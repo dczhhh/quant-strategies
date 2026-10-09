@@ -1,0 +1,1211 @@
+{
+  "retrieved_date_us": "2026-10-09",
+  "purpose": "Current candidate-universe review; not a historical point-in-time universe",
+  "quotes": [
+    {
+      "symbol": "NVDA",
+      "contract_id": 4815747,
+      "data": {
+        "last": {
+          "price": 229.94,
+          "ts": 1791561442,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 27799079848
+        }
+      }
+    },
+    {
+      "symbol": "AMD",
+      "contract_id": 4391,
+      "data": {
+        "last": {
+          "price": 611.42,
+          "ts": 1791561442,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 14220107165
+        }
+      }
+    },
+    {
+      "symbol": "AVGO",
+      "contract_id": 313130367,
+      "data": {
+        "last": {
+          "price": 363.23,
+          "ts": 1791561448,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 8162757030
+        }
+      }
+    },
+    {
+      "symbol": "LRCX",
+      "contract_id": 732440574,
+      "data": {
+        "last": {
+          "price": 319.37,
+          "ts": 1791561449,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 2989438247
+        }
+      }
+    },
+    {
+      "symbol": "MSFT",
+      "contract_id": 272093,
+      "data": {
+        "last": {
+          "price": 534.58,
+          "ts": 1791561455,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 14827797674
+        }
+      }
+    },
+    {
+      "symbol": "ORCL",
+      "contract_id": 272800,
+      "data": {
+        "last": {
+          "price": 141.82,
+          "ts": 1791561451,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 4505840656
+        }
+      }
+    },
+    {
+      "symbol": "CRM",
+      "contract_id": 29624264,
+      "data": {
+        "last": {
+          "price": 228.18,
+          "ts": 1791561435,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 3047115801
+        }
+      }
+    },
+    {
+      "symbol": "PLTR",
+      "contract_id": 444857009,
+      "data": {
+        "last": {
+          "price": 205.46,
+          "ts": 1791561453,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 6874193388
+        }
+      }
+    },
+    {
+      "symbol": "AMZN",
+      "contract_id": 3691937,
+      "data": {
+        "last": {
+          "price": 261.27,
+          "ts": 1791561457,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 10270501303
+        }
+      }
+    },
+    {
+      "symbol": "GOOGL",
+      "contract_id": 208813719,
+      "data": {
+        "last": {
+          "price": 353.89,
+          "ts": 1791561457,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 9597357652
+        }
+      }
+    },
+    {
+      "symbol": "META",
+      "contract_id": 107113386,
+      "data": {
+        "last": {
+          "price": 724.5,
+          "ts": 1791561459,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 13563948353
+        }
+      }
+    },
+    {
+      "symbol": "UBER",
+      "contract_id": 365207014,
+      "data": {
+        "last": {
+          "price": 72.03,
+          "ts": 1791561445,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 1308159176
+        }
+      }
+    },
+    {
+      "symbol": "TSLA",
+      "contract_id": 76792991,
+      "data": {
+        "last": {
+          "price": 383.26,
+          "ts": 1791561454,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 14408407045
+        }
+      }
+    },
+    {
+      "symbol": "NFLX",
+      "contract_id": 15124833,
+      "data": {
+        "last": {
+          "price": 70.94,
+          "ts": 1791561465,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 2624028422
+        }
+      }
+    },
+    {
+      "symbol": "BKNG",
+      "contract_id": 308728373,
+      "data": {
+        "last": {
+          "price": 160.12,
+          "ts": 1791561462,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 1094243090
+        }
+      }
+    },
+    {
+      "symbol": "NKE",
+      "contract_id": 10291,
+      "data": {
+        "last": {
+          "price": 34.910000000000004,
+          "ts": 1791561452,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 1099156039
+        }
+      }
+    },
+    {
+      "symbol": "JPM",
+      "contract_id": 1520593,
+      "data": {
+        "last": {
+          "price": 332.27,
+          "ts": 1791561438,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 2430787151
+        }
+      }
+    },
+    {
+      "symbol": "GS",
+      "contract_id": 4627828,
+      "data": {
+        "last": {
+          "price": 887.96,
+          "ts": 1791561444,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 1803731527
+        }
+      }
+    },
+    {
+      "symbol": "V",
+      "contract_id": 49462172,
+      "data": {
+        "last": {
+          "price": 383.79,
+          "ts": 1791561465,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 2513880953
+        }
+      }
+    },
+    {
+      "symbol": "MA",
+      "contract_id": 38685693,
+      "data": {
+        "last": {
+          "price": 585.62,
+          "ts": 1791561408,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 1674395205
+        }
+      }
+    },
+    {
+      "symbol": "GE",
+      "contract_id": 498843743,
+      "data": {
+        "last": {
+          "price": 306.05,
+          "ts": 1791561460,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 1231848415
+        }
+      }
+    },
+    {
+      "symbol": "CAT",
+      "contract_id": 5437,
+      "data": {
+        "last": {
+          "price": 802.1800000000001,
+          "ts": 1791561448,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 2125766631
+        }
+      }
+    },
+    {
+      "symbol": "RTX",
+      "contract_id": 415342104,
+      "data": {
+        "last": {
+          "price": 186.23,
+          "ts": 1791561448,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 825856906
+        }
+      }
+    },
+    {
+      "symbol": "UPS",
+      "contract_id": 6231002,
+      "data": {
+        "last": {
+          "price": 94.5,
+          "ts": 1791561502,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 465141298
+        }
+      }
+    },
+    {
+      "symbol": "UNH",
+      "contract_id": 13272,
+      "data": {
+        "last": {
+          "price": 374.45,
+          "ts": 1791561520,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 1855733758
+        }
+      }
+    },
+    {
+      "symbol": "LLY",
+      "contract_id": 9160,
+      "data": {
+        "last": {
+          "price": 1170.6000000000001,
+          "ts": 1791561517,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 2925995742
+        }
+      }
+    },
+    {
+      "symbol": "ABBV",
+      "contract_id": 118089500,
+      "data": {
+        "last": {
+          "price": 275.43,
+          "ts": 1791561313,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 1329735005
+        }
+      }
+    },
+    {
+      "symbol": "GILD",
+      "contract_id": 269753,
+      "data": {
+        "last": {
+          "price": 150.21,
+          "ts": 1791561484,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 899681416
+        }
+      }
+    },
+    {
+      "symbol": "XOM",
+      "contract_id": 895178251,
+      "data": {
+        "last": {
+          "price": 169.64000000000001,
+          "ts": 1791561530,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 2380120669
+        }
+      }
+    },
+    {
+      "symbol": "CVX",
+      "contract_id": 5684,
+      "data": {
+        "last": {
+          "price": 213.11,
+          "ts": 1791561531,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 1770809470
+        }
+      }
+    },
+    {
+      "symbol": "FCX",
+      "contract_id": 7089,
+      "data": {
+        "last": {
+          "price": 73.37,
+          "ts": 1791561588,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 970860936
+        }
+      }
+    },
+    {
+      "symbol": "NEE",
+      "contract_id": 75960201,
+      "data": {
+        "last": {
+          "price": 77.29,
+          "ts": 1791561528,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 874258356
+        }
+      }
+    },
+    {
+      "symbol": "CELH",
+      "contract_id": 71364351,
+      "data": {
+        "last": {
+          "price": 28,
+          "ts": 1791561550,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 257810149
+        }
+      }
+    },
+    {
+      "symbol": "DKNG",
+      "contract_id": 560105364,
+      "data": {
+        "last": {
+          "price": 19.5,
+          "ts": 1791561587,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 254469150
+        }
+      }
+    },
+    {
+      "symbol": "GTLB",
+      "contract_id": 520512263,
+      "data": {
+        "last": {
+          "price": 54.81,
+          "ts": 1791561533,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 254464435
+        }
+      }
+    },
+    {
+      "symbol": "S",
+      "contract_id": 499640681,
+      "data": {
+        "last": {
+          "price": 26.3,
+          "ts": 1791561609,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 212751159
+        }
+      }
+    },
+    {
+      "symbol": "RRC",
+      "contract_id": 6608450,
+      "data": {
+        "last": {
+          "price": 41.27,
+          "ts": 1791561527,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 113559259
+        }
+      }
+    },
+    {
+      "symbol": "PCOR",
+      "contract_id": 491665436,
+      "data": {
+        "last": {
+          "price": 55.160000000000004,
+          "ts": 1791561614,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 173680195
+        }
+      }
+    },
+    {
+      "symbol": "MTCH",
+      "contract_id": 430252818,
+      "data": {
+        "last": {
+          "price": 41.480000000000004,
+          "ts": 1791561607,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 132880375
+        }
+      }
+    },
+    {
+      "symbol": "CROX",
+      "contract_id": 37792836,
+      "data": {
+        "last": {
+          "price": 116.78,
+          "ts": 1791561501,
+          "halted": false,
+          "is_close": false
+        },
+        "avg-90d-usd-volume": {
+          "volume": 121432338
+        }
+      }
+    }
+  ],
+  "fractional_list_source": "https://www.ibkr.com/download/fracshare_stk.csv",
+  "fractional_matches": [
+    {
+      "symbol": "NVDA",
+      "record": {
+        "#SYMBOL": "NVDA",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "NVIDIA CORP",
+        "IB_CONTRACT_ID": "4815747",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "AMD",
+      "record": {
+        "#SYMBOL": "AMD",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "ADVANCED MICRO DEVICES",
+        "IB_CONTRACT_ID": "4391",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "AVGO",
+      "record": {
+        "#SYMBOL": "AVGO",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "BROADCOM INC",
+        "IB_CONTRACT_ID": "313130367",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "LRCX",
+      "record": {
+        "#SYMBOL": "LRCX",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "LAM RESEARCH CORP",
+        "IB_CONTRACT_ID": "732440574",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "MSFT",
+      "record": {
+        "#SYMBOL": "MSFT",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "MICROSOFT CORP",
+        "IB_CONTRACT_ID": "272093",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "ORCL",
+      "record": {
+        "#SYMBOL": "ORCL",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "ORACLE CORP",
+        "IB_CONTRACT_ID": "272800",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "CRM",
+      "record": {
+        "#SYMBOL": "CRM",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "SALESFORCE INC",
+        "IB_CONTRACT_ID": "29624264",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "PLTR",
+      "record": {
+        "#SYMBOL": "PLTR",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "PALANTIR TECHNOLOGIES INC-A",
+        "IB_CONTRACT_ID": "444857009",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "AMZN",
+      "record": {
+        "#SYMBOL": "AMZN",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "AMAZON.COM INC",
+        "IB_CONTRACT_ID": "3691937",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "GOOGL",
+      "record": {
+        "#SYMBOL": "GOOGL",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "ALPHABET INC-CL A",
+        "IB_CONTRACT_ID": "208813719",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "META",
+      "record": {
+        "#SYMBOL": "META",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "META PLATFORMS INC-CLASS A",
+        "IB_CONTRACT_ID": "107113386",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "UBER",
+      "record": {
+        "#SYMBOL": "UBER",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "UBER TECHNOLOGIES INC",
+        "IB_CONTRACT_ID": "365207014",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "TSLA",
+      "record": {
+        "#SYMBOL": "TSLA",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "TESLA INC",
+        "IB_CONTRACT_ID": "76792991",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "NFLX",
+      "record": {
+        "#SYMBOL": "NFLX",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "NETFLIX INC",
+        "IB_CONTRACT_ID": "15124833",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "BKNG",
+      "record": {
+        "#SYMBOL": "BKNG",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "BOOKING HOLDINGS INC",
+        "IB_CONTRACT_ID": "308728373",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "NKE",
+      "record": {
+        "#SYMBOL": "NKE",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "NIKE INC -CL B",
+        "IB_CONTRACT_ID": "10291",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "JPM",
+      "record": {
+        "#SYMBOL": "JPM",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "JPMORGAN CHASE & CO",
+        "IB_CONTRACT_ID": "1520593",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "GS",
+      "record": {
+        "#SYMBOL": "GS",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "GOLDMAN SACHS GROUP INC",
+        "IB_CONTRACT_ID": "4627828",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "V",
+      "record": {
+        "#SYMBOL": "V",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "VISA INC-CLASS A SHARES",
+        "IB_CONTRACT_ID": "49462172",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "MA",
+      "record": {
+        "#SYMBOL": "MA",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "MASTERCARD INC - A",
+        "IB_CONTRACT_ID": "38685693",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "GE",
+      "record": {
+        "#SYMBOL": "GE",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "GENERAL ELECTRIC",
+        "IB_CONTRACT_ID": "498843743",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "CAT",
+      "record": {
+        "#SYMBOL": "CAT",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "CATERPILLAR INC",
+        "IB_CONTRACT_ID": "5437",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "RTX",
+      "record": {
+        "#SYMBOL": "RTX",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "RTX CORP",
+        "IB_CONTRACT_ID": "415342104",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "UPS",
+      "record": {
+        "#SYMBOL": "UPS",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "UNITED PARCEL SERVICE-CL B",
+        "IB_CONTRACT_ID": "6231002",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "UNH",
+      "record": {
+        "#SYMBOL": "UNH",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "UNITEDHEALTH GROUP INC",
+        "IB_CONTRACT_ID": "13272",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "LLY",
+      "record": {
+        "#SYMBOL": "LLY",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "ELI LILLY & CO",
+        "IB_CONTRACT_ID": "9160",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "ABBV",
+      "record": {
+        "#SYMBOL": "ABBV",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "ABBVIE INC",
+        "IB_CONTRACT_ID": "118089500",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "GILD",
+      "record": {
+        "#SYMBOL": "GILD",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "GILEAD SCIENCES INC",
+        "IB_CONTRACT_ID": "269753",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "XOM",
+      "record": {
+        "#SYMBOL": "XOM",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "EXXONMOBIL HOLDINGS CORP",
+        "IB_CONTRACT_ID": "895178251",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "CVX",
+      "record": {
+        "#SYMBOL": "CVX",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "CHEVRON CORP",
+        "IB_CONTRACT_ID": "5684",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "FCX",
+      "record": {
+        "#SYMBOL": "FCX",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "FREEPORT-MCMORAN INC",
+        "IB_CONTRACT_ID": "7089",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "NEE",
+      "record": {
+        "#SYMBOL": "NEE",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "NEXTERA ENERGY INC",
+        "IB_CONTRACT_ID": "75960201",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "CELH",
+      "record": {
+        "#SYMBOL": "CELH",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "CELSIUS HOLDINGS INC",
+        "IB_CONTRACT_ID": "71364351",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "DKNG",
+      "record": {
+        "#SYMBOL": "DKNG",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "DRAFTKINGS INC-CL A",
+        "IB_CONTRACT_ID": "560105364",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "GTLB",
+      "record": {
+        "#SYMBOL": "GTLB",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "GITLAB INC-CL A",
+        "IB_CONTRACT_ID": "520512263",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "S",
+      "record": {
+        "#SYMBOL": "S",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "SENTINELONE INC -CLASS A",
+        "IB_CONTRACT_ID": "499640681",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "RRC",
+      "record": {
+        "#SYMBOL": "RRC",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "RANGE RESOURCES CORP",
+        "IB_CONTRACT_ID": "6608450",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "PCOR",
+      "record": {
+        "#SYMBOL": "PCOR",
+        "MAIN_EXCHANGE": "NYSE",
+        "DESCRIPTION": "PROCORE TECHNOLOGIES INC",
+        "IB_CONTRACT_ID": "491665436",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "MTCH",
+      "record": {
+        "#SYMBOL": "MTCH",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "MATCH GROUP INC",
+        "IB_CONTRACT_ID": "430252818",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    },
+    {
+      "symbol": "CROX",
+      "record": {
+        "#SYMBOL": "CROX",
+        "MAIN_EXCHANGE": "NASDAQ",
+        "DESCRIPTION": "CROCS INC",
+        "IB_CONTRACT_ID": "37792836",
+        "SCHEDULED_INELIGIBILTY_DATE": ""
+      }
+    }
+  ],
+  "market_cap_sources": [
+    {
+      "symbol": "NVDA",
+      "reported_cap": "5.56T",
+      "url": "https://stockanalysis.com/stocks/nvda/statistics/"
+    },
+    {
+      "symbol": "AMD",
+      "reported_cap": "997.74B",
+      "url": "https://stockanalysis.com/stocks/amd/statistics/"
+    },
+    {
+      "symbol": "AVGO",
+      "reported_cap": "1.74T",
+      "url": "https://stockanalysis.com/stocks/avgo/statistics/"
+    },
+    {
+      "symbol": "LRCX",
+      "reported_cap": "399.74B",
+      "url": "https://stockanalysis.com/stocks/lrcx/statistics/"
+    },
+    {
+      "symbol": "MSFT",
+      "reported_cap": "3.96T",
+      "url": "https://stockanalysis.com/stocks/msft/statistics/"
+    },
+    {
+      "symbol": "ORCL",
+      "reported_cap": "430.14B",
+      "url": "https://stockanalysis.com/stocks/orcl/statistics/"
+    },
+    {
+      "symbol": "CRM",
+      "reported_cap": "187.83B",
+      "url": "https://stockanalysis.com/stocks/crm/statistics/"
+    },
+    {
+      "symbol": "PLTR",
+      "reported_cap": "493.83B",
+      "url": "https://stockanalysis.com/stocks/pltr/statistics/"
+    },
+    {
+      "symbol": "AMZN",
+      "reported_cap": "2.82T",
+      "url": "https://stockanalysis.com/stocks/amzn/statistics/"
+    },
+    {
+      "symbol": "GOOGL",
+      "reported_cap": "4.29T",
+      "url": "https://stockanalysis.com/stocks/googl/statistics/"
+    },
+    {
+      "symbol": "META",
+      "reported_cap": "1.84T",
+      "url": "https://stockanalysis.com/stocks/meta/statistics/"
+    },
+    {
+      "symbol": "UBER",
+      "reported_cap": "146.47B",
+      "url": "https://stockanalysis.com/stocks/uber/statistics/"
+    },
+    {
+      "symbol": "TSLA",
+      "reported_cap": "1.51T",
+      "url": "https://stockanalysis.com/stocks/tsla/statistics/"
+    },
+    {
+      "symbol": "NFLX",
+      "reported_cap": "295.14B",
+      "url": "https://stockanalysis.com/stocks/nflx/statistics/"
+    },
+    {
+      "symbol": "BKNG",
+      "reported_cap": "120.24B",
+      "url": "https://stockanalysis.com/stocks/bkng/statistics/"
+    },
+    {
+      "symbol": "NKE",
+      "reported_cap": "51.88B",
+      "url": "https://stockanalysis.com/stocks/nke/statistics/"
+    },
+    {
+      "symbol": "JPM",
+      "reported_cap": "883.02B",
+      "url": "https://stockanalysis.com/stocks/jpm/statistics/"
+    },
+    {
+      "symbol": "GS",
+      "reported_cap": "268.50B",
+      "url": "https://stockanalysis.com/stocks/gs/statistics/"
+    },
+    {
+      "symbol": "V",
+      "reported_cap": "703.13B",
+      "url": "https://stockanalysis.com/stocks/v/statistics/"
+    },
+    {
+      "symbol": "MA",
+      "reported_cap": "512.02B",
+      "url": "https://stockanalysis.com/stocks/ma/statistics/"
+    },
+    {
+      "symbol": "GE",
+      "reported_cap": "317.29B",
+      "url": "https://stockanalysis.com/stocks/ge/statistics/"
+    },
+    {
+      "symbol": "CAT",
+      "reported_cap": "368.74B",
+      "url": "https://stockanalysis.com/stocks/cat/statistics/"
+    },
+    {
+      "symbol": "RTX",
+      "reported_cap": "251.00B",
+      "url": "https://stockanalysis.com/stocks/rtx/statistics/"
+    },
+    {
+      "symbol": "UPS",
+      "reported_cap": "80.47B",
+      "url": "https://stockanalysis.com/stocks/ups/statistics/"
+    },
+    {
+      "symbol": "UNH",
+      "reported_cap": "336.72B",
+      "url": "https://stockanalysis.com/stocks/unh/statistics/"
+    },
+    {
+      "symbol": "LLY",
+      "reported_cap": "1.04T",
+      "url": "https://stockanalysis.com/stocks/lly/statistics/"
+    },
+    {
+      "symbol": "ABBV",
+      "reported_cap": "486.43B",
+      "url": "https://stockanalysis.com/stocks/abbv/statistics/"
+    },
+    {
+      "symbol": "GILD",
+      "reported_cap": "186.08B",
+      "url": "https://stockanalysis.com/stocks/gild/statistics/"
+    },
+    {
+      "symbol": "XOM",
+      "reported_cap": "700.05B",
+      "url": "https://stockanalysis.com/stocks/xom/statistics/"
+    },
+    {
+      "symbol": "CVX",
+      "reported_cap": "418.39B",
+      "url": "https://stockanalysis.com/stocks/cvx/statistics/"
+    },
+    {
+      "symbol": "FCX",
+      "reported_cap": "105.86B",
+      "url": "https://stockanalysis.com/stocks/fcx/statistics/"
+    },
+    {
+      "symbol": "NEE",
+      "reported_cap": "161.43B",
+      "url": "https://stockanalysis.com/stocks/nee/statistics/"
+    },
+    {
+      "symbol": "DKNG",
+      "reported_cap": "9.72B",
+      "url": "https://stockanalysis.com/stocks/dkng/statistics/"
+    },
+    {
+      "symbol": "GTLB",
+      "reported_cap": "9.12B",
+      "url": "https://stockanalysis.com/stocks/gtlb/statistics/"
+    },
+    {
+      "symbol": "S",
+      "reported_cap": "9.14B",
+      "url": "https://stockanalysis.com/stocks/s/statistics/"
+    },
+    {
+      "symbol": "RRC",
+      "reported_cap": "9.63B",
+      "url": "https://stockanalysis.com/stocks/rrc/statistics/"
+    },
+    {
+      "symbol": "PCOR",
+      "reported_cap": "8.41B",
+      "url": "https://stockanalysis.com/stocks/pcor/statistics/"
+    },
+    {
+      "symbol": "MTCH",
+      "reported_cap": "9.54B",
+      "url": "https://stockanalysis.com/stocks/mtch/statistics/"
+    },
+    {
+      "symbol": "CELH",
+      "reported_cap": "7.10B",
+      "url": "https://stockanalysis.com/stocks/celh/statistics/"
+    },
+    {
+      "symbol": "CROX",
+      "reported_cap": "5.60B",
+      "url": "https://stockanalysis.com/stocks/crox/statistics/"
+    }
+  ]
+}

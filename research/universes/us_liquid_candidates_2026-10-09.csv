@@ -1,0 +1,41 @@
+symbol,company,review_group,industry_group,market_cap_usd,avg_90d_dollar_volume_usd,last_price_usd,quote_time_utc,primary_exchange,ibkr_contract_id,fractional_on_ibkr_list,review_status,market_cap_source_url
+NVDA,英伟达,large_and_mega,半导体,5560000000000,27799079848,229.94,2026-10-09T15:57:22.000Z,NASDAQ,4815747,true,candidate,https://stockanalysis.com/stocks/nvda/statistics/
+AMD,AMD,large_and_mega,半导体,997740000000,14220107165,611.42,2026-10-09T15:57:22.000Z,NASDAQ,4391,true,candidate,https://stockanalysis.com/stocks/amd/statistics/
+AVGO,博通,large_and_mega,半导体,1740000000000,8162757030,363.23,2026-10-09T15:57:28.000Z,NASDAQ,313130367,true,candidate,https://stockanalysis.com/stocks/avgo/statistics/
+LRCX,泛林,large_and_mega,半导体,399740000000,2989438247,319.37,2026-10-09T15:57:29.000Z,NASDAQ,732440574,true,candidate,https://stockanalysis.com/stocks/lrcx/statistics/
+MSFT,微软,large_and_mega,软件,3960000000000,14827797674,534.58,2026-10-09T15:57:35.000Z,NASDAQ,272093,true,candidate,https://stockanalysis.com/stocks/msft/statistics/
+ORCL,甲骨文,large_and_mega,软件,430140000000,4505840656,141.82,2026-10-09T15:57:31.000Z,NYSE,272800,true,candidate,https://stockanalysis.com/stocks/orcl/statistics/
+CRM,Salesforce,large_and_mega,软件,187830000000,3047115801,228.18,2026-10-09T15:57:15.000Z,NYSE,29624264,true,candidate,https://stockanalysis.com/stocks/crm/statistics/
+PLTR,Palantir,large_and_mega,软件,493830000000,6874193388,205.46,2026-10-09T15:57:33.000Z,NASDAQ,444857009,true,candidate,https://stockanalysis.com/stocks/pltr/statistics/
+AMZN,亚马逊,large_and_mega,互联网与平台,2820000000000,10270501303,261.27,2026-10-09T15:57:37.000Z,NASDAQ,3691937,true,candidate,https://stockanalysis.com/stocks/amzn/statistics/
+GOOGL,Alphabet,large_and_mega,互联网与平台,4290000000000,9597357652,353.89,2026-10-09T15:57:37.000Z,NASDAQ,208813719,true,candidate,https://stockanalysis.com/stocks/googl/statistics/
+META,Meta,large_and_mega,互联网与平台,1840000000000,13563948353,724.5,2026-10-09T15:57:39.000Z,NASDAQ,107113386,true,candidate,https://stockanalysis.com/stocks/meta/statistics/
+UBER,Uber,large_and_mega,互联网与平台,146470000000,1308159176,72.03,2026-10-09T15:57:25.000Z,NYSE,365207014,true,candidate,https://stockanalysis.com/stocks/uber/statistics/
+TSLA,特斯拉,large_and_mega,消费与出行,1510000000000,14408407045,383.26,2026-10-09T15:57:34.000Z,NASDAQ,76792991,true,candidate,https://stockanalysis.com/stocks/tsla/statistics/
+NFLX,Netflix,large_and_mega,消费与出行,295140000000,2624028422,70.94,2026-10-09T15:57:45.000Z,NASDAQ,15124833,true,candidate,https://stockanalysis.com/stocks/nflx/statistics/
+BKNG,Booking,large_and_mega,消费与出行,120240000000,1094243090,160.12,2026-10-09T15:57:42.000Z,NASDAQ,308728373,true,candidate,https://stockanalysis.com/stocks/bkng/statistics/
+NKE,耐克,large_and_mega,消费与出行,51880000000,1099156039,34.91,2026-10-09T15:57:32.000Z,NYSE,10291,true,candidate,https://stockanalysis.com/stocks/nke/statistics/
+JPM,摩根大通,large_and_mega,金融与支付,883020000000,2430787151,332.27,2026-10-09T15:57:18.000Z,NYSE,1520593,true,candidate,https://stockanalysis.com/stocks/jpm/statistics/
+GS,高盛,large_and_mega,金融与支付,268500000000,1803731527,887.96,2026-10-09T15:57:24.000Z,NYSE,4627828,true,candidate,https://stockanalysis.com/stocks/gs/statistics/
+V,Visa,large_and_mega,金融与支付,703130000000,2513880953,383.79,2026-10-09T15:57:45.000Z,NYSE,49462172,true,candidate,https://stockanalysis.com/stocks/v/statistics/
+MA,万事达,large_and_mega,金融与支付,512020000000,1674395205,585.62,2026-10-09T15:56:48.000Z,NYSE,38685693,true,candidate,https://stockanalysis.com/stocks/ma/statistics/
+GE,GE Aerospace,large_and_mega,工业与航空,317290000000,1231848415,306.05,2026-10-09T15:57:40.000Z,NYSE,498843743,true,candidate,https://stockanalysis.com/stocks/ge/statistics/
+CAT,卡特彼勒,large_and_mega,工业与航空,368740000000,2125766631,802.18,2026-10-09T15:57:28.000Z,NYSE,5437,true,candidate,https://stockanalysis.com/stocks/cat/statistics/
+RTX,RTX,large_and_mega,工业与航空,251000000000,825856906,186.23,2026-10-09T15:57:28.000Z,NYSE,415342104,true,candidate,https://stockanalysis.com/stocks/rtx/statistics/
+UPS,UPS,large_and_mega,工业与航空,80470000000,465141298,94.5,2026-10-09T15:58:22.000Z,NYSE,6231002,true,candidate,https://stockanalysis.com/stocks/ups/statistics/
+UNH,联合健康,large_and_mega,医疗,336720000000,1855733758,374.45,2026-10-09T15:58:40.000Z,NYSE,13272,true,candidate,https://stockanalysis.com/stocks/unh/statistics/
+LLY,礼来,large_and_mega,医疗,1040000000000,2925995742,1170.6,2026-10-09T15:58:37.000Z,NYSE,9160,true,candidate,https://stockanalysis.com/stocks/lly/statistics/
+ABBV,艾伯维,large_and_mega,医疗,486430000000,1329735005,275.43,2026-10-09T15:55:13.000Z,NYSE,118089500,true,candidate,https://stockanalysis.com/stocks/abbv/statistics/
+GILD,吉利德,large_and_mega,医疗,186080000000,899681416,150.21,2026-10-09T15:58:04.000Z,NASDAQ,269753,true,candidate,https://stockanalysis.com/stocks/gild/statistics/
+XOM,埃克森美孚,large_and_mega,能源资源与公用事业,700050000000,2380120669,169.64,2026-10-09T15:58:50.000Z,NYSE,895178251,true,candidate,https://stockanalysis.com/stocks/xom/statistics/
+CVX,雪佛龙,large_and_mega,能源资源与公用事业,418390000000,1770809470,213.11,2026-10-09T15:58:51.000Z,NYSE,5684,true,candidate,https://stockanalysis.com/stocks/cvx/statistics/
+FCX,Freeport-McMoRan,large_and_mega,能源资源与公用事业,105860000000,970860936,73.37,2026-10-09T15:59:48.000Z,NYSE,7089,true,candidate,https://stockanalysis.com/stocks/fcx/statistics/
+NEE,NextEra Energy,large_and_mega,能源资源与公用事业,161430000000,874258356,77.29,2026-10-09T15:58:48.000Z,NYSE,75960201,true,candidate,https://stockanalysis.com/stocks/nee/statistics/
+CELH,Celsius,mid,消费饮料,7100000000,257810149,28,2026-10-09T15:59:10.000Z,NASDAQ,71364351,true,candidate,https://stockanalysis.com/stocks/celh/statistics/
+DKNG,DraftKings,mid,博彩娱乐,9720000000,254469150,19.5,2026-10-09T15:59:47.000Z,NASDAQ,560105364,true,candidate,https://stockanalysis.com/stocks/dkng/statistics/
+GTLB,GitLab,mid,开发工具,9120000000,254464435,54.81,2026-10-09T15:58:53.000Z,NASDAQ,520512263,true,candidate,https://stockanalysis.com/stocks/gtlb/statistics/
+S,SentinelOne,mid,网络安全,9140000000,212751159,26.3,2026-10-09T16:00:09.000Z,NYSE,499640681,true,candidate,https://stockanalysis.com/stocks/s/statistics/
+RRC,Range Resources,mid,天然气,9630000000,113559259,41.27,2026-10-09T15:58:47.000Z,NYSE,6608450,true,candidate,https://stockanalysis.com/stocks/rrc/statistics/
+PCOR,Procore,mid,建筑软件,8410000000,173680195,55.16,2026-10-09T16:00:14.000Z,NYSE,491665436,true,candidate,https://stockanalysis.com/stocks/pcor/statistics/
+MTCH,Match Group,mid,社交应用,9540000000,132880375,41.48,2026-10-09T16:00:07.000Z,NASDAQ,430252818,true,candidate,https://stockanalysis.com/stocks/mtch/statistics/
+CROX,Crocs,mid,消费鞋服,5600000000,121432338,116.78,2026-10-09T15:58:21.000Z,NASDAQ,37792836,true,candidate,https://stockanalysis.com/stocks/crox/statistics/
