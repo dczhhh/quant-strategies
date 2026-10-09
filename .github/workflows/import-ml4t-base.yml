@@ -1,0 +1,71 @@
+name: Import ML4T base
+
+on:
+  push:
+    paths:
+      - ".github/workflows/import-ml4t-base.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: import-ml4t-base
+  cancel-in-progress: false
+
+jobs:
+  import:
+    if: github.repository == 'dczhhh/quant-strategies'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Import pinned upstream history and source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/ml4t/backtest.git
+          git fetch upstream main --tags
+          git cat-file -e c1ee19c385db3cbad225822cf845832470694f2b^{commit}
+          git merge --allow-unrelated-histories -X theirs --no-edit c1ee19c385db3cbad225822cf845832470694f2b
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("README.md")
+          original = p.read_text()
+          p.write_text(
+              "# quant-strategies\n\n"
+              "量化策略研究仓库，基座来自 [ml4t/backtest](https://github.com/ml4t/backtest)。\n\n"
+              "当前阶段为基座移植；账户限制与具体策略将在后续接入。\n\n"
+              "## 使用本仓库源码\n\n"
+              "需要 Python 3.12+ 和 uv。\n\n"
+              "```bash\ngit clone https://github.com/dczhhh/quant-strategies.git\n"
+              "cd quant-strategies\nuv sync --locked --dev\nuv run pytest\n```\n\n"
+              "来源与更新方法见 [UPSTREAM.md](UPSTREAM.md)。上游 README 保留如下。\n\n---\n\n"
+              + original
+          )
+          Path("UPSTREAM.md").write_text(
+              "# Upstream provenance\n\n"
+              "- Repository: https://github.com/ml4t/backtest\n"
+              "- Branch: main\n"
+              "- Imported commit: c1ee19c385db3cbad225822cf845832470694f2b\n"
+              "- Import date: 2026-10-09\n"
+              "- License: MIT; original copyright and LICENSE retained.\n\n"
+              "The upstream source, tests, examples, documentation, validation fixtures, "
+              "commit history and tags are preserved. The destination's initialization "
+              "history is retained by merging the histories. No trading behavior is changed.\n\n"
+              "The root README adds repository-specific instructions. The import workflow "
+              "is temporary and is removed after import verification. Upstream release "
+              "workflows remain upstream tooling and are not configured for this project.\n\n"
+              "## Updating\n\n"
+              "```bash\ngit remote add upstream https://github.com/ml4t/backtest.git\n"
+              "git fetch upstream main --tags\ngit merge upstream/main\n"
+              "uv sync --locked --dev\nuv run pytest\n```\n\n"
+              "Resolve conflicts in the repository introduction while retaining LICENSE. "
+              "Do not publish this checkout to upstream's PyPI package or documentation.\n"
+          )
+          PY
+          git add README.md UPSTREAM.md
+          git commit -m "Document ML4T base import and local development"
+          git push origin HEAD:main --tags
