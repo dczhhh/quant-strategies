@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import warnings
+from collections.abc import Callable
 from datetime import date, datetime
 from math import ceil
 from typing import TYPE_CHECKING, Any
@@ -94,6 +95,7 @@ class Engine:
         lifecycle_version: LifecycleVersion | str = LifecycleVersion.V1,
         execution_policy: ExecutionPolicy | None = None,
         target_intent_state: dict[str, Any] | None = None,
+        broker_factory: Callable[..., Broker] | None = None,
     ):
         from .config import BacktestConfig as ConfigCls
 
@@ -113,7 +115,7 @@ class Engine:
             raise ValueError("session decisions require NEXT_BAR execution")
         self.lifecycle_version = negotiated_version
         self.execution_policy = execution_policy or default_execution_policy(self.config)
-        self.broker = Broker.from_config(
+        self.broker = (broker_factory or Broker.from_config)(
             self.config,
             contract_specs=contract_specs,
             market_impact_model=market_impact_model,
@@ -893,6 +895,7 @@ class Engine:
         lifecycle_version: LifecycleVersion | str = LifecycleVersion.V1,
         execution_policy: ExecutionPolicy | None = None,
         target_intent_state: dict[str, Any] | None = None,
+        broker_factory: Callable[..., Broker] | None = None,
     ) -> Engine:
         """Create an Engine instance from a BacktestConfig.
 
@@ -907,6 +910,8 @@ class Engine:
             market_impact_model: Market impact model for fill simulation
             execution_limits: Execution limits (max order size, etc.)
             funding_df: Timestamped funding rates or amounts for named assets
+            broker_factory: Optional opt-in broker constructor with the same arguments as
+                Broker.from_config. Defaults to the upstream Broker constructor.
 
         Returns:
             Configured Engine instance
@@ -922,6 +927,7 @@ class Engine:
             lifecycle_version=lifecycle_version,
             execution_policy=execution_policy,
             target_intent_state=target_intent_state,
+            broker_factory=broker_factory,
         )
 
 
