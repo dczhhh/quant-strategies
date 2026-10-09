@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+site/
+eggs/
+*.egg
+
+# Virtual environments
+.venv/
+.venv-*/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Testing
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Type checking
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+src/ml4t/backtest/_version.py
+
+# Agent-local state
+CLAUDE.md
+.claude/
+.codex/
+.workspace/
+
+# Validation-generated local artifacts
+validation/.zipline/
+validation/CORRECTNESS_RESULTS.md
+validation/BENCHMARK_RESULTS.md
+validation/candidates/
+validation/trade_logs/
+validation/lean/workspace/
+validation/nautilus/.venv-nautilus/
+validation/nautilus/catalog/
+performance-evidence.json
+release-performance-evidence.json

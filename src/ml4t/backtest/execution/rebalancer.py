@@ -1,0 +1,635 @@
+"""Portfolio rebalancing utilities for target weight execution.
+
+This module provides utilities for converting portfolio target weights to orders,
+enabling integration with external portfolio optimizers like riskfolio-lib,
+PyPortfolioOpt, or cvxpy.
+
+Example:
+    from ml4t.backtest import TargetWeightExecutor, RebalanceConfig
+
+    executor = TargetWeightExecutor(config=RebalanceConfig(
+        min_trade_value=500,
+        allow_fractional=True,
+    ))
+
+    # In strategy.on_data():
+    target_weights = {'AAPL': 0.3, 'GOOG': 0.3, 'MSFT': 0.35}  # 5% cash
+    orders = executor.execute(target_weights, data, broker)
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from datetime import datetime
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from ..broker import Broker
+    from ..types import Order
+
+from ml4t.specs.market_data import TimestampSemantics
+
+from ..config import (
+    DataFrequency,
+    ExecutionPrice,
+    RebalanceMode,
+    ShareRounding,
+    ShareType,
+)
+from ..core.shared import SubmitOrderOptions
+from ..types import OrderSide
+from .schedule import RebalanceSchedule, _OnlineRebalanceEvaluator
+
+_SCHEDULE_CONFIG_FIELDS = (
+    "schedule",
+    "calendar",
+    "timezone",
+    "session_start_time",
+    "data_frequency",
+    "timestamp_semantics",
+)
+
+
+class WeightProvider(Protocol):
+    """Protocol for anything that produces target weights."""
+
+    def get_weights(self, data: dict, broker: Broker) -> dict[str, float]:
+        """Return target weights (asset -> weight), including negative or levered weights."""
+        ...
+
+
+@dataclass
+class RebalanceConfig:
+    """Configuration for rebalancing behavior.
+
+    Attributes:
+        min_trade_value: Skip trades with absolute value smaller than this ($).
+            Default 0.0 disables this filter.
+        min_weight_change: Skip if weight change is smaller than this (decimal).
+            Default 0.0 disables this filter.
+        allow_fractional: Allow fractional shares (default: False, whole shares only).
+        round_lots: Round to lot_size increments (e.g., 100-share lots).
+        lot_size: Lot size for rounding (only used if round_lots=True).
+        allow_short: Allow short positions via negative weights.
+        max_single_weight: Maximum weight allowed for any single asset.
+        max_gross_leverage: Maximum gross leverage (sum of abs weights). None means
+            no cap — the gatekeeper's buying power check is the constraint. For cash
+            accounts, the gatekeeper naturally prevents over-allocation. For margin
+            accounts, set this as a risk guardrail (e.g., 5.0 for a CTA portfolio).
+        cancel_before_rebalance: Cancel pending orders before rebalancing (safest).
+        account_for_pending: Consider pending orders when calculating current weights.
+        rebalance_mode: How portfolio value is computed during rebalancing.
+            SNAPSHOT (default): Freeze value, batch fills (backward compatible).
+            INCREMENTAL: Recompute value after each fill (most accurate).
+            HYBRID: Frozen targets, sequential fills (VBT-style).
+        schedule: Optional event, session, weekly, month-end, or explicit schedule.
+        calendar: Exchange calendar used to identify session closes and period ends. Required for
+            weekly and month-end schedules.
+        timezone: Timezone used to interpret naive feed timestamps.
+        session_start_time: Optional exchange-local session boundary in ``HH:MM`` form.
+        data_frequency: Feed frequency. Set this with ``timestamp_semantics`` for intraday data.
+        timestamp_semantics: Whether timestamps are session labels, bar closes, or event times.
+            Both metadata fields may be omitted only when each event is a daily session close.
+    """
+
+    # Trade thresholds
+    min_trade_value: float = 0.0
+    min_weight_change: float = 0.0
+
+    # Share handling
+    allow_fractional: bool | None = None  # None = defer to broker.share_type
+    round_lots: bool = False
+    lot_size: int = 100
+
+    # Position constraints
+    allow_short: bool = False
+    max_single_weight: float = 1.0
+    max_gross_leverage: float | None = None  # None = no cap, gatekeeper decides
+
+    # Order handling
+    cancel_before_rebalance: bool = True
+    account_for_pending: bool = True
+    rebalance_mode: RebalanceMode = RebalanceMode.SNAPSHOT
+    share_rounding: ShareRounding | str = ShareRounding.NEAREST
+    schedule: RebalanceSchedule | None = None
+    calendar: str | None = None
+    timezone: str | None = None
+    session_start_time: str | None = None
+    data_frequency: DataFrequency | str | None = None
+    timestamp_semantics: TimestampSemantics | str | None = None
+
+    def __post_init__(self) -> None:
+        self.share_rounding = ShareRounding(self.share_rounding)
+        if self.session_start_time is None:
+            return
+        from ..sessions import _validate_session_start_time
+
+        _validate_session_start_time(self.calendar, self.session_start_time)
+
+
+class TargetWeightExecutor:
+    """Convert target portfolio weights to orders.
+
+    Handles the common pattern of rebalancing to target weights:
+    - Computes required trades from current vs target positions
+    - Accounts for pending orders to prevent double-allocation
+    - Applies minimum trade thresholds
+    - Handles lot rounding and fractional shares
+    - Respects position limits
+
+    Example:
+        executor = TargetWeightExecutor(config=RebalanceConfig(
+            min_trade_value=500,
+            round_lots=True,
+        ))
+
+        # In strategy:
+        target_weights = {'AAPL': 0.3, 'GOOG': 0.3, 'MSFT': 0.4}
+        orders = executor.execute(target_weights, data, broker)
+    """
+
+    def __init__(self, config: RebalanceConfig | None = None):
+        """Initialize the executor with optional configuration.
+
+        Args:
+            config: Rebalancing configuration. Uses defaults if not provided.
+        """
+        self.config = config or RebalanceConfig()
+        self._schedule_evaluator: _OnlineRebalanceEvaluator | None = None
+        self._schedule_evaluator_config: tuple[object, ...] | None = None
+        self._ensure_schedule_evaluator()
+
+    def _schedule_config(self) -> tuple[object, ...]:
+        return tuple(getattr(self.config, name) for name in _SCHEDULE_CONFIG_FIELDS)
+
+    def _schedule_config_error(self, current: tuple[object, ...]) -> ValueError:
+        previous = self._schedule_evaluator_config
+        if previous is None:
+            return ValueError("RebalanceConfig changed during evaluation; call reset() first")
+        changes = ", ".join(
+            f"{name}: {old!r} -> {new!r}"
+            for name, old, new in zip(_SCHEDULE_CONFIG_FIELDS, previous, current, strict=True)
+            if old != new
+        )
+        return ValueError(
+            f"RebalanceConfig changed during evaluation ({changes}); call reset() first"
+        )
+
+    def _ensure_schedule_evaluator(self) -> _OnlineRebalanceEvaluator | None:
+        schedule = self.config.schedule
+        evaluator_config = self._schedule_config()
+        if evaluator_config != self._schedule_evaluator_config:
+            if self._schedule_evaluator is not None and self._schedule_evaluator.has_observations:
+                raise self._schedule_config_error(evaluator_config)
+            self._schedule_evaluator = (
+                None
+                if schedule is None
+                else _OnlineRebalanceEvaluator(
+                    schedule,
+                    calendar=self.config.calendar,
+                    timezone=self.config.timezone,
+                    session_start_time=self.config.session_start_time,
+                    data_frequency=self.config.data_frequency,
+                    timestamp_semantics=self.config.timestamp_semantics,
+                )
+            )
+            self._schedule_evaluator_config = evaluator_config
+        return self._schedule_evaluator
+
+    def reset(self) -> None:
+        """Clear schedule state before reusing this executor for another run."""
+        self._schedule_evaluator = None
+        self._schedule_evaluator_config = None
+
+    def should_rebalance(
+        self,
+        timestamp: datetime,
+        *,
+        is_session_close: bool | None = None,
+    ) -> bool:
+        """Evaluate one event in order; call this for every event when a schedule is set."""
+        evaluator = self._ensure_schedule_evaluator()
+        if evaluator is None:
+            return True
+        return evaluator.evaluate(
+            timestamp,
+            is_session_close=is_session_close,
+        )
+
+    def validate_completed_run(self) -> None:
+        """Validate schedule alignment after the final event in a complete run."""
+        evaluator = self._schedule_evaluator
+        if evaluator is None:
+            return
+        evaluator.validate_completed_run()
+
+    def _validate_engine_run(self, market_event_count: int) -> None:
+        evaluator = self._schedule_evaluator
+        if evaluator is None:
+            return
+        evaluator.validate_engine_run(market_event_count)
+
+    def execute(
+        self,
+        target_weights: dict[str, float],
+        data: dict[str, dict],
+        broker: Broker,
+        *,
+        timestamp: datetime | None = None,
+        is_session_close: bool | None = None,
+    ) -> list[Order]:
+        """Execute rebalancing to target weights.
+
+        Behavior depends on ``self.config.rebalance_mode``:
+
+        - **SNAPSHOT** (default): Compute portfolio value once, submit all orders,
+          fill at once. Backward compatible — matches the pre-v0.18 behavior.
+        - **INCREMENTAL**: Recompute portfolio value after each fill. Most accurate
+          cash tracking. Each target uses the latest portfolio state.
+        - **HYBRID**: Freeze portfolio value for target computation, but fill
+          sequentially (cash constraints checked against live state).
+
+        Args:
+            target_weights: Dict of asset -> target weight. Negative weights
+                express shorts. Gross exposure may exceed 1.0 when leverage is
+                enabled; ``max_gross_leverage`` and broker/account validation
+                control the allowed exposure.
+            data: Current bar data (for prices). Format: {asset: {'close': price, ...}}
+            broker: Broker instance for order submission.
+            timestamp: Current event time, required when a schedule is configured.
+            is_session_close: Explicit boundary signal for intraday feeds without a calendar.
+                When a schedule is configured, call ``execute`` for every event in order and call
+                ``validate_completed_run`` after the final event in standalone use. An Engine
+                broker registers and runs completion validation automatically.
+
+        Returns:
+            List of submitted orders.
+        """
+        if self.config.schedule is not None:
+            if timestamp is None:
+                raise ValueError("timestamp is required when RebalanceConfig.schedule is set")
+            broker._register_completion_validator(self, self._validate_engine_run)
+            if not self.should_rebalance(timestamp, is_session_close=is_session_close):
+                return []
+
+        # 1. Cancel pending orders if configured (prevents double-allocation)
+        if self.config.cancel_before_rebalance:
+            for pending_order in broker.get_pending_orders():
+                broker.cancel_order(pending_order.order_id)
+
+        equity = broker.get_account_value()
+        if equity <= 0:
+            return []
+
+        orders: list[Order] = []
+        mode = self.config.rebalance_mode
+        rebalance_id: str | None = None
+
+        def rebalance_options() -> SubmitOrderOptions:
+            nonlocal rebalance_id
+            if rebalance_id is None:
+                rebalance_id = broker._next_rebalance_id()
+            return SubmitOrderOptions(rebalance_id=rebalance_id)
+
+        # 2. Get current weights (effective or actual based on config)
+        if self.config.account_for_pending and not self.config.cancel_before_rebalance:
+            current_weights = self._get_effective_weights(broker, data)
+        else:
+            current_weights = self._get_current_weights(broker, data)
+
+        # 3. Apply gross leverage cap if configured (safety guardrail)
+        # Without a cap, the gatekeeper's buying power check is the constraint.
+        if self.config.max_gross_leverage is not None:
+            gross_weight = sum(abs(w) for w in target_weights.values())
+            if gross_weight > self.config.max_gross_leverage + 1e-6:
+                scale = self.config.max_gross_leverage / gross_weight
+                target_weights = {k: v * scale for k, v in target_weights.items()}
+
+        # 4. Build deterministic execution order:
+        # first reduce exposure (sells), then add exposure (buys).
+        reducing_assets: list[str] = []
+        increasing_assets: list[str] = []
+        for asset, target_wt in target_weights.items():
+            current_wt = current_weights.get(asset, 0.0)
+            if target_wt - current_wt < 0:
+                reducing_assets.append(asset)
+            else:
+                increasing_assets.append(asset)
+
+        # 5. Process reductions for target assets first (frees cash for buys).
+        for asset in reducing_assets:
+            target_wt = target_weights[asset]
+            order = self._process_asset(
+                asset,
+                target_wt,
+                current_weights,
+                equity,
+                data,
+                broker,
+                rebalance_id=rebalance_options().rebalance_id,
+            )
+            if order is not None:
+                orders.append(order)
+            if mode in (RebalanceMode.INCREMENTAL, RebalanceMode.HYBRID) and order is not None:
+                broker._process_orders()
+                if mode == RebalanceMode.INCREMENTAL:
+                    equity = broker.get_account_value()
+                    current_weights = self._get_current_weights(broker, data)
+
+        # 6. Close positions not in target before processing buy-side targets.
+        for asset in list(current_weights):
+            if asset not in target_weights:
+                pos = broker.get_position(asset)
+                if pos and pos.quantity != 0:
+                    close_order: Order | None = broker.close_position(
+                        asset, _options=rebalance_options()
+                    )
+                    if close_order:
+                        orders.append(close_order)
+
+                    # Process close orders immediately for INCREMENTAL/HYBRID
+                    if mode in (RebalanceMode.INCREMENTAL, RebalanceMode.HYBRID):
+                        broker._process_orders()
+                        if mode == RebalanceMode.INCREMENTAL:
+                            equity = broker.get_account_value()
+                            current_weights = self._get_current_weights(broker, data)
+
+        # 7. Process increases for target assets.
+        for asset in increasing_assets:
+            target_wt = target_weights[asset]
+            order = self._process_asset(
+                asset,
+                target_wt,
+                current_weights,
+                equity,
+                data,
+                broker,
+                rebalance_id=rebalance_options().rebalance_id,
+            )
+            if order is not None:
+                orders.append(order)
+            if mode in (RebalanceMode.INCREMENTAL, RebalanceMode.HYBRID) and order is not None:
+                broker._process_orders()
+                if mode == RebalanceMode.INCREMENTAL:
+                    equity = broker.get_account_value()
+                    current_weights = self._get_current_weights(broker, data)
+
+        return orders
+
+    def _process_asset(
+        self,
+        asset: str,
+        target_wt: float,
+        current_weights: dict[str, float],
+        equity: float,
+        data: dict[str, dict],
+        broker: Broker,
+        *,
+        rebalance_id: str | None = None,
+    ) -> Order | None:
+        """Process a single asset for rebalancing.
+
+        Returns:
+            Order if trade needed, None otherwise.
+        """
+        # Apply constraints
+        target_wt = min(target_wt, self.config.max_single_weight)
+        if target_wt < 0 and not self.config.allow_short:
+            target_wt = 0
+
+        current_wt = current_weights.get(asset, 0.0)
+        weight_delta = target_wt - current_wt
+
+        # Skip small weight changes
+        if abs(weight_delta) < self.config.min_weight_change:
+            return None
+
+        # Get price
+        price = self._get_rebalance_price(asset, data)
+        if price is None or price <= 0:
+            return None
+
+        # Compute trade value
+        delta_value = equity * weight_delta
+
+        # Skip small trades
+        if abs(delta_value) < self.config.min_trade_value:
+            return None
+
+        # Compute shares (account for contract multiplier for futures)
+        multiplier = broker.get_multiplier(asset)
+        shares = self._quantize_shares(delta_value / (price * multiplier), broker)
+
+        if shares == 0:
+            return None
+
+        # Submit order
+        side = OrderSide.BUY if shares > 0 else OrderSide.SELL
+        options = SubmitOrderOptions(
+            rebalance_id=rebalance_id,
+            priority_notional=abs(delta_value),
+        )
+        return broker.submit_order(asset, abs(shares), side, _options=options)
+
+    def _get_rebalance_price(self, asset: str, data: dict[str, dict]) -> float | None:
+        """Return the current bar close used for new rebalance trades."""
+        asset_data = data.get(asset) or {}
+        return asset_data.get("close")
+
+    def _quantize_shares(self, shares: float, broker: Broker) -> float:
+        """Quantize rebalance share deltas to the broker's share granularity.
+
+        For target-weight rebalancing under integer-share mode, round to the
+        nearest whole share instead of truncating toward zero. Truncation
+        systematically under-trades one-sided targets and can create extra
+        correction rebalances over time.
+        """
+        use_fractional = self.config.allow_fractional
+        if use_fractional is None:
+            use_fractional = (
+                getattr(broker, "share_type", ShareType.INTEGER) == ShareType.FRACTIONAL
+            )
+
+        if self.config.round_lots:
+            rounded_lots = round(shares / self.config.lot_size) * self.config.lot_size
+            if use_fractional:
+                return rounded_lots
+            return int(rounded_lots)
+        if use_fractional:
+            return shares
+        if self.config.share_rounding is ShareRounding.TRUNCATE:
+            return int(shares)
+        rounded = math.copysign(math.floor(abs(shares) + 0.5), shares)
+        return int(rounded)
+
+    def _get_position_price(
+        self,
+        asset: str,
+        pos,
+        data: dict[str, dict],
+        broker: Broker,
+    ) -> float | None:
+        """Return a mark price for an existing position, tolerating sparse bars."""
+        price = self._get_rebalance_price(asset, data)
+        if price is None:
+            price = broker.get_price_for_source(ExecutionPrice.PRICE, asset)
+        if price is None:
+            price = broker.get_last_price(asset)
+        if price is None:
+            price = pos.current_price
+        if price is None:
+            price = pos.entry_price
+        return price
+
+    def _get_current_weights(self, broker: Broker, data: dict[str, dict]) -> dict[str, float]:
+        """Get current portfolio weights from held positions only.
+
+        Args:
+            broker: Broker instance.
+            data: Current bar data for prices.
+
+        Returns:
+            Dict of asset -> current weight.
+        """
+        equity = broker.get_account_value()
+        if equity <= 0:
+            return {}
+
+        weights = {}
+        for asset, pos in broker.get_positions().items():
+            price = self._get_position_price(asset, pos, data, broker)
+            if price is None or price <= 0:
+                continue
+            multiplier = broker.get_multiplier(asset)
+            value = pos.quantity * price * multiplier
+            weights[asset] = value / equity
+
+        return weights
+
+    def _get_effective_weights(self, broker: Broker, data: dict[str, dict]) -> dict[str, float]:
+        """Get effective weights including pending orders.
+
+        This prevents double-allocation when execute() is called multiple times
+        before orders fill (e.g., with ExecutionMode.NEXT_BAR or LIMIT orders).
+
+        Args:
+            broker: Broker instance.
+            data: Current bar data for prices.
+
+        Returns:
+            Dict of asset -> effective weight (positions + pending orders).
+        """
+        equity = broker.get_account_value()
+        if equity <= 0:
+            return {}
+
+        # Start with actual positions
+        effective_value: dict[str, float] = {}
+        for asset, pos in broker.get_positions().items():
+            price = self._get_position_price(asset, pos, data, broker)
+            if price is None or price <= 0:
+                continue
+            multiplier = broker.get_multiplier(asset)
+            effective_value[asset] = pos.quantity * price * multiplier
+
+        # Add net value of pending orders
+        for order in broker.get_pending_orders():
+            price = order.limit_price or data.get(order.asset, {}).get("close")
+            if price is not None and price > 0:
+                multiplier = broker.get_multiplier(order.asset)
+                # BUY adds value, SELL subtracts
+                sign = 1 if order.side == OrderSide.BUY else -1
+                delta = order.quantity * price * sign * multiplier
+                effective_value[order.asset] = effective_value.get(order.asset, 0) + delta
+
+        return {k: v / equity for k, v in effective_value.items()}
+
+    def preview(
+        self,
+        target_weights: dict[str, float],
+        data: dict[str, dict],
+        broker: Broker,
+    ) -> list[dict]:
+        """Preview trades without executing.
+
+        Useful for debugging and understanding what trades would be generated.
+
+        Args:
+            target_weights: Dict of asset -> target weight.
+            data: Current bar data.
+            broker: Broker instance.
+
+        Returns:
+            List of trade previews with asset, current_weight, target_weight,
+            shares, value, and skip_reason (if applicable).
+        """
+        equity = broker.get_account_value()
+        if equity <= 0:
+            return []
+
+        if self.config.account_for_pending and not self.config.cancel_before_rebalance:
+            current_weights = self._get_effective_weights(broker, data)
+        else:
+            current_weights = self._get_current_weights(broker, data)
+
+        previews = []
+
+        for asset, target_wt in target_weights.items():
+            current_wt = current_weights.get(asset, 0.0)
+            price = self._get_rebalance_price(asset, data)
+            weight_delta = target_wt - current_wt
+
+            if price is not None and price > 0:
+                multiplier = broker.get_multiplier(asset)
+                delta_value = equity * weight_delta
+                shares = delta_value / (price * multiplier)
+
+                quantized_shares = self._quantize_shares(shares, broker)
+
+                # Determine if would be skipped
+                skip_reason = None
+                if abs(weight_delta) < self.config.min_weight_change:
+                    skip_reason = "weight_change_too_small"
+                elif abs(delta_value) < self.config.min_trade_value:
+                    skip_reason = "trade_value_too_small"
+                elif quantized_shares == 0:
+                    skip_reason = "rounds_to_zero_shares"
+
+                previews.append(
+                    {
+                        "asset": asset,
+                        "current_weight": current_wt,
+                        "target_weight": target_wt,
+                        "weight_delta": weight_delta,
+                        "shares": shares,
+                        "quantized_shares": quantized_shares,
+                        "value": delta_value,
+                        "skip_reason": skip_reason,
+                    }
+                )
+
+        # Add positions not in target (will be closed)
+        for asset in current_weights:
+            if asset not in target_weights:
+                pos = broker.get_position(asset)
+                if pos and pos.quantity != 0:
+                    price = self._get_position_price(asset, pos, data, broker)
+                    if price is None or price <= 0:
+                        continue
+                    multiplier = broker.get_multiplier(asset)
+                    current_wt = current_weights.get(asset, 0.0)
+                    previews.append(
+                        {
+                            "asset": asset,
+                            "current_weight": current_wt,
+                            "target_weight": 0.0,
+                            "weight_delta": -current_wt,
+                            "shares": -pos.quantity,
+                            "value": -pos.quantity * price * multiplier,
+                            "skip_reason": None,
+                            "action": "close_position",
+                        }
+                    )
+
+        return previews

@@ -1,0 +1,1503 @@
+"""
+Backtest Configuration
+
+Centralized configuration for all backtesting behavior. This allows:
+1. Consistent behavior across all backtests
+2. Easy replication of other frameworks (Backtrader, VectorBT, Zipline)
+3. Clear documentation of all configurable behaviors
+4. No code changes needed - just swap configuration files
+
+Usage:
+    from ml4t.backtest import BacktestConfig
+
+    # Load default config
+    config = BacktestConfig()
+
+    # Load preset (e.g., backtrader-compatible)
+    config = BacktestConfig.from_preset("backtrader")
+
+    # Load from file
+    config = BacktestConfig.from_yaml("my_config.yaml")
+"""
+
+from __future__ import annotations
+
+import math
+import os
+from dataclasses import asdict, dataclass, field, replace
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+import yaml
+from ml4t.specs.base import serialize_artifact_value
+from ml4t.specs.market_data import FeedSpec, TimestampSemantics
+
+from .types import ExecutionMode, StopFillMode, StopLevelBasis
+
+
+def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge two dicts without mutating either input."""
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_yaml_mapping(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise TypeError(f"Expected mapping in {path}, got {type(data).__name__}")
+    return data
+
+
+def _resolve_user_config_dir(config_dir: str | Path | None) -> Path:
+    if config_dir is not None:
+        return Path(config_dir)
+    xdg_home = os.environ.get("XDG_CONFIG_HOME")
+    if xdg_home:
+        return Path(xdg_home) / "ml4t" / "backtest"
+    return Path.home() / ".config" / "ml4t" / "backtest"
+
+
+class ExecutionPrice(str, Enum):
+    """Price used for order execution."""
+
+    PRICE = "price"  # Use FeedSpec.price_col / broker reference price
+    CLOSE = "close"  # Use bar's close price
+    OPEN = "open"  # Use bar's open price
+    VWAP = "vwap"  # Volume-weighted average price (requires volume data)
+    MID = "mid"  # (high + low) / 2
+    BID = "bid"  # Use best bid quote
+    ASK = "ask"  # Use best ask quote
+    QUOTE_MID = "quote_mid"  # Use quote midpoint
+    QUOTE_SIDE = "quote_side"  # Buy at ask / sell at bid
+
+
+class ShareType(str, Enum):
+    """Type of share quantities allowed."""
+
+    FRACTIONAL = "fractional"  # Allow fractional shares (0.5, 1.234, etc.)
+    INTEGER = "integer"  # Round down to whole shares (like most real brokers)
+
+
+class ShareRounding(str, Enum):
+    """Integer-share rounding used during target-weight sizing."""
+
+    NEAREST = "nearest"
+    TRUNCATE = "truncate"
+
+
+class FillOrdering(str, Enum):
+    """Order processing sequence within a single bar.
+
+    Controls how pending orders are sequenced during fill processing:
+
+    EXIT_FIRST (default):
+        All exits → mark-to-market → all entries (with gatekeeper validation).
+        Capital-efficient: exits free cash before entries need it.
+        Matches engines that explicitly process reductions before additions.
+
+    FIFO:
+        Orders process in submission order with sequential cash updates.
+        Each order's gatekeeper check sees cash from all prior fills.
+        Matches Backtrader's submission-order processing.
+
+    SEQUENTIAL:
+        Orders process in submission order (typically alphabetical by asset)
+        without exit/entry separation. Cash updates after each individual fill.
+        Unlike EXIT_FIRST, exits do not pre-free cash for later entries.
+        Matches LEAN's per-order sequential buying-power model.
+
+    PRIORITY:
+        Sort all orders as one sequence using ``entry_order_priority``. This preserves
+        combined reversal orders and matches portfolio simulators whose automatic call
+        sequence does not separate exits from entries.
+    """
+
+    EXIT_FIRST = "exit_first"
+    FIFO = "fifo"
+    SEQUENTIAL = "sequential"
+    PRIORITY = "priority"
+
+
+class EntryOrderPriority(str, Enum):
+    """Priority for sequencing entry orders under cash constraints.
+
+    Applied to entries under ``fill_ordering=EXIT_FIRST`` and to the complete order
+    sequence under ``fill_ordering=PRIORITY``.
+
+    SUBMISSION:
+        Keep strategy submission order.
+
+    NOTIONAL_DESC:
+        Process larger notional entries first.
+
+    NOTIONAL_ASC:
+        Process smaller notional entries first.
+
+    FREE_CASH_ASC:
+        Process orders by their estimated free-cash use, including collateral released by
+        reversals.
+
+    ORDER_VALUE_ASC:
+        Process entries by signed target-order value, with sell orders before buy orders.
+    """
+
+    SUBMISSION = "submission"
+    NOTIONAL_DESC = "notional_desc"
+    NOTIONAL_ASC = "notional_asc"
+    FREE_CASH_ASC = "free_cash_asc"
+    ORDER_VALUE_ASC = "order_value_asc"
+
+
+class ShortCashPolicy(str, Enum):
+    """How short-sale proceeds affect spendable cash in non-levered accounts.
+
+    CREDIT:
+        Legacy behavior: short entries are cash-checked by notional.
+
+    CREDIT_PROCEEDS:
+        Short proceeds are immediately spendable for new entries/reversals.
+
+    LOCK_NOTIONAL:
+        Lock short notional as collateral from spendable cash.
+        This emulates engines that reserve short proceeds under constraints.
+    """
+
+    CREDIT = "credit"
+    CREDIT_PROCEEDS = "credit_proceeds"
+    LOCK_NOTIONAL = "lock_notional"
+
+
+class LockNotionalUpdateMode(str, Enum):
+    """Floating-point operation order for locked-notional cash updates.
+
+    POSITION_LEGS:
+        Settle closing and opening position legs separately.
+
+    COMBINED_ORDER:
+        Settle the gross cash and short-debt effects as one order.
+    """
+
+    POSITION_LEGS = "position_legs"
+    COMBINED_ORDER = "combined_order"
+
+
+class RebalanceMode(str, Enum):
+    """How portfolio value is computed during multi-asset rebalancing.
+
+    When rebalancing across multiple assets, the engine must decide whether
+    to recompute portfolio value after each fill or freeze it. Real brokers
+    differ: some snapshot account value at order placement, others update
+    incrementally as each fill settles.
+
+    SNAPSHOT:
+        Freeze portfolio value at the start of the rebalance. All targets
+        computed from the same base, orders batch and fill at once. Matches
+        Backtrader's ``order_target_percent`` in ``next()`` where
+        ``broker.getvalue()`` is constant across all submissions.
+
+    INCREMENTAL:
+        Recompute portfolio value after each asset's order fills. Most
+        accurate cash tracking — each target uses the latest portfolio
+        state. May produce more trades than SNAPSHOT because cascading
+        value changes create small corrections.
+
+    HYBRID:
+        Freeze portfolio value for target computation, but fill
+        sequentially (cash constraints checked against live state).
+        Matches VectorBT's default behavior with ``auto_call_seq=False``
+        and ``update_value=False``.
+    """
+
+    SNAPSHOT = "snapshot"
+    INCREMENTAL = "incremental"
+    HYBRID = "hybrid"
+
+
+class MissingPricePolicy(str, Enum):
+    """How target-weight rebalancing handles missing current-bar prices."""
+
+    SKIP = "skip"
+    USE_LAST = "use_last"
+
+
+class LateAssetPolicy(str, Enum):
+    """How target-weight rebalancing handles assets that start late."""
+
+    ALLOW = "allow"
+    REQUIRE_HISTORY = "require_history"
+
+
+class CommissionType(str, Enum):
+    """Commission calculation method."""
+
+    NONE = "none"  # No commission
+    PERCENTAGE = "percentage"  # % of trade value
+    PER_SHARE = "per_share"  # Fixed amount per share/contract
+    PER_CONTRACT = "per_share"  # Alias for PER_SHARE (futures convention)
+    PER_TRADE = "per_trade"  # Fixed amount per trade
+    TIERED = "tiered"  # Volume-based tiers
+
+    @classmethod
+    def _missing_(cls, value: object) -> CommissionType | None:
+        if value == "per_contract":
+            return cls.PER_SHARE
+        return None
+
+
+class SlippageType(str, Enum):
+    """Slippage calculation method."""
+
+    NONE = "none"  # No slippage
+    PERCENTAGE = "percentage"  # % of price
+    FIXED = "fixed"  # Fixed dollar amount
+    SPREAD = "spread"  # Bid-ask spread approximation in currency units
+    VOLUME_BASED = "volume_based"  # Based on trade size vs volume
+
+
+class DataFrequency(str, Enum):
+    """Data frequency for the backtest."""
+
+    DAILY = "daily"  # Daily bars (EOD)
+    MINUTE_1 = "1m"  # 1-minute bars
+    MINUTE_5 = "5m"  # 5-minute bars
+    MINUTE_15 = "15m"  # 15-minute bars
+    MINUTE_30 = "30m"  # 30-minute bars
+    HOURLY = "1h"  # Hourly bars
+    IRREGULAR = "irregular"  # Trade bars, tick aggregations (no fixed frequency)
+
+
+class WaterMarkSource(str, Enum):
+    """Source for water mark updates in trailing stops.
+
+    Controls which price is used to update water marks on each bar AFTER entry.
+    Works for both LONG (High Water Mark) and SHORT (Low Water Mark) positions:
+
+    - CLOSE: Use close prices for water mark updates (default, simpler behavior)
+    - BAR_EXTREME: Use HIGH for HWM (longs), LOW for LWM (shorts) - VBT Pro OHLC mode
+
+    This is direction-agnostic and works identically for long-only, short-only,
+    or combined long-short strategies.
+
+    Note: Initial water mark on entry bar is controlled by InitialHwmSource.
+    """
+
+    CLOSE = "close"  # Use close prices for water mark updates (default)
+    BAR_EXTREME = "bar_extreme"  # Use HIGH for HWM, LOW for LWM (VBT Pro with OHLC)
+
+
+class InitialHwmSource(str, Enum):
+    """Source for initial high-water mark on position entry.
+
+    Controls what price is used for HWM when a new position is created:
+    - FILL_PRICE: Use the actual fill price including slippage (default)
+    - SIGNAL_PRICE: Use the price observed when the entry order was submitted
+    - BAR_CLOSE: Use the bar's close price
+    - BAR_HIGH: Use the bar's high price (VBT Pro with OHLC data)
+
+    VBT Pro with OHLC data uses BAR_HIGH for initial HWM. This is because
+    VBT Pro updates HWM from bar highs vectorially, including the entry bar.
+    Most event-driven frameworks use the actual fill price.
+    """
+
+    FILL_PRICE = "fill_price"  # Use fill price (default, most frameworks)
+    SIGNAL_PRICE = "signal_price"  # Use the entry order's signal price (Backtrader)
+    BAR_CLOSE = "bar_close"  # Use bar's close
+    BAR_HIGH = "bar_high"  # Use bar's high (VBT Pro with OHLC)
+
+
+class SpreadConvention(str, Enum):
+    """Interpretation of user-provided spread values."""
+
+    FULL_SPREAD = "full_spread"  # Convert full quoted spread to half-spread per side
+    HALF_SPREAD = "half_spread"  # Treat provided value as per-side crossing cost
+
+
+def _feed_spec_to_dict(feed_spec: FeedSpec) -> dict[str, Any]:
+    """Serialize feed metadata to plain Python data for config round-trips."""
+    return serialize_artifact_value(asdict(feed_spec))
+
+
+def _coerce_margin_schedule(
+    schedule: dict[str, tuple[float, float]] | None,
+) -> dict[str, Any] | None:
+    if schedule is None:
+        return None
+    coerced: dict[str, Any] = {}
+    for asset, value in schedule.items():
+        if not isinstance(value, list | tuple):
+            coerced[asset] = value
+            continue
+        try:
+            initial, maintenance = value
+            coerced[asset] = (float(initial), float(maintenance))
+        except (OverflowError, TypeError, ValueError):
+            coerced[asset] = value
+    return coerced
+
+
+def _margin_schedule_to_dict(
+    schedule: dict[str, tuple[float, float]] | None,
+) -> dict[str, Any] | None:
+    if schedule is None:
+        return None
+    serialized: dict[str, Any] = {}
+    for asset, value in schedule.items():
+        if not isinstance(value, list | tuple):
+            serialized[asset] = _serialize_invalid_margin_scalar(value)
+            continue
+        try:
+            initial, maintenance = value
+            serialized[asset] = [float(initial), float(maintenance)]
+        except (OverflowError, TypeError, ValueError):
+            serialized[asset] = _serialize_invalid_margin_schedule_value(value)
+    return serialized
+
+
+def _serialize_invalid_margin_schedule_value(value: Any) -> Any:
+    if not isinstance(value, list | tuple):
+        return _serialize_invalid_margin_scalar(value)
+    return [_serialize_invalid_margin_scalar(item) for item in value]
+
+
+def _serialize_invalid_margin_scalar(value: Any) -> Any:
+    serialized = serialize_artifact_value(value)
+    if isinstance(serialized, str | int | float | bool) or serialized is None:
+        return serialized
+    return repr(serialized)
+
+
+def _validate_margin_pct_schedule(
+    schedule: dict[str, tuple[float, float]] | None,
+) -> list[str]:
+    issues: list[str] = []
+    if schedule is None:
+        return issues
+    for asset, value in schedule.items():
+        if not isinstance(value, list | tuple):
+            issues.append(
+                f"margin_pct_schedule[{asset!r}] must be a two-item (initial, maintenance) sequence"
+            )
+            continue
+        try:
+            initial, maintenance = value
+        except (TypeError, ValueError):
+            issues.append(
+                f"margin_pct_schedule[{asset!r}] must be a two-item (initial, maintenance) sequence"
+            )
+            continue
+        try:
+            initial = float(initial)
+            maintenance = float(maintenance)
+        except (OverflowError, TypeError, ValueError):
+            issues.append(f"margin_pct_schedule[{asset!r}] values must be numeric")
+            continue
+        if not 0.0 < initial <= 1.0:
+            issues.append(
+                f"margin_pct_schedule[{asset!r}] initial margin ({initial}) must be in (0.0, 1.0]"
+            )
+        if not 0.0 < maintenance <= 1.0:
+            issues.append(
+                f"margin_pct_schedule[{asset!r}] maintenance margin ({maintenance}) "
+                "must be in (0.0, 1.0]"
+            )
+        if 0.0 < maintenance <= 1.0 and 0.0 < initial <= 1.0 and maintenance >= initial:
+            issues.append(
+                f"margin_pct_schedule[{asset!r}] maintenance margin ({maintenance}) "
+                f"must be < initial margin ({initial})"
+            )
+    return issues
+
+
+def _to_backtest_frequency(value: DataFrequency | Any | None) -> DataFrequency | None:
+    if value is None:
+        return None
+    if isinstance(value, DataFrequency):
+        return value
+    if isinstance(value, Enum):
+        value = value.value
+
+    normalized = str(value).strip().lower()
+    mapping = {
+        "daily": DataFrequency.DAILY,
+        "1d": DataFrequency.DAILY,
+        "d": DataFrequency.DAILY,
+        "weekly": DataFrequency.IRREGULAR,
+        "monthly": DataFrequency.IRREGULAR,
+        "minute": DataFrequency.MINUTE_1,
+        "1m": DataFrequency.MINUTE_1,
+        "1min": DataFrequency.MINUTE_1,
+        "5m": DataFrequency.MINUTE_5,
+        "5min": DataFrequency.MINUTE_5,
+        "5minute": DataFrequency.MINUTE_5,
+        "15m": DataFrequency.MINUTE_15,
+        "15min": DataFrequency.MINUTE_15,
+        "15minute": DataFrequency.MINUTE_15,
+        "30m": DataFrequency.MINUTE_30,
+        "30min": DataFrequency.MINUTE_30,
+        "30minute": DataFrequency.MINUTE_30,
+        "hour": DataFrequency.HOURLY,
+        "hourly": DataFrequency.HOURLY,
+        "1h": DataFrequency.HOURLY,
+        "tick": DataFrequency.IRREGULAR,
+        "second": DataFrequency.IRREGULAR,
+    }
+    return mapping.get(normalized, DataFrequency.IRREGULAR)
+
+
+class TrailStopTiming(str, Enum):
+    """Timing of water mark update relative to trailing stop check.
+
+    Controls when water marks are updated for trailing stop calculation:
+
+    LAGGED mode (formerly END_OF_BAR):
+        1. Check stop using HWM/LWM from PREVIOUS bar
+        2. Update HWM/LWM at end of current bar
+        ⚠️ This causes 1-bar delay in stop triggers vs VBT Pro
+
+    INTRABAR mode:
+        1. Compute live water mark: max/min(previous, current_bar_extreme)
+        2. Check stop using live water mark against HIGH/LOW
+        3. If triggered, fill per StopFillMode configuration
+        4. Update water mark at end of bar
+        ⚠️ Too aggressive - triggers on HIGH when VBT Pro only checks CLOSE
+
+    VBT_PRO mode (true VBT Pro compatible, two-pass algorithm):
+        1. First pass: Check stop using LAGGED water mark against HIGH/LOW
+        2. If first pass doesn't trigger, update water mark from current bar extreme
+        3. Second pass: Check stop using UPDATED water mark against CLOSE only
+        4. This matches VBT Pro's exact algorithm where the second pass can only
+           use CLOSE (can_use_ohlc=False in VBT Pro source code)
+
+    VBT_PRO mode for SHORT positions:
+        Pass 1: LWM from previous bar, check if HIGH >= stop
+        Pass 2: Update LWM from bar_low, check if CLOSE >= stop (not HIGH!)
+
+    VBT_PRO mode for LONG positions:
+        Pass 1: HWM from previous bar, check if LOW <= stop
+        Pass 2: Update HWM from bar_high, check if CLOSE <= stop (not LOW!)
+    """
+
+    LAGGED = "lagged"  # Use previous bar's water mark (1-bar lag)
+    INTRABAR = "intrabar"  # Update water mark before check, triggers on HIGH/LOW
+    VBT_PRO = "vbt_pro"  # Two-pass: LAGGED check, then INTRABAR check using CLOSE only
+
+
+@dataclass
+class StatsConfig:
+    """Configuration for per-asset trading statistics tracking.
+
+    Controls how AssetTradingStats are computed and managed during backtesting.
+
+    Attributes:
+        recent_window_size: Number of recent trades to track (default 50).
+            Larger windows provide more stable statistics but slower response
+            to regime changes. Recommended: 3x average holding period in bars.
+        track_session_stats: Whether to track per-session statistics.
+            Requires session configuration to detect session boundaries.
+        enabled: Whether stats tracking is enabled. Disable for maximum
+            performance when stats are not needed.
+
+    Example:
+        # Configure stats for a strategy with ~3 day average holding period
+        config = StatsConfig(
+            recent_window_size=100,  # ~1 month of trades
+            track_session_stats=True,
+        )
+        broker.configure_stats(config)
+    """
+
+    recent_window_size: int = 50
+    track_session_stats: bool = True
+    enabled: bool = True
+
+
+@dataclass
+class BacktestConfig:
+    """
+    Complete configuration for backtesting behavior.
+
+    All behavioral differences between frameworks are captured here.
+    Load presets to match specific frameworks exactly.
+
+    This is the single source of truth for all backtest settings.
+    Broker and Engine are configured entirely from this dataclass.
+    """
+
+    # === Account Type (replaces class hierarchy) ===
+    allow_short_selling: bool = False  # True for margin/crypto
+    allow_leverage: bool = False  # True for margin only
+    initial_margin: float = 0.5  # Only used if allow_leverage=True (Reg T = 0.5)
+    long_maintenance_margin: float = 0.25  # Reg T standard for longs
+    short_maintenance_margin: float = 0.30  # Reg T standard for shorts (higher!)
+    fixed_margin_schedule: dict[str, tuple[float, float]] | None = None  # For futures
+    margin_pct_schedule: dict[str, tuple[float, float]] | None = None  # Price-aware futures margin
+    short_cash_policy: ShortCashPolicy = ShortCashPolicy.CREDIT
+    lock_notional_update_mode: LockNotionalUpdateMode = LockNotionalUpdateMode.POSITION_LEGS
+
+    # === Execution Timing ===
+    execution_price: ExecutionPrice = ExecutionPrice.OPEN
+    mark_price: ExecutionPrice = ExecutionPrice.PRICE
+    execution_mode: ExecutionMode = ExecutionMode.NEXT_BAR  # Order execution timing
+
+    # === Stop Configuration ===
+    stop_fill_mode: StopFillMode = StopFillMode.STOP_PRICE
+    stop_level_basis: StopLevelBasis = StopLevelBasis.FILL_PRICE
+    trail_hwm_source: WaterMarkSource = WaterMarkSource.CLOSE
+    trail_include_entry_bar_extremes: bool = False
+    initial_hwm_source: InitialHwmSource = InitialHwmSource.FILL_PRICE
+    trail_stop_timing: TrailStopTiming = TrailStopTiming.LAGGED
+
+    def validate(self, warn: bool = True) -> list[str]:
+        """Validate configuration and return warnings for edge cases.
+
+        Checks for configurations that may produce unexpected results or
+        indicate potential issues. Returns a list of warning messages.
+
+        Args:
+            warn: If True, emit warnings via warnings.warn(). Default True.
+
+        Returns:
+            List of warning message strings (empty if no issues found).
+
+        Example:
+            config = BacktestConfig(execution_mode=ExecutionMode.SAME_BAR)
+            warnings = config.validate()
+            # ["SAME_BAR execution has look-ahead bias risk..."]
+        """
+        import warnings as _warnings
+
+        issues: list[str] = self._execution_validation_errors()
+
+        # Look-ahead bias warning
+        if self.execution_mode == ExecutionMode.SAME_BAR:
+            issues.append(
+                "SAME_BAR execution has look-ahead bias risk. "
+                "Use NEXT_BAR execution mode for realistic backtesting."
+            )
+
+        # Zero cost warning
+        if self.commission_type == CommissionType.NONE and self.slippage_type == SlippageType.NONE:
+            issues.append(
+                "Both commission and slippage are disabled. Results may be overly optimistic."
+            )
+
+        # Volume-based slippage without partial fills
+        if self.slippage_type == SlippageType.VOLUME_BASED and not self.partial_fills_allowed:
+            issues.append(
+                "Volume-based slippage without partial_fills_allowed may cause "
+                "orders to be rejected in low-volume conditions."
+            )
+
+        # High slippage + high commission
+        total_cost = self.slippage_rate + self.commission_rate
+        if total_cost > 0.01:  # > 1% round-trip
+            issues.append(
+                f"Total transaction cost ({total_cost:.2%}) is high. "
+                "Verify this matches your broker's actual costs."
+            )
+
+        if (
+            self.slippage_type == SlippageType.SPREAD
+            and self.slippage_spread == 0.0
+            and not self.slippage_spread_by_asset
+        ):
+            issues.append(
+                "slippage_type='spread' requires slippage_spread > 0 or "
+                "slippage_spread_by_asset entries."
+            )
+
+        # Fractional shares warning for production
+        if self.share_type == ShareType.FRACTIONAL and self.preset_name == "realistic":
+            issues.append(
+                "REALISTIC preset with fractional shares may not match all brokers. "
+                "Set share_type=INTEGER for most accurate simulation."
+            )
+
+        # Margin parameter validation
+        if self.allow_leverage:
+            if not 0.0 < self.initial_margin <= 1.0:
+                issues.append(f"initial_margin ({self.initial_margin}) must be in (0.0, 1.0]")
+            if not 0.0 < self.long_maintenance_margin <= 1.0:
+                issues.append(
+                    f"long_maintenance_margin ({self.long_maintenance_margin}) must be in (0.0, 1.0]"
+                )
+            if not 0.0 < self.short_maintenance_margin <= 1.0:
+                issues.append(
+                    f"short_maintenance_margin ({self.short_maintenance_margin}) must be in (0.0, 1.0]"
+                )
+            if self.long_maintenance_margin >= self.initial_margin:
+                issues.append(
+                    f"long_maintenance_margin ({self.long_maintenance_margin}) must be < "
+                    f"initial_margin ({self.initial_margin})"
+                )
+            if self.short_maintenance_margin >= self.initial_margin:
+                issues.append(
+                    f"short_maintenance_margin ({self.short_maintenance_margin}) must be < "
+                    f"initial_margin ({self.initial_margin})"
+                )
+
+        fixed_assets = set(self.fixed_margin_schedule or {})
+        pct_assets = set(self.margin_pct_schedule or {})
+        overlapping_margin_assets = sorted(fixed_assets & pct_assets)
+        if overlapping_margin_assets:
+            issues.append(
+                "fixed_margin_schedule and margin_pct_schedule cannot both define: "
+                f"{overlapping_margin_assets}"
+            )
+        issues.extend(_validate_margin_pct_schedule(self.margin_pct_schedule))
+
+        if self.settlement_delay < 0 or self.settlement_delay > 5:
+            issues.append(
+                f"settlement_delay ({self.settlement_delay}) should be 0-5. "
+                "Values count processed bars: 0 is instant, 1 delays one bar."
+            )
+
+        if not 0.0 < self.rebalance_headroom_pct <= 1.0:
+            issues.append(
+                f"rebalance_headroom_pct ({self.rebalance_headroom_pct}) must be in (0.0, 1.0]"
+            )
+        if self.late_asset_min_bars < 1:
+            issues.append(f"late_asset_min_bars ({self.late_asset_min_bars}) must be >= 1")
+
+        # Emit warnings if requested
+        if warn and issues:
+            for msg in issues:
+                _warnings.warn(msg, UserWarning, stacklevel=2)
+
+        return issues
+
+    def _execution_validation_errors(self) -> list[str]:
+        errors: list[str] = []
+        cost_fields = (
+            "commission_rate",
+            "commission_per_share",
+            "commission_per_trade",
+            "commission_minimum",
+            "slippage_rate",
+            "slippage_fixed",
+            "slippage_spread",
+            "stop_slippage_rate",
+        )
+        for field_name in cost_fields:
+            value = getattr(self, field_name)
+            try:
+                valid = math.isfinite(value) and value >= 0.0
+            except TypeError:
+                valid = False
+            if not valid:
+                errors.append(f"{field_name} ({value!r}) must be finite and >= 0")
+
+        for asset, spread in self.slippage_spread_by_asset.items():
+            try:
+                valid = math.isfinite(spread) and spread >= 0.0
+            except TypeError:
+                valid = False
+            if not valid:
+                errors.append(
+                    f"slippage_spread_by_asset[{asset!r}] ({spread!r}) must be finite and >= 0"
+                )
+        return errors
+
+    def _validate_for_execution(self) -> None:
+        errors = self._execution_validation_errors()
+        if errors:
+            raise ValueError("Invalid BacktestConfig: " + "; ".join(errors))
+
+    def get_effective_account_settings(self) -> tuple[bool, bool]:
+        """Get account settings as a tuple.
+
+        Returns:
+            Tuple of (allow_short_selling, allow_leverage)
+        """
+        return self.allow_short_selling, self.allow_leverage
+
+    def get_effective_account_type(self) -> str:
+        """Get account type string based on current settings.
+
+        Returns:
+            "cash", "crypto", or "margin" based on flags.
+        """
+        if self.allow_leverage:
+            return "margin"
+        elif self.allow_short_selling:
+            return "crypto"
+        else:
+            return "cash"
+
+    # === Position Sizing ===
+    share_type: ShareType = ShareType.INTEGER
+    share_rounding: ShareRounding = ShareRounding.NEAREST
+
+    # === Commission ===
+    commission_type: CommissionType = CommissionType.NONE
+    commission_rate: float = 0.0  # % of trade value (if percentage model)
+    commission_per_share: float = 0.0  # $ per share (if per_share model)
+    commission_per_trade: float = 0.0  # $ per trade (if per_trade model)
+    commission_minimum: float = 0.0  # Minimum commission per trade
+
+    # === Slippage ===
+    slippage_type: SlippageType = SlippageType.NONE
+    slippage_rate: float = 0.0  # % of price (if percentage model)
+    slippage_fixed: float = 0.0  # $ per share (if fixed model)
+    slippage_spread: float = 0.0  # Quoted spread in currency units (if spread model)
+    slippage_spread_by_asset: dict[str, float] = field(default_factory=dict)
+    slippage_spread_convention: SpreadConvention = SpreadConvention.FULL_SPREAD
+    stop_slippage_rate: float = 0.0  # Additional slippage for stop/risk exits (on top of normal)
+
+    # === Cash Management ===
+    initial_cash: float = 100000.0
+    cash_buffer_pct: float = 0.0  # Reserve this % of cash (0 = use all)
+
+    # === Settlement ===
+    settlement_delay: int = 0  # Bars until sale proceeds are spendable (T+0 default)
+    settlement_reduces_buying_power: bool = True  # Unsettled cash reduces buying power
+
+    # === Order Handling ===
+    reject_on_insufficient_cash: bool = True
+    skip_cash_validation: bool = (
+        False  # True = bypass gatekeeper (Zipline-like unconstrained fills)
+    )
+    partial_fills_allowed: bool = False
+    fill_ordering: FillOrdering = FillOrdering.EXIT_FIRST
+    entry_order_priority: EntryOrderPriority = EntryOrderPriority.SUBMISSION
+    next_bar_submission_precheck: bool = False
+    next_bar_simple_cash_check: bool = False
+    buying_power_reservation: bool = False  # Reserve cash at submission (LEAN-style)
+    # Validate a next-open batch against a shadow account in submission order.
+    # When combined with next_bar_submission_precheck, each order first gets an
+    # independent close-price check before the batch is rechecked next session.
+    next_bar_queue_shadow_validation: bool = False
+    immediate_fill: bool = False  # Fill same-bar market orders at submit time (LEAN-style)
+    rebalance_mode: RebalanceMode = RebalanceMode.INCREMENTAL
+    rebalance_headroom_pct: float = 1.0
+    missing_price_policy: MissingPricePolicy = MissingPricePolicy.SKIP
+    late_asset_policy: LateAssetPolicy = LateAssetPolicy.ALLOW
+    late_asset_min_bars: int = 1
+
+    # === Calendar & Timezone ===
+    calendar: str | None = None  # Exchange calendar (e.g., "NYSE", "CME_Equity", "LSE")
+    timezone: str = "UTC"  # Default timezone for naive datetimes
+    data_frequency: DataFrequency = DataFrequency.DAILY  # Data frequency
+    enforce_sessions: bool = False  # Skip bars outside trading sessions (requires calendar)
+
+    # === Metadata ===
+    preset_name: str | None = None  # Name of preset this was loaded from
+    feed_spec: FeedSpec | None = field(default=None, repr=False, compare=False)
+    metadata: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+    # === Result Evidence ===
+    retain_intent_history: bool = False
+    retain_lifecycle_history: bool = False
+    _explicit_timezone: bool = field(default=False, init=False, repr=False, compare=False)
+    _explicit_data_frequency: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def __new__(cls, *args: Any, **kwargs: Any):
+        instance = super().__new__(cls)
+        field_names = [name for name, value in cls.__dataclass_fields__.items() if value.init]
+        provided = set(kwargs)
+        provided.update(field_names[: len(args)])
+        instance._provided_init_fields = provided
+        return instance
+
+    def __post_init__(self) -> None:
+        provided = getattr(self, "_provided_init_fields", set())
+        self._explicit_timezone = "timezone" in provided
+        self._explicit_data_frequency = "data_frequency" in provided
+        if hasattr(self, "_provided_init_fields"):
+            delattr(self, "_provided_init_fields")
+        self.fixed_margin_schedule = _coerce_margin_schedule(self.fixed_margin_schedule)
+        self.margin_pct_schedule = _coerce_margin_schedule(self.margin_pct_schedule)
+        if self.feed_spec is None:
+            return
+
+        self.feed_spec = FeedSpec.from_any(self.feed_spec)
+        if self.calendar is None and self.feed_spec.calendar:
+            self.calendar = self.feed_spec.calendar
+        if not self._explicit_timezone and self.feed_spec.timezone:
+            self.timezone = self.feed_spec.timezone
+
+        spec_frequency = _to_backtest_frequency(self.feed_spec.data_frequency)
+        if not self._explicit_data_frequency and spec_frequency is not None:
+            self.data_frequency = spec_frequency
+
+        if self.feed_spec.session_start_time is not None:
+            from .sessions import _validate_session_start_time
+
+            _validate_session_start_time(
+                self.calendar or self.feed_spec.calendar,
+                self.feed_spec.session_start_time,
+            )
+
+    @property
+    def resolved_feed_spec(self) -> FeedSpec:
+        """Effective feed metadata after applying runtime config precedence."""
+        base = self.feed_spec if self.feed_spec is not None else FeedSpec()
+        return base.with_overrides(
+            calendar=self.calendar,
+            timezone=self.timezone,
+            data_frequency=self.data_frequency,
+        )
+
+    @property
+    def resolved_calendar(self) -> str | None:
+        return self.resolved_feed_spec.calendar
+
+    @property
+    def resolved_timezone(self) -> str:
+        """Effective runtime timezone with UTC fallback."""
+        return self.resolved_feed_spec.timezone or "UTC"
+
+    @property
+    def resolved_data_frequency(self) -> DataFrequency:
+        resolved_frequency = _to_backtest_frequency(self.resolved_feed_spec.data_frequency)
+        return resolved_frequency or self.data_frequency
+
+    @property
+    def resolved_session_start_time(self) -> str | None:
+        return self.resolved_feed_spec.session_start_time
+
+    @property
+    def resolved_timestamp_semantics(self) -> TimestampSemantics | None:
+        semantics = self.resolved_feed_spec.timestamp_semantics
+        if semantics is None or isinstance(semantics, TimestampSemantics):
+            return semantics
+        return TimestampSemantics(semantics)
+
+    def merge_feed_spec(self, feed_spec: FeedSpec | Any | None) -> BacktestConfig:
+        """Fill missing runtime config from feed metadata without mutating user config."""
+        effective_feed_spec = self.feed_spec if self.feed_spec is not None else feed_spec
+        if effective_feed_spec is None:
+            return self
+
+        effective_feed_spec = FeedSpec.from_any(effective_feed_spec)
+        updates: dict[str, Any] = {"feed_spec": effective_feed_spec}
+        if self.calendar is None and effective_feed_spec.calendar:
+            updates["calendar"] = effective_feed_spec.calendar
+        if (
+            not self._explicit_timezone
+            and effective_feed_spec.timezone
+            and effective_feed_spec.timezone != self.timezone
+        ):
+            updates["timezone"] = effective_feed_spec.timezone
+
+        spec_frequency = _to_backtest_frequency(effective_feed_spec.data_frequency)
+        if (
+            not self._explicit_data_frequency
+            and spec_frequency is not None
+            and spec_frequency != self.data_frequency
+        ):
+            updates["data_frequency"] = spec_frequency
+
+        if len(updates) == 1 and self.feed_spec == effective_feed_spec:
+            return self
+
+        merged = replace(self, **updates)
+        merged._explicit_timezone = self._explicit_timezone
+        merged._explicit_data_frequency = self._explicit_data_frequency
+        return merged
+
+    def to_dict(self) -> dict:
+        """Convert config to dictionary for serialization."""
+        return {
+            "account": {
+                "allow_short_selling": self.allow_short_selling,
+                "allow_leverage": self.allow_leverage,
+                "initial_margin": self.initial_margin,
+                "long_maintenance_margin": self.long_maintenance_margin,
+                "short_maintenance_margin": self.short_maintenance_margin,
+                "fixed_margin_schedule": _margin_schedule_to_dict(self.fixed_margin_schedule),
+                "margin_pct_schedule": _margin_schedule_to_dict(self.margin_pct_schedule),
+                "short_cash_policy": self.short_cash_policy.value,
+                "lock_notional_update_mode": self.lock_notional_update_mode.value,
+            },
+            "execution": {
+                "execution_price": self.execution_price.value,
+                "mark_price": self.mark_price.value,
+                "execution_mode": self.execution_mode.value,
+            },
+            "stops": {
+                "stop_fill_mode": self.stop_fill_mode.value,
+                "stop_level_basis": self.stop_level_basis.value,
+                "trail_hwm_source": self.trail_hwm_source.value,
+                "trail_include_entry_bar_extremes": self.trail_include_entry_bar_extremes,
+                "initial_hwm_source": self.initial_hwm_source.value,
+                "trail_stop_timing": self.trail_stop_timing.value,
+            },
+            "position_sizing": {
+                "share_type": self.share_type.value,
+                "share_rounding": self.share_rounding.value,
+            },
+            "commission": {
+                "model": self.commission_type.value,
+                "rate": self.commission_rate,
+                "per_share": self.commission_per_share,
+                "per_trade": self.commission_per_trade,
+                "minimum": self.commission_minimum,
+            },
+            "slippage": {
+                "model": self.slippage_type.value,
+                "rate": self.slippage_rate,
+                "fixed": self.slippage_fixed,
+                "spread": self.slippage_spread,
+                "spread_by_asset": self.slippage_spread_by_asset,
+                "spread_convention": self.slippage_spread_convention.value,
+                "stop_rate": self.stop_slippage_rate,
+            },
+            "cash": {
+                "initial": self.initial_cash,
+                "buffer_pct": self.cash_buffer_pct,
+            },
+            "settlement": {
+                "delay": self.settlement_delay,
+                "reduces_buying_power": self.settlement_reduces_buying_power,
+            },
+            "orders": {
+                "reject_on_insufficient_cash": self.reject_on_insufficient_cash,
+                "skip_cash_validation": self.skip_cash_validation,
+                "partial_fills_allowed": self.partial_fills_allowed,
+                "fill_ordering": self.fill_ordering.value,
+                "entry_order_priority": self.entry_order_priority.value,
+                "next_bar_submission_precheck": self.next_bar_submission_precheck,
+                "next_bar_simple_cash_check": self.next_bar_simple_cash_check,
+                "buying_power_reservation": self.buying_power_reservation,
+                "next_bar_queue_shadow_validation": self.next_bar_queue_shadow_validation,
+                "immediate_fill": self.immediate_fill,
+                "rebalance_mode": self.rebalance_mode.value,
+                "rebalance_headroom_pct": self.rebalance_headroom_pct,
+                "missing_price_policy": self.missing_price_policy.value,
+                "late_asset_policy": self.late_asset_policy.value,
+                "late_asset_min_bars": self.late_asset_min_bars,
+            },
+            "calendar": {
+                "calendar": self.calendar,
+                "timezone": self.timezone,
+                "data_frequency": self.data_frequency.value,
+                "enforce_sessions": self.enforce_sessions,
+            },
+            "feed": _feed_spec_to_dict(self.resolved_feed_spec),
+            "result": {
+                "retain_intent_history": self.retain_intent_history,
+                "retain_lifecycle_history": self.retain_lifecycle_history,
+            },
+            "metadata": serialize_artifact_value(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(
+        cls, data: dict, preset_name: str | None = None, strict: bool = True
+    ) -> BacktestConfig:
+        """Create config from dictionary.
+
+        Args:
+            data: Nested config dictionary
+            preset_name: Optional metadata label
+            strict: If True, reject unknown sections/keys
+        """
+        if not isinstance(data, dict):
+            raise TypeError(f"Config data must be a dict, got {type(data).__name__}")
+
+        if strict:
+            allowed_sections = {
+                "account",
+                "execution",
+                "stops",
+                "position_sizing",
+                "commission",
+                "slippage",
+                "cash",
+                "settlement",
+                "orders",
+                "calendar",
+                "feed",
+                "result",
+                "metadata",
+            }
+            unknown_sections = set(data) - allowed_sections
+            if unknown_sections:
+                raise ValueError(f"Unknown config section(s): {sorted(unknown_sections)}")
+
+            allowed_keys_by_section = {
+                "account": {
+                    "allow_short_selling",
+                    "allow_leverage",
+                    "initial_margin",
+                    "long_maintenance_margin",
+                    "short_maintenance_margin",
+                    "fixed_margin_schedule",
+                    "margin_pct_schedule",
+                    "short_cash_policy",
+                    "lock_notional_update_mode",
+                },
+                "execution": {"execution_price", "mark_price", "execution_mode"},
+                "stops": {
+                    "stop_fill_mode",
+                    "stop_level_basis",
+                    "trail_hwm_source",
+                    "trail_include_entry_bar_extremes",
+                    "initial_hwm_source",
+                    "trail_stop_timing",
+                },
+                "position_sizing": {"share_type", "share_rounding"},
+                "commission": {"model", "rate", "per_share", "per_trade", "minimum"},
+                "slippage": {
+                    "model",
+                    "rate",
+                    "fixed",
+                    "spread",
+                    "spread_by_asset",
+                    "spread_convention",
+                    "stop_rate",
+                },
+                "cash": {"initial", "buffer_pct"},
+                "settlement": {"delay", "reduces_buying_power"},
+                "orders": {
+                    "reject_on_insufficient_cash",
+                    "skip_cash_validation",
+                    "partial_fills_allowed",
+                    "fill_ordering",
+                    "entry_order_priority",
+                    "next_bar_submission_precheck",
+                    "next_bar_simple_cash_check",
+                    "buying_power_reservation",
+                    "next_bar_queue_shadow_validation",
+                    "immediate_fill",
+                    "rebalance_mode",
+                    "rebalance_headroom_pct",
+                    "missing_price_policy",
+                    "late_asset_policy",
+                    "late_asset_min_bars",
+                },
+                "calendar": {
+                    "calendar",
+                    "timezone",
+                    "data_frequency",
+                    "enforce_sessions",
+                },
+                "feed": {
+                    "timestamp_col",
+                    "entity_col",
+                    "price_col",
+                    "open_col",
+                    "high_col",
+                    "low_col",
+                    "close_col",
+                    "volume_col",
+                    "vwap_col",
+                    "bid_col",
+                    "ask_col",
+                    "mid_col",
+                    "bid_size_col",
+                    "ask_size_col",
+                    "calendar",
+                    "timezone",
+                    "data_frequency",
+                    "bar_type",
+                    "timestamp_semantics",
+                    "session_start_time",
+                },
+                "result": {"retain_intent_history", "retain_lifecycle_history"},
+            }
+            for section, cfg in data.items():
+                if section == "metadata":
+                    if not isinstance(cfg, dict):
+                        raise TypeError(
+                            f"Section 'metadata' must be a dict, got {type(cfg).__name__}"
+                        )
+                    continue
+                if not isinstance(cfg, dict):
+                    raise TypeError(f"Section '{section}' must be a dict, got {type(cfg).__name__}")
+                unknown_keys = set(cfg) - allowed_keys_by_section[section]
+                if unknown_keys:
+                    raise ValueError(
+                        f"Unknown key(s) in section '{section}': {sorted(unknown_keys)}"
+                    )
+
+        acct_cfg = data.get("account", {})
+        exec_cfg = data.get("execution", {})
+        stops_cfg = data.get("stops", {})
+        sizing_cfg = data.get("position_sizing", {})
+        comm_cfg = data.get("commission", {})
+        slip_cfg = data.get("slippage", {})
+        cash_cfg = data.get("cash", {})
+        settle_cfg = data.get("settlement", {})
+        order_cfg = data.get("orders", {})
+        cal_cfg = data.get("calendar", {})
+        feed_cfg = data.get("feed", {})
+        result_cfg = data.get("result", {})
+        metadata = data.get("metadata", {})
+
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            raise TypeError(f"Section 'metadata' must be a dict, got {type(metadata).__name__}")
+        spread_by_asset = slip_cfg.get("spread_by_asset", {})
+        if spread_by_asset is None:
+            spread_by_asset = {}
+        if not isinstance(spread_by_asset, dict):
+            raise TypeError(
+                f"Section 'slippage.spread_by_asset' must be a dict, got "
+                f"{type(spread_by_asset).__name__}"
+            )
+
+        allow_short_selling = acct_cfg.get("allow_short_selling", False)
+        allow_leverage = acct_cfg.get("allow_leverage", False)
+
+        return cls(
+            # Account
+            allow_short_selling=allow_short_selling,
+            allow_leverage=allow_leverage,
+            initial_margin=acct_cfg.get("initial_margin", 0.5),
+            long_maintenance_margin=acct_cfg.get("long_maintenance_margin", 0.25),
+            short_maintenance_margin=acct_cfg.get("short_maintenance_margin", 0.30),
+            fixed_margin_schedule=acct_cfg.get("fixed_margin_schedule"),
+            margin_pct_schedule=acct_cfg.get("margin_pct_schedule"),
+            short_cash_policy=ShortCashPolicy(acct_cfg.get("short_cash_policy", "credit")),
+            lock_notional_update_mode=LockNotionalUpdateMode(
+                acct_cfg.get("lock_notional_update_mode", "position_legs")
+            ),
+            # Execution
+            execution_price=ExecutionPrice(
+                exec_cfg.get("execution_price", ExecutionPrice.OPEN.value)
+            ),
+            mark_price=ExecutionPrice(exec_cfg.get("mark_price", ExecutionPrice.PRICE.value)),
+            execution_mode=ExecutionMode(
+                exec_cfg.get("execution_mode", ExecutionMode.NEXT_BAR.value)
+            ),
+            # Stops
+            stop_fill_mode=StopFillMode(stops_cfg.get("stop_fill_mode", "stop_price")),
+            stop_level_basis=StopLevelBasis(stops_cfg.get("stop_level_basis", "fill_price")),
+            trail_hwm_source=WaterMarkSource(stops_cfg.get("trail_hwm_source", "close")),
+            trail_include_entry_bar_extremes=stops_cfg.get(
+                "trail_include_entry_bar_extremes", False
+            ),
+            initial_hwm_source=InitialHwmSource(stops_cfg.get("initial_hwm_source", "fill_price")),
+            trail_stop_timing=TrailStopTiming(stops_cfg.get("trail_stop_timing", "lagged")),
+            # Sizing
+            share_type=ShareType(sizing_cfg.get("share_type", "integer")),
+            share_rounding=ShareRounding(sizing_cfg.get("share_rounding", "nearest")),
+            # Commission
+            commission_type=CommissionType(comm_cfg.get("model", "none")),
+            commission_rate=comm_cfg.get("rate", 0.0),
+            commission_per_share=comm_cfg.get("per_share", 0.0),
+            commission_per_trade=comm_cfg.get("per_trade", 0.0),
+            commission_minimum=comm_cfg.get("minimum", 0.0),
+            # Slippage
+            slippage_type=SlippageType(slip_cfg.get("model", "none")),
+            slippage_rate=slip_cfg.get("rate", 0.0),
+            slippage_fixed=slip_cfg.get("fixed", 0.0),
+            slippage_spread=slip_cfg.get("spread", 0.0),
+            slippage_spread_by_asset={
+                str(asset): float(spread) for asset, spread in spread_by_asset.items()
+            },
+            slippage_spread_convention=SpreadConvention(
+                slip_cfg.get("spread_convention", "full_spread")
+            ),
+            stop_slippage_rate=slip_cfg.get("stop_rate", 0.0),
+            # Cash
+            initial_cash=cash_cfg.get("initial", 100000.0),
+            cash_buffer_pct=cash_cfg.get("buffer_pct", 0.0),
+            # Settlement
+            settlement_delay=settle_cfg.get("delay", 0),
+            settlement_reduces_buying_power=settle_cfg.get("reduces_buying_power", True),
+            # Orders
+            reject_on_insufficient_cash=order_cfg.get("reject_on_insufficient_cash", True),
+            skip_cash_validation=order_cfg.get("skip_cash_validation", False),
+            partial_fills_allowed=order_cfg.get("partial_fills_allowed", False),
+            fill_ordering=FillOrdering(order_cfg.get("fill_ordering", "exit_first")),
+            entry_order_priority=EntryOrderPriority(
+                order_cfg.get("entry_order_priority", "submission")
+            ),
+            next_bar_submission_precheck=order_cfg.get("next_bar_submission_precheck", False),
+            next_bar_simple_cash_check=order_cfg.get("next_bar_simple_cash_check", False),
+            buying_power_reservation=order_cfg.get("buying_power_reservation", False),
+            next_bar_queue_shadow_validation=order_cfg.get(
+                "next_bar_queue_shadow_validation", False
+            ),
+            immediate_fill=order_cfg.get("immediate_fill", False),
+            rebalance_mode=RebalanceMode(
+                order_cfg.get("rebalance_mode", RebalanceMode.INCREMENTAL.value)
+            ),
+            rebalance_headroom_pct=order_cfg.get("rebalance_headroom_pct", 1.0),
+            missing_price_policy=MissingPricePolicy(order_cfg.get("missing_price_policy", "skip")),
+            late_asset_policy=LateAssetPolicy(order_cfg.get("late_asset_policy", "allow")),
+            late_asset_min_bars=order_cfg.get("late_asset_min_bars", 1),
+            # Calendar
+            calendar=cal_cfg.get("calendar"),
+            timezone=cal_cfg.get("timezone", "UTC"),
+            data_frequency=DataFrequency(cal_cfg.get("data_frequency", "daily")),
+            enforce_sessions=cal_cfg.get("enforce_sessions", False),
+            # Metadata
+            preset_name=preset_name,
+            feed_spec=FeedSpec.from_any(feed_cfg) if feed_cfg else None,
+            retain_intent_history=result_cfg.get("retain_intent_history", False),
+            retain_lifecycle_history=result_cfg.get("retain_lifecycle_history", False),
+            metadata=dict(metadata),
+        )
+
+    def to_yaml(self, path: str | Path) -> None:
+        """Save config to YAML file."""
+        path = Path(path)
+        with open(path, "w") as f:
+            yaml.safe_dump(self.to_dict(), f, default_flow_style=False, sort_keys=False)
+
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> BacktestConfig:
+        """Load config from YAML file."""
+        path = Path(path)
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        return cls.from_dict(data, preset_name=path.stem, strict=True)
+
+    @classmethod
+    def from_preset(cls, preset: str) -> BacktestConfig:
+        """
+        Load a predefined configuration preset.
+
+        Available presets:
+        - "default": Sensible defaults for general use
+        - "backtrader": Match Backtrader's default behavior
+        - "vectorbt": Match VectorBT's default behavior
+        - "zipline": Match Zipline's default behavior
+        - "lean": Match the frozen LEAN daily US-equity comparison protocol
+        - "realistic": Conservative settings for realistic simulation
+        - "ibkr_us_stocks_fixed": Interactive Brokers US stocks fixed pricing
+        """
+        from .profiles import get_profile_config
+
+        profile_data = get_profile_config(preset)
+        return cls.from_dict(profile_data, preset_name=preset, strict=True)
+
+    @classmethod
+    def from_assumptions(
+        cls,
+        *,
+        broker: str,
+        region: str,
+        asset_class: str,
+        plan: str,
+        overrides: dict[str, Any] | None = None,
+        **config_overrides: Any,
+    ) -> BacktestConfig:
+        """Build config from structured broker assumptions plus explicit overrides."""
+        from .profiles import get_assumption_preset, get_profile_config
+
+        preset = get_assumption_preset(
+            broker=broker,
+            region=region,
+            asset_class=asset_class,
+            plan=plan,
+        )
+        config_data = get_profile_config(preset)
+        if overrides:
+            config_data = _deep_merge_dicts(config_data, overrides)
+        config = cls.from_dict(config_data, preset_name=preset, strict=True)
+        if config_overrides:
+            config = replace(config, **config_overrides)
+        return config
+
+    @classmethod
+    def from_user_config(
+        cls,
+        *,
+        config_dir: str | Path | None = None,
+        broker: str | None = None,
+        region: str | None = None,
+        asset_class: str | None = None,
+        plan: str | None = None,
+        **config_overrides: Any,
+    ) -> BacktestConfig:
+        """Load config using layered user defaults and optional broker assumptions."""
+        config_root = _resolve_user_config_dir(config_dir)
+        defaults_path = config_root / "defaults.yaml"
+        assumptions_path = config_root / "assumptions.yaml"
+
+        defaults_data = _load_yaml_mapping(defaults_path)
+        assumptions_data = _load_yaml_mapping(assumptions_path)
+
+        default_assumptions = assumptions_data.get("default_assumptions", {})
+        if default_assumptions and not isinstance(default_assumptions, dict):
+            raise TypeError(
+                f"Expected mapping for default_assumptions in {assumptions_path}, "
+                f"got {type(default_assumptions).__name__}"
+            )
+
+        effective_broker = broker or default_assumptions.get("broker")
+        effective_region = region or default_assumptions.get("region")
+        effective_asset_class = asset_class or default_assumptions.get("asset_class")
+        effective_plan = plan or default_assumptions.get("plan")
+
+        provided_components = [
+            effective_broker,
+            effective_region,
+            effective_asset_class,
+            effective_plan,
+        ]
+        if any(value is not None for value in provided_components) and not all(
+            value is not None for value in provided_components
+        ):
+            raise ValueError(
+                "Broker assumptions must specify broker, region, asset_class, and plan together."
+            )
+
+        merged_data: dict[str, Any] = {}
+
+        if all(value is not None for value in provided_components):
+            from .profiles import get_assumption_preset, get_profile_config
+
+            preset = get_assumption_preset(
+                broker=effective_broker,
+                region=effective_region,
+                asset_class=effective_asset_class,
+                plan=effective_plan,
+            )
+            merged_data = _deep_merge_dicts(merged_data, get_profile_config(preset))
+            defaults_without_commission = {
+                key: value for key, value in defaults_data.items() if key != "commission"
+            }
+            merged_data = _deep_merge_dicts(merged_data, defaults_without_commission)
+
+            profile_overrides = assumptions_data.get("profiles", {})
+            if profile_overrides and not isinstance(profile_overrides, dict):
+                raise TypeError(
+                    f"Expected mapping for profiles in {assumptions_path}, "
+                    f"got {type(profile_overrides).__name__}"
+                )
+            preset_override = profile_overrides.get(preset, {})
+            if preset_override:
+                if not isinstance(preset_override, dict):
+                    raise TypeError(
+                        f"Expected mapping for profiles.{preset} in {assumptions_path}, "
+                        f"got {type(preset_override).__name__}"
+                    )
+                merged_data = _deep_merge_dicts(merged_data, preset_override)
+
+            broker_tree = assumptions_data.get("brokers", {})
+            if broker_tree and not isinstance(broker_tree, dict):
+                raise TypeError(
+                    f"Expected mapping for brokers in {assumptions_path}, "
+                    f"got {type(broker_tree).__name__}"
+                )
+            node: Any = broker_tree
+            for key in (
+                str(effective_broker),
+                str(effective_region),
+                str(effective_asset_class),
+                str(effective_plan),
+            ):
+                if not isinstance(node, dict):
+                    node = {}
+                    break
+                node = node.get(key, {})
+            if node:
+                if not isinstance(node, dict):
+                    raise TypeError(
+                        f"Expected broker-specific override to be a mapping in {assumptions_path}"
+                    )
+                merged_data = _deep_merge_dicts(merged_data, node)
+        else:
+            merged_data = _deep_merge_dicts(merged_data, defaults_data)
+        config = cls.from_dict(merged_data, preset_name="user_config", strict=False)
+        if config_overrides:
+            config = replace(config, **config_overrides)
+        return config
+
+    def describe(self) -> str:
+        """Return human-readable description of configuration."""
+        allow_shorts, allow_leverage = self.get_effective_account_settings()
+        account_str = self.get_effective_account_type()
+
+        lines = [
+            f"BacktestConfig (preset: {self.preset_name or 'custom'})",
+            "=" * 50,
+            "",
+            "Account:",
+            f"  Type: {account_str}",
+            f"  Short selling: {'allowed' if allow_shorts else 'disabled'}",
+            f"  Leverage: {'enabled' if allow_leverage else 'disabled'}",
+        ]
+
+        if allow_leverage:
+            lines.extend(
+                [
+                    f"  Initial margin: {self.initial_margin:.0%}",
+                    f"  Long maintenance: {self.long_maintenance_margin:.0%}",
+                    f"  Short maintenance: {self.short_maintenance_margin:.0%}",
+                ]
+            )
+
+        lines.extend(
+            [
+                "",
+                "Execution:",
+                f"  Execution mode: {self.execution_mode.value}",
+                f"  Execution price: {self.execution_price.value}",
+                f"  Mark price: {self.mark_price.value}",
+                "",
+                "Stops:",
+                f"  Fill mode: {self.stop_fill_mode.value}",
+                f"  Level basis: {self.stop_level_basis.value}",
+                f"  Trail HWM source: {self.trail_hwm_source.value}",
+                f"  Include entry-bar extremes: {self.trail_include_entry_bar_extremes}",
+                f"  Trail timing: {self.trail_stop_timing.value}",
+                "",
+                "Position Sizing:",
+                f"  Share type: {self.share_type.value}",
+                "",
+                "Costs:",
+                f"  Commission: {self.commission_type.value} @ {self.commission_rate:.2%}",
+                (
+                    "  Slippage: "
+                    f"{self.slippage_type.value} default_spread={self.slippage_spread:.6f} "
+                    f"convention={self.slippage_spread_convention.value}"
+                    if self.slippage_type == SlippageType.SPREAD
+                    else f"  Slippage: {self.slippage_type.value} @ {self.slippage_rate:.2%}"
+                ),
+            ]
+        )
+
+        if self.stop_slippage_rate > 0:
+            lines.append(f"  Stop slippage: +{self.stop_slippage_rate:.2%}")
+
+        lines.extend(
+            [
+                "",
+                "Orders:",
+                f"  Fill ordering: {self.fill_ordering.value}",
+                f"  Entry priority: {self.entry_order_priority.value}",
+                f"  Next-bar precheck: {self.next_bar_submission_precheck}",
+                f"  Next-bar cash check: {self.next_bar_simple_cash_check}",
+                f"  Next-bar queue shadow validation: {self.next_bar_queue_shadow_validation}",
+                f"  Rebalance mode: {self.rebalance_mode.value}",
+                f"  Rebalance headroom: {self.rebalance_headroom_pct:.3f}",
+                f"  Missing price policy: {self.missing_price_policy.value}",
+                f"  Late asset policy: {self.late_asset_policy.value}",
+                f"  Late asset min bars: {self.late_asset_min_bars}",
+                f"  Reject insufficient: {self.reject_on_insufficient_cash}",
+                f"  Skip cash validation: {self.skip_cash_validation}",
+                f"  Partial fills: {self.partial_fills_allowed}",
+                "",
+                "Cash:",
+                f"  Initial: ${self.initial_cash:,.0f}",
+                f"  Buffer: {self.cash_buffer_pct:.1%}",
+            ]
+        )
+
+        if self.settlement_delay > 0:
+            lines.extend(
+                [
+                    "",
+                    "Settlement:",
+                    f"  Delay: T+{self.settlement_delay}",
+                ]
+            )
+
+        return "\n".join(line for line in lines if line is not None)

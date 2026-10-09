@@ -1,0 +1,261 @@
+# ml4t.backtest - Event-driven backtesting with explicit execution semantics
+# Independent package configuration for standalone distribution
+
+[build-system]
+requires = ["hatchling==1.32.3", "hatch-vcs==0.5.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/ml4t/backtest/_version.py"
+
+[tool.hatch.build]
+exclude = [
+    "**/AGENTS.md",
+    "**/CLAUDE.md",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ml4t"]
+namespaces = true
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+]
+
+[project]
+name = "ml4t-backtest"
+dynamic = ["version"]
+description = "Event-driven backtesting for quantitative strategies with configurable execution, accounting, risk, and framework-parity validation."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Stefan Jansen", email = "stefan@applied-ai.com" },
+]
+maintainers = [
+    { name = "Stefan Jansen", email = "pm@ml4trading.io" },
+]
+keywords = [
+    "finance",
+    "backtesting",
+    "trading",
+    "simulation",
+    "event-driven",
+    "quantitative-finance",
+    "algorithmic-trading",
+    "portfolio",
+    "risk-management",
+    "execution",
+    "polars",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Typing :: Typed",
+]
+requires-python = ">=3.12"
+
+# Core dependencies
+dependencies = [
+    "ml4t-specs>=0.1.4,<0.2",
+    "polars>=1.36.1",
+    "pandas>=2.3.3; python_version < '3.15'",
+    "pandas>=3.0.5; python_version >= '3.15'",
+    "numpy>=2.3.2",
+    "PyYAML>=6.0.3",
+    "pandas-market-calendars>=5.4.0",
+]
+
+[project.optional-dependencies]
+# Visualization and reporting
+viz = [
+    "plotly>=5.15.0",
+    "matplotlib>=3.7.0",
+    "dash>=2.11.0",  # Interactive dashboards
+]
+
+# Advanced execution models
+advanced = [
+    "networkx>=3.0",  # Order routing graphs
+    "cvxpy>=1.3.0",  # Portfolio optimization
+]
+
+# Comparison libraries (for benchmarking)
+comparison = [
+    "vectorbt>=0.24.0; python_version < '3.15'",
+    "backtrader>=1.9.0; python_version < '3.15'",
+    "zipline-reloaded>=2.4.0; python_version < '3.15'",
+    "pyfolio-reloaded>=0.9.9; python_version < '3.15'",
+]
+
+# Development dependencies
+dev = [
+    "ml4t-diagnostic>=0.1.0b4",
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-xdist>=3.3.0",
+    "pytest-timeout>=2.1.0",
+    "pytest-benchmark>=4.0.0",
+    "pytest-asyncio>=0.21.0",
+    "hypothesis>=6.80.0",
+    "ruff>=0.8.0",
+    "ty",
+    "pre-commit>=3.3.0",
+]
+
+# Documentation dependencies
+docs = [
+    "mkdocs>=1.6,<2",
+    "mkdocs-material>=9.5.0",
+    "mkdocstrings[python]>=0.24.0",
+]
+
+# All optional dependencies
+all = [
+    "ml4t-backtest[viz,advanced,dev,docs]",
+]
+
+[project.urls]
+Homepage = "https://www.ml4trading.io/"
+Documentation = "https://www.ml4trading.io/docs/backtest/"
+Repository = "https://github.com/ml4t/backtest"
+Issues = "https://github.com/ml4t/backtest/issues"
+Changelog = "https://github.com/ml4t/backtest/blob/main/CHANGELOG.md"
+
+[dependency-groups]
+test = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-xdist>=3.3.0",
+    "pytest-timeout>=2.1.0",
+    "pytest-benchmark>=4.0.0",
+    "hypothesis>=6.80.0",
+]
+dev = [
+    { include-group = "test" },
+    "ml4t-diagnostic>=0.1.0b4",
+    "ruff>=0.8.0",
+    "ty",
+    "pre-commit>=3.3.0",
+    "twine>=6.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--ignore=tests/private",  # Exclude private/commercial dependency tests
+    "--ignore=tests/validation",  # Exclude optional cross-framework validation tests
+    "--cov=ml4t.backtest",
+    "--cov-report=term-missing",
+    "--cov-report=html",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "benchmark: marks benchmark tests",
+    "unit: marks unit tests",
+    "private: requires commercial dependencies (vectorbtpro) - excluded by default",
+    "requires_comparison: requires optional comparison frameworks (vectorbt, backtrader, zipline)",
+    "no_invariant_check: skip autouse accounting invariant check for this test",
+]
+filterwarnings = [
+    "error",
+    "ignore:The 'generic' unit for NumPy timedelta is deprecated.*:DeprecationWarning",
+    "ignore:co_lnotab is deprecated, use co_lines instead.*:DeprecationWarning:zipline.*",
+    "ignore::UserWarning:vectorbt",  # VectorBT accessor registration warnings
+    "ignore::FutureWarning:zipline",  # Zipline compatibility warnings
+    # pandas 3.1 Pandas4Warning from exchange_calendars' calendar constructor; pandas attributes
+    # it to its own module, so the message is what keeps the filter narrow
+    "ignore:Series.values returning an ndarray that drops timezone:DeprecationWarning:pandas.core.series",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = [
+    "validation/*",  # Release-critical scripts are checked from validation/release_checks.txt
+    "docs/*",        # Documentation artifacts
+    ".claude/*",     # Claude workspace files
+    ".serena/*",     # Serena workspace files
+    "src/ml4t/backtest/_version.py",  # Auto-generated by hatch-vcs
+]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+    "ARG",  # flake8-unused-arguments
+    "SIM",  # flake8-simplify
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+    "B008",  # do not perform function calls in argument defaults
+    "B905",  # zip without explicit strict parameter
+    "ARG002",  # unused method arguments (intentional in strategy callbacks)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG001", "ARG002", "F841", "SIM102", "SIM108"]  # Test patterns
+
+[tool.ty.environment]
+python-version = "3.12"
+root = ["src", "."]
+
+[tool.ty.src]
+include = ["src"]
+exclude = ["tests", "validation", "docs"]
+
+[tool.coverage.run]
+source = ["src/ml4t/backtest"]
+branch = true
+omit = [
+    "*/tests/*",
+    "*/__init__.py",
+]
+
+[tool.coverage.report]
+fail_under = 84
+precision = 2
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "pass",
+    "except ImportError:",
+    "@abstractmethod",
+]

@@ -1,0 +1,364 @@
+# Market Impact & Execution Costs
+
+The [costs and funding tutorial](../tutorials/costs-and-funding.md) reconciles executed examples across all four cash-flow sources.
+
+Realistic backtesting requires modeling the costs of executing trades. ml4t-backtest provides three layers of cost modeling: commission, slippage, and market impact.
+
+Individual cost-model snippets assume a configured backtest and, where shown, an existing `result`. The linked costs tutorial runs complete gross-to-net comparisons.
+
+## Cost Layers
+
+| Layer | What It Models | Config |
+|-------|---------------|--------|
+| **Commission** | Broker fees | `commission_type`, `commission_rate` |
+| **Slippage** | Spread crossing or synthetic execution drag | `slippage_type`, `slippage_rate` |
+| **Market impact** | Price movement from your order | `market_impact_model=` kwarg |
+
+Commission and slippage are configured via BacktestConfig. Market impact is an optional model passed to the Engine.
+
+## Commission Models
+
+### Percentage (Default)
+
+```python
+from ml4t.backtest import BacktestConfig
+
+config = BacktestConfig(
+    commission_rate=0.001,  # 10 bps per trade
+)
+```
+
+### Per-Share
+
+```python
+from ml4t.backtest import BacktestConfig, CommissionType
+
+config = BacktestConfig(
+    commission_type=CommissionType.PER_SHARE,
+    commission_per_share=0.005,   # $0.005 per share
+    commission_minimum=1.0,       # $1 minimum per trade
+)
+```
+
+### Per-Contract (Futures)
+
+```python
+config = BacktestConfig(
+    commission_type=CommissionType.PER_CONTRACT,
+    commission_per_share=2.50,  # $2.50 per contract
+)
+```
+
+`PER_CONTRACT` is an alias for `PER_SHARE` - same math, clearer intent for futures.
+
+### Custom Models
+
+For volume-tiered or combined commission structures, use model objects:
+
+```python
+from ml4t.backtest.models import TieredCommission, CombinedCommission
+
+# Volume-tiered (Interactive Brokers style)
+tiered = TieredCommission(tiers=[
+    (300, 0.0035),    # First 300 shares: $0.0035/share
+    (3000, 0.0020),   # 301-3000: $0.0020/share
+    (float('inf'), 0.0015),  # 3001+: $0.0015/share
+])
+
+# Combined (base + percentage)
+combined = CombinedCommission(
+    fixed=1.0,        # $1 base
+    percentage=0.0005,  # Plus 5 bps of notional
+)
+```
+
+A custom commission model implements `calculate(asset, quantity, price)` and
+returns the fee for that quantity. The engine may call it before execution to
+estimate cash or margin requirements, then call it at the actual fill price.
+Only the fill-time value is charged. Estimates use a deep copy of the model,
+so a model that advances an internal volume tier on an executed fill does not
+advance it for a rejected or unfilled estimate. Custom models must support
+`deepcopy`, and `calculate` must not have external effects such as writing to a
+database or shared counter. A single fill that closes a position and opens
+its opposite is charged once for its full quantity. The fee is allocated between the closing
+and opening trade records in proportion to their quantities. Partial fills are
+charged separately when they execute.
+
+### Prediction-Market Venue Fees
+
+`ml4t.backtest.prediction_market_fees` implements the published fee schedules
+of Kalshi, ForecastEx (via IBKR) and Polymarket US. Prices are dollars per
+contract in `[0, 1]`; buying NO at `q` is a purchase at `q`.
+
+| Venue | Fee per fill | Model |
+|-------|--------------|-------|
+| Kalshi | taker `round_up(M * 0.07 * C * P * (1 - P))`; maker 0, 0.25x or 0.5x taker by series `fee_type` | `KalshiCommission` |
+| ForecastEx | 0.01 per contract per side; no IBKR commission | `ForecastExCommission` |
+| Polymarket US | taker `0.0695 * C * p * (1 - p)`; maker rebate `0.0125 * C * p * (1 - p)` | `PolymarketUSCommission` |
+
+Kalshi rounds the trade fee up to 0.000001. A non-direct member's balance is
+then aligned to whole cents, so one contract at 0.50 costs 0.02 instead of
+0.0175 while 100 contracts cost exactly 1.75; `rounding="cent"` reproduces
+this, and `kalshi_order_fees` adds the per-order rebate of accumulated
+overpayment. Polymarket US rounds each fill to the cent, half to even. The
+engine charges only non-negative fees, so `PolymarketUSCommission` charges a
+maker fill 0 and leaves out the rebate.
+
+Assign a model to the broker before running:
+
+```python
+from ml4t.backtest.prediction_market_fees import KalshiCommission
+
+engine.broker.commission_model = KalshiCommission(
+    liquidity="taker", fee_type="quadratic", fee_multiplier=1.0, rounding="cent"
+)
+```
+
+For research over many fills, the vectorized functions take NumPy arrays or
+Polars Series and return an array of fees in dollars:
+
+```python
+import polars as pl
+
+from ml4t.backtest.prediction_market_fees import kalshi_fee, polymarket_us_fee
+
+fills = pl.DataFrame(
+    {
+        "price": [0.50, 0.50, 0.90],
+        "contracts": [1, 100, 10],
+        "liquidity": ["taker", "taker", "maker"],
+    }
+)
+kalshi = kalshi_fee(
+    fills["price"],
+    fills["contracts"],
+    liquidity=fills["liquidity"],
+    fee_type="quadratic_with_maker_fees",
+    rounding="cent",
+)
+# array([0.02, 1.75, 0.02])
+polymarket = polymarket_us_fee(fills["price"], fills["contracts"], liquidity=fills["liquidity"])
+# array([ 0.017375,  1.7375  , -0.01125 ])
+```
+
+Each function's docstring names the venue documents it follows and the date
+they were read; schedules change, so check them before relying on a result.
+
+## Slippage Models
+
+Slippage adjusts the configured execution price in the adverse direction. Use the spread model for a bar-only estimate of bid-ask crossing, or a percentage or fixed amount for other execution drag.
+
+### Percentage (Default)
+
+```python
+config = BacktestConfig(
+    slippage_rate=0.001,        # 10 bps for market orders
+    stop_slippage_rate=0.001,   # Additional 10 bps for stop exits
+)
+```
+
+Stop exits can have additional slippage because stops trigger during fast markets.
+
+### Fixed
+
+```python
+from ml4t.backtest.config import SlippageType
+
+config = BacktestConfig(
+    slippage_type=SlippageType.FIXED,
+    slippage_fixed=0.01,  # $0.01 per share
+)
+```
+
+### Spread
+
+Use this when you only have bars and want to approximate bid-ask crossing in
+currency units.
+
+```python
+from ml4t.backtest.config import SlippageType, SpreadConvention
+
+config = BacktestConfig(
+    slippage_type=SlippageType.SPREAD,
+    slippage_spread=0.02,  # $0.02 quoted spread
+    slippage_spread_convention=SpreadConvention.FULL_SPREAD,
+)
+```
+
+`FULL_SPREAD` means the configured value is the quoted bid-ask spread, so the
+engine applies half-spread per side. `HALF_SPREAD` means the configured value is
+already the per-side crossing cost.
+
+For asset-specific assumptions:
+
+```python
+config = BacktestConfig(
+    slippage_type=SlippageType.SPREAD,
+    slippage_spread=0.02,
+    slippage_spread_by_asset={"AAPL": 0.01, "MSFT": 0.015},
+    slippage_spread_convention=SpreadConvention.HALF_SPREAD,
+)
+```
+
+If you already have bid/ask quotes, prefer `execution_price=QUOTE_SIDE` and keep
+synthetic spread slippage disabled unless you explicitly want additional impact.
+
+## Market Impact Models
+
+Market impact models add an adverse price adjustment that depends on order size relative to reported volume. Calibrate the model parameters for the market and bar frequency you simulate.
+
+Import from `ml4t.backtest.execution`:
+
+```python
+from ml4t.backtest.execution import LinearImpact, SquareRootImpact, NoImpact
+```
+
+### No Impact (Default)
+
+```python
+engine = Engine(feed, strategy, config)
+# Equivalent to: market_impact_model=NoImpact()
+```
+
+### Linear Impact
+
+Price impact proportional to order size relative to bar volume:
+
+$$\Delta P = P \times \eta \times \frac{Q}{V}$$
+
+Here $P$ is the reference price, $Q$ is order quantity, $V$ is the bar volume, and
+$\eta$ is the configured coefficient. $\Delta P$ is added for buys and subtracted for sells.
+
+```python
+from ml4t.backtest.execution import LinearImpact
+
+engine = Engine(
+    feed, strategy, config,
+    market_impact_model=LinearImpact(coefficient=0.1),
+)
+```
+
+An order that is 10% of bar volume with `coefficient=0.1` moves the fill price by 1%.
+
+Impact from every model here is entirely temporary: `calculate` is handed one order and holds no
+reference to earlier slices of the same parent, so there is nothing for a permanent component to
+persist into. `LinearImpact` accepted a `permanent_fraction` argument through 0.1.6 and never read
+it, so a caller asking for a mostly permanent model got a fully temporary one and no warning. The
+argument is removed rather than defaulted, so the request now raises `TypeError` instead of being
+answered wrongly. Model persistence outside the engine if you need it.
+
+### Square-Root Impact
+
+This model scales the price adjustment with the square root of estimated daily-volume participation:
+
+$$\Delta P = P \times \eta \times \sigma \times \sqrt{\frac{Q}{V \times a}}$$
+
+Here $\sigma$ is the model's configured daily volatility and $a$ is
+`adv_factor`, the configured multiplier that converts bar volume into an
+estimated average daily volume. The defaults are $\sigma=0.02$ and $a=1.0$.
+The model does not estimate either value from the feed.
+
+```python
+from ml4t.backtest.execution import SquareRootImpact
+
+engine = Engine(
+    feed, strategy, config,
+    market_impact_model=SquareRootImpact(coefficient=0.5),
+)
+```
+
+Both impact models return zero adjustment when bar volume is missing or zero.
+Calibrate their coefficients against observed execution costs before using them
+for performance estimates.
+
+### Volume Participation Limits
+
+Prevent orders from consuming too much bar volume:
+
+```python
+from ml4t.backtest.execution import VolumeParticipationLimit
+
+engine = Engine(
+    feed, strategy, config,
+    execution_limits=VolumeParticipationLimit(max_participation=0.10),
+)
+```
+
+Orders exceeding 10% of bar volume are partially filled (the remainder stays pending).
+
+## Perpetual Futures Funding
+
+Pass a Polars frame to `Engine(..., funding_df=funding)`. Each row names a feed
+timestamp and asset, with either `rate` or `amount_per_unit`:
+
+```python
+from datetime import datetime
+import polars as pl
+
+funding = pl.DataFrame({
+    "timestamp": [datetime(2024, 1, 2, 8)],
+    "asset": ["BTC-PERP"],
+    "rate": [0.0001],
+})
+result = Engine(feed=feed, strategy=strategy, config=config,
+                funding_df=funding).run()
+payments = result.to_funding_dataframe()
+print(payments.select("timestamp", "asset", "cash_delta"))
+print(result.metrics["total_funding"])
+```
+
+A positive rate debits a long and credits a short. For a held position, the
+cash transfer is `-quantity * latest_price * contract_multiplier * rate`.
+Alternatively, `amount_per_unit` gives an account-currency amount per unit of
+underlying, multiplied by position quantity and contract multiplier. Negative
+values reverse the direction. Each row must provide exactly one of the two.
+
+Funding is applied after the bar's reference price becomes available and before
+orders eligible at that timestamp or the strategy callback run. A position
+opened at that timestamp does not pay that event. If the asset has no bar at
+the event, the latest earlier positive reference price is used. Events must
+match feed timestamps and known assets; duplicate, missing, or nonfinite
+values raise before the run. A rate event for a held position without a causal
+price raises before any payment at that timestamp changes cash.
+
+Funding is a separate cash flow, not a fill or trading fee. The result includes
+`funding.parquet`, `to_funding_dataframe()`, `total_funding`, and
+`num_funding_events`. Trading P&L
+and costs retain their existing definitions; terminal equity includes funding
+in addition to trading P&L. A scheduled event for a flat asset records zero
+cash transfer.
+
+## Cost Impact Analysis
+
+To measure cost impact, run the same strategy with and without costs:
+
+```python
+# Full costs
+config_real = BacktestConfig(
+    commission_rate=0.002,
+    slippage_rate=0.002,
+)
+
+# Zero costs
+config_zero = BacktestConfig(
+    commission_rate=0.0,
+    slippage_rate=0.0,
+)
+
+result_real = Engine(feed, strategy, config_real).run()
+result_zero = Engine(feed2, strategy2, config_zero).run()
+
+cost_drag = result_zero.metrics['total_return_pct'] - result_real.metrics['total_return_pct']
+print(f"Cost drag: {cost_drag:.2f}%")
+```
+
+## In the book
+
+Chapter 18, Section 18.4, [Market impact calibration](https://github.com/stefan-jansen/machine-learning-for-trading/blob/2d6e8f95eeccaee66906245606471f570b5807e5/18_transaction_costs/03_market_impact_calibration.ipynb) examines how execution size changes impact. [Gross versus net performance](https://github.com/stefan-jansen/machine-learning-for-trading/blob/2d6e8f95eeccaee66906245606471f570b5807e5/18_transaction_costs/10_gross_vs_net_performance.ipynb) shows the portfolio effect of those costs.
+
+## Next Steps
+
+- [Book Guide](../book-guide/index.md) -- where cost realism and quote-aware execution appear in the book
+- [Execution Semantics](execution-semantics.md) - fill timing, ordering, and stop modes
+- [Configuration](configuration.md) - all commission and slippage parameters
+- [Rebalancing](rebalancing.md) - how costs interact with weight-based rebalancing

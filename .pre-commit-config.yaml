@@ -1,0 +1,44 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.10
+    hooks:
+      - id: ruff-format
+        args: [--check]
+      - id: ruff
+        args: [--no-fix]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+        exclude: ^tests/fixtures/artifacts/
+      - id: check-yaml
+        args: [--unsafe]
+      - id: check-added-large-files
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: debug-statements
+      - id: mixed-line-ending
+
+  - repo: local
+    hooks:
+      - id: release-validation-format
+        name: release validation format check
+        entry: bash -c 'xargs uv run ruff format --check < validation/release_checks.txt'
+        language: system
+        files: ^validation/
+        pass_filenames: false
+      - id: release-validation-lint
+        name: release validation lint check
+        entry: bash -c 'xargs uv run ruff check --no-fix < validation/release_checks.txt'
+        language: system
+        files: ^validation/
+        pass_filenames: false
+      - id: ty
+        name: ty type check
+        entry: bash -c 'xargs uv run ty check src/ < validation/release_checks.txt'
+        language: system
+        files: ^(src/|validation/)
+        types: [python]
+        pass_filenames: false

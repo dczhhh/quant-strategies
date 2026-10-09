@@ -1,0 +1,2247 @@
+"""Tests for config fields that are wired to runtime behavior.
+
+Validates that BacktestConfig fields actually affect execution:
+- share_type: INTEGER rounds shares at fill time
+- reject_on_insufficient_cash: False allows skipping instead of rejecting
+- cash_buffer_pct: reserves cash from available buying power
+- partial_fills_allowed: fills max affordable when cash is insufficient
+- fill_ordering: EXIT_FIRST vs FIFO processing order
+- Preset round-trip: presets produce correct field values
+"""
+
+from datetime import datetime
+
+import pytest
+from ml4t.specs.market_data import FeedSpec
+
+from ml4t.backtest import (
+    BacktestConfig,
+    Broker,
+    ExecutionMode,
+)
+from ml4t.backtest.config import (
+    CommissionType,
+    DataFrequency,
+    EntryOrderPriority,
+    ExecutionPrice,
+    FillOrdering,
+    LateAssetPolicy,
+    LockNotionalUpdateMode,
+    MissingPricePolicy,
+    RebalanceMode,
+    ShareType,
+    ShortCashPolicy,
+    SlippageType,
+    SpreadConvention,
+)
+from ml4t.backtest.core.shared import CASH_TOLERANCE
+from ml4t.backtest.execution.limits import VolumeParticipationLimit
+from ml4t.backtest.execution.rebalancer import RebalanceConfig, TargetWeightExecutor
+from ml4t.backtest.models import (
+    CombinedCommission,
+    NoCommission,
+    NoSlippage,
+    PercentageCommission,
+    PercentageSlippage,
+    PerShareCommission,
+    SpreadSlippage,
+    TieredCommission,
+    VolumeShareSlippage,
+)
+from ml4t.backtest.profiles import get_profile_config
+from ml4t.backtest.types import OrderSide, Position
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_broker(**kwargs) -> Broker:
+    """Create a Broker with sensible defaults, overriding with kwargs."""
+    defaults = {
+        "initial_cash": 100_000.0,
+        "commission_model": NoCommission(),
+        "slippage_model": NoSlippage(),
+        "execution_mode": ExecutionMode.SAME_BAR,
+        "allow_short_selling": True,
+        "allow_leverage": False,
+    }
+    defaults.update(kwargs)
+    return Broker(**defaults)
+
+
+def _set_prices(broker: Broker, prices: dict[str, float], ts=None):
+    """Set current prices on broker for order processing."""
+    if ts is None:
+        ts = datetime(2024, 1, 1)
+    broker._current_time = ts
+    broker._current_prices = prices
+    broker._current_opens = prices
+    broker._current_highs = prices
+    broker._current_lows = prices
+
+
+# ---------------------------------------------------------------------------
+# share_type enforcement
+# ---------------------------------------------------------------------------
+
+
+class TestShareType:
+    """share_type=INTEGER should round order quantities at fill time."""
+
+    def test_integer_share_type_rounds_quantity(self):
+        broker = _make_broker(share_type=ShareType.INTEGER)
+        _set_prices(broker, {"AAPL": 150.0})
+
+        # Submit order with fractional quantity
+        broker.submit_order("AAPL", 10.7, OrderSide.BUY)
+        broker._process_orders()
+
+        # Should have been rounded to 10 shares
+        pos = broker.get_position("AAPL")
+        assert pos is not None
+        assert pos.quantity == 10.0
+
+    def test_fractional_share_type_preserves_quantity(self):
+        broker = _make_broker(share_type=ShareType.FRACTIONAL)
+        _set_prices(broker, {"AAPL": 150.0})
+
+        broker.submit_order("AAPL", 10.7, OrderSide.BUY)
+        broker._process_orders()
+
+        pos = broker.get_position("AAPL")
+        assert pos is not None
+        assert pos.quantity == 10.7
+
+    def test_integer_rounds_to_zero_rejects(self):
+        broker = _make_broker(share_type=ShareType.INTEGER)
+        _set_prices(broker, {"AAPL": 150.0})
+
+        broker.submit_order("AAPL", 0.5, OrderSide.BUY)
+        broker._process_orders()
+
+        # Should be rejected (rounds to 0)
+        pos = broker.get_position("AAPL")
+        assert pos is None
+
+    def test_from_config_propagates_share_type(self):
+        config = BacktestConfig(share_type=ShareType.INTEGER)
+        broker = Broker.from_config(config)
+        assert broker.share_type == ShareType.INTEGER
+
+    def test_broker_constructor_defaults_to_integer_shares(self):
+        broker = _make_broker()
+        assert broker.share_type == ShareType.INTEGER
+
+    def test_exit_first_classifies_after_integer_rounding(self):
+        broker = _make_broker(
+            initial_cash=0.0,
+            allow_short_selling=False,
+            fill_ordering=FillOrdering.EXIT_FIRST,
+            share_type=ShareType.INTEGER,
+            reject_on_insufficient_cash=True,
+        )
+        ts = datetime(2024, 1, 2)
+        _set_prices(broker, {"AAPL": 100.0, "MSFT": 100.0}, ts=ts)
+        broker.positions["AAPL"] = Position(
+            asset="AAPL",
+            quantity=5.0,
+            entry_price=100.0,
+            entry_time=ts,
+            current_price=100.0,
+        )
+        broker.account.positions["AAPL"] = Position(
+            asset="AAPL",
+            quantity=5.0,
+            entry_price=100.0,
+            entry_time=ts,
+            current_price=100.0,
+        )
+
+        buy = broker.submit_order("MSFT", 5, OrderSide.BUY)
+        sell = broker.submit_order("AAPL", 5.4, OrderSide.SELL)
+
+        broker._process_orders()
+
+        assert buy is not None
+        assert sell is not None
+        assert broker.get_position("AAPL") is None
+        assert broker.get_position("MSFT") is not None
+        assert buy.status.value == "filled"
+
+
+# ---------------------------------------------------------------------------
+# reject_on_insufficient_cash
+# ---------------------------------------------------------------------------
+
+
+class TestRejectOnInsufficientCash:
+    """reject_on_insufficient_cash=False should skip (not reject) unaffordable orders."""
+
+    def test_default_rejects_unaffordable(self):
+        broker = _make_broker(initial_cash=1000.0, reject_on_insufficient_cash=True)
+        _set_prices(broker, {"AAPL": 150.0})
+
+        broker.submit_order("AAPL", 100, OrderSide.BUY)  # costs $15,000
+        broker._process_orders()
+
+        pos = broker.get_position("AAPL")
+        assert pos is None
+        # Order should be rejected
+        rejected = [o for o in broker.orders if o.rejection_reason]
+        assert len(rejected) == 1
+
+    def test_permissive_skips_unaffordable(self):
+        broker = _make_broker(initial_cash=1000.0, reject_on_insufficient_cash=False)
+        _set_prices(broker, {"AAPL": 150.0})
+
+        broker.submit_order("AAPL", 100, OrderSide.BUY)  # costs $15,000
+        broker._process_orders()
+
+        pos = broker.get_position("AAPL")
+        assert pos is None
+        # Order should NOT have rejection_reason set (silently skipped)
+        rejected = [o for o in broker.orders if o.rejection_reason]
+        assert len(rejected) == 0
+
+    def test_permissive_does_not_keep_unaffordable_order_pending_forever(self):
+        broker = _make_broker(
+            initial_cash=50.0,
+            reject_on_insufficient_cash=False,
+            partial_fills_allowed=True,
+            share_type=ShareType.INTEGER,
+        )
+        _set_prices(broker, {"AAPL": 100.0})
+
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        broker._process_orders()
+
+        # Could not fill even a single share; order should be skipped and cleared.
+        assert broker.get_position("AAPL") is None
+        assert len(broker.pending_orders) == 0
+        # Still permissive: skipped orders are not marked rejected.
+        rejected = [o for o in broker.orders if o.rejection_reason]
+        assert len(rejected) == 0
+
+    def test_from_config_propagates(self):
+        config = BacktestConfig.from_preset("vectorbt")
+        assert config.reject_on_insufficient_cash is False
+        broker = Broker.from_config(config)
+        assert broker.reject_on_insufficient_cash is False
+
+    def test_next_bar_submission_precheck_rejects_immediately(self):
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            execution_mode=ExecutionMode.NEXT_BAR,
+            next_bar_submission_precheck=True,
+            share_type=ShareType.INTEGER,
+            reject_on_insufficient_cash=True,
+        )
+        _set_prices(broker, {"AAPL": 100.0})
+
+        order = broker.submit_order("AAPL", 20, OrderSide.BUY)  # needs $2000
+        assert order is not None
+        assert order.status.value == "rejected"
+        assert "submission precheck" in (order.rejection_reason or "").lower()
+        assert "insufficient cash" in (order.rejection_reason or "").lower()
+        assert order.rejection_code == "insufficient_cash"
+        assert len(broker.pending_orders) == 0
+
+    def test_next_bar_submission_precheck_uses_sequential_shadow_cash(self):
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            execution_mode=ExecutionMode.NEXT_BAR,
+            next_bar_submission_precheck=True,
+            share_type=ShareType.INTEGER,
+            reject_on_insufficient_cash=True,
+        )
+        _set_prices(broker, {"AAPL": 100.0, "MSFT": 100.0})
+
+        first = broker.submit_order("AAPL", 5, OrderSide.BUY)  # ~$500
+        second = broker.submit_order("MSFT", 6, OrderSide.BUY)  # ~$600 -> should fail after first
+
+        assert first is not None
+        assert second is not None
+        assert first.status.value != "rejected"
+        assert second.status.value == "rejected"
+
+    def test_lean_two_stage_buying_power_validation(self):
+        broker = _make_broker(
+            initial_cash=10_000.0,
+            execution_mode=ExecutionMode.NEXT_BAR,
+            next_bar_submission_precheck=True,
+            next_bar_queue_shadow_validation=True,
+            allow_short_selling=True,
+            allow_leverage=True,
+            initial_margin=0.5,
+            long_maintenance_margin=0.5,
+            short_maintenance_margin=0.5,
+            fill_ordering=FillOrdering.SEQUENTIAL,
+            share_type=ShareType.INTEGER,
+            reject_on_insufficient_cash=True,
+        )
+        broker._update_time(
+            timestamp=datetime(2024, 1, 2),
+            prices={"AAPL": 100.0},
+            opens={"AAPL": 100.0},
+            volumes={"AAPL": 1_000.0},
+            highs={"AAPL": 100.0},
+            lows={"AAPL": 100.0},
+            signals={},
+        )
+
+        first = broker.submit_order("AAPL", 150, OrderSide.BUY)
+        second = broker.submit_order("AAPL", 150, OrderSide.BUY)
+
+        assert first is not None and first.status.value == "pending"
+        assert second is not None and second.status.value == "pending"
+
+        broker._update_time(
+            timestamp=datetime(2024, 1, 3),
+            prices={"AAPL": 110.0},
+            opens={"AAPL": 110.0},
+            volumes={"AAPL": 1_000.0},
+            highs={"AAPL": 110.0},
+            lows={"AAPL": 110.0},
+            signals={},
+        )
+        broker._process_orders(use_open=True)
+
+        assert first.status.value == "filled"
+        assert second.status.value == "rejected"
+        assert second.rejection_code == "insufficient_buying_power"
+        assert broker.get_position("AAPL").quantity == 150.0
+        assert broker.cash == -6_500.0
+
+    def test_lean_shadow_validation_uses_fill_day_mark_price(self):
+        broker = _make_broker(
+            initial_cash=10_000.0,
+            execution_mode=ExecutionMode.NEXT_BAR,
+            next_bar_submission_precheck=True,
+            next_bar_queue_shadow_validation=True,
+            allow_short_selling=True,
+            allow_leverage=True,
+            initial_margin=0.5,
+            long_maintenance_margin=0.5,
+            short_maintenance_margin=0.5,
+            fill_ordering=FillOrdering.SEQUENTIAL,
+            share_type=ShareType.INTEGER,
+            reject_on_insufficient_cash=True,
+        )
+        _set_prices(broker, {"AAPL": 50.0})
+        order = broker.submit_order("AAPL", 300, OrderSide.BUY)
+
+        broker._update_time(
+            timestamp=datetime(2024, 1, 3),
+            prices={"AAPL": 25.0},
+            opens={"AAPL": 100.0},
+            volumes={"AAPL": 1_000.0},
+            highs={"AAPL": 100.0},
+            lows={"AAPL": 25.0},
+            signals={},
+        )
+        broker._process_orders(use_open=True)
+
+        assert order is not None and order.status.value == "filled"
+        assert order.filled_price == 100.0
+        assert [fill.price for fill in broker.fills] == [100.0]
+
+    def test_backtrader_precheck_rejects_unaffordable_short_cover(self):
+        broker = _make_broker(
+            initial_cash=100.0,
+            execution_mode=ExecutionMode.NEXT_BAR,
+            next_bar_submission_precheck=True,
+            next_bar_simple_cash_check=True,
+            share_type=ShareType.INTEGER,
+            reject_on_insufficient_cash=True,
+        )
+        ts = datetime(2024, 1, 2)
+        _set_prices(broker, {"AAPL": 250.0}, ts=ts)
+        broker.cash = 200.0
+        broker.positions["AAPL"] = Position(
+            asset="AAPL",
+            quantity=-1.0,
+            entry_price=100.0,
+            entry_time=ts,
+            current_price=250.0,
+        )
+
+        order = broker.submit_order("AAPL", 1, OrderSide.BUY)
+
+        assert order is not None
+        assert order.status.value == "rejected"
+        assert order.rejection_code == "insufficient_cash"
+
+    def test_backtrader_gap_reversal_executes_only_the_close_leg(self):
+        broker = _make_broker(
+            initial_cash=100.0,
+            execution_mode=ExecutionMode.NEXT_BAR,
+            next_bar_submission_precheck=True,
+            next_bar_simple_cash_check=True,
+            share_type=ShareType.INTEGER,
+            fill_ordering=FillOrdering.FIFO,
+            reject_on_insufficient_cash=True,
+        )
+        broker._update_time(
+            timestamp=datetime(2024, 1, 1),
+            prices={"AAPL": 100.0},
+            opens={"AAPL": 100.0},
+            volumes={"AAPL": 1_000.0},
+            highs={"AAPL": 100.0},
+            lows={"AAPL": 100.0},
+            signals={},
+        )
+        short_order = broker.submit_order("AAPL", 1, OrderSide.SELL)
+
+        broker._update_time(
+            timestamp=datetime(2024, 1, 2),
+            prices={"AAPL": 90.0},
+            opens={"AAPL": 100.0},
+            volumes={"AAPL": 1_000.0},
+            highs={"AAPL": 100.0},
+            lows={"AAPL": 90.0},
+            signals={},
+        )
+        broker._process_orders(use_open=True)
+        reversal = broker.submit_order("AAPL", 2, OrderSide.BUY)
+
+        broker._update_time(
+            timestamp=datetime(2024, 1, 3),
+            prices={"AAPL": 250.0},
+            opens={"AAPL": 250.0},
+            volumes={"AAPL": 1_000.0},
+            highs={"AAPL": 250.0},
+            lows={"AAPL": 250.0},
+            signals={},
+        )
+        broker._process_orders(use_open=True)
+
+        assert short_order is not None
+        assert reversal is not None
+        assert [fill.quantity for fill in broker.fills] == [1.0, 1.0]
+        assert broker.get_position("AAPL") is None
+        assert broker.cash == -50.0
+        assert reversal.requested_quantity == 2.0
+        assert reversal.filled_quantity == 1.0
+
+    def test_margin_submission_precheck_allows_reversal_after_close_proceeds(self):
+        broker = _make_broker(
+            initial_cash=1_000_000.0,
+            execution_mode=ExecutionMode.NEXT_BAR,
+            next_bar_submission_precheck=True,
+            next_bar_simple_cash_check=False,
+            allow_short_selling=True,
+            allow_leverage=True,
+            reject_on_insufficient_cash=True,
+            share_type=ShareType.INTEGER,
+        )
+        ts = datetime(2024, 1, 2)
+        _set_prices(broker, {"AAPL": 1000.0}, ts=ts)
+        broker.cash = -500_000.0
+        broker.positions["AAPL"] = Position(
+            asset="AAPL",
+            quantity=15_000.0,
+            entry_price=100.0,
+            entry_time=ts,
+            current_price=1000.0,
+        )
+
+        # Long 15k -> submit sell 30k (close + reverse). Reversal precheck must
+        # account for close proceeds before validating the new short leg.
+        order = broker.submit_order("AAPL", 30_000, OrderSide.SELL)
+        assert order is not None
+        assert order.status.value != "rejected"
+        assert order.rejection_reason is None
+
+
+# ---------------------------------------------------------------------------
+# cash_buffer_pct
+# ---------------------------------------------------------------------------
+
+
+class TestCashBufferPct:
+    """cash_buffer_pct should reserve a fraction of cash from buying power."""
+
+    def test_buffer_reduces_buying_power(self):
+        # With 2% buffer, $100k cash → $98k available
+        broker = _make_broker(initial_cash=100_000.0, cash_buffer_pct=0.02)
+        _set_prices(broker, {"AAPL": 100.0})
+
+        # Try to buy exactly $99,000 worth = 990 shares
+        # Available is $98,000, so 990 shares ($99k) should be rejected
+        broker.submit_order("AAPL", 990, OrderSide.BUY)
+        broker._process_orders()
+
+        pos = broker.get_position("AAPL")
+        assert pos is None  # rejected due to buffer
+
+    def test_buffer_allows_within_limit(self):
+        broker = _make_broker(initial_cash=100_000.0, cash_buffer_pct=0.02)
+        _set_prices(broker, {"AAPL": 100.0})
+
+        # Buy $97,000 worth = 970 shares (within $98k available)
+        broker.submit_order("AAPL", 970, OrderSide.BUY)
+        broker._process_orders()
+
+        pos = broker.get_position("AAPL")
+        assert pos is not None
+        assert pos.quantity == 970
+
+    def test_zero_buffer_allows_full_cash(self):
+        broker = _make_broker(initial_cash=100_000.0, cash_buffer_pct=0.0)
+        _set_prices(broker, {"AAPL": 100.0})
+
+        broker.submit_order("AAPL", 1000, OrderSide.BUY)  # exactly $100k
+        broker._process_orders()
+
+        pos = broker.get_position("AAPL")
+        assert pos is not None
+
+    def test_from_config_propagates(self):
+        config = BacktestConfig.from_preset("realistic")
+        assert config.cash_buffer_pct == 0.02
+        broker = Broker.from_config(config)
+        assert broker.cash_buffer_pct == 0.02
+        assert broker.gatekeeper.cash_buffer_pct == 0.02
+
+
+class TestShortCashPolicy:
+    """short_cash_policy controls whether short proceeds are spendable."""
+
+    def test_credit_policy_reuses_short_proceeds(self):
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            allow_short_selling=True,
+            allow_leverage=False,
+            short_cash_policy=ShortCashPolicy.CREDIT,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=False,
+        )
+        _set_prices(broker, {"SHORT": 100.0, "LONG": 100.0})
+
+        # Open short: should credit cash under CREDIT mode.
+        broker.submit_order("SHORT", 10, OrderSide.SELL)
+        broker._process_orders()
+        assert broker.get_position("SHORT") is not None
+
+        # Reuse proceeds for long entry.
+        broker.submit_order("LONG", 15, OrderSide.BUY)  # $1500
+        broker._process_orders()
+        assert broker.get_position("LONG") is not None
+
+    def test_lock_notional_policy_blocks_reuse_of_short_proceeds(self):
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            allow_short_selling=True,
+            allow_leverage=False,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=False,
+        )
+        _set_prices(broker, {"SHORT": 100.0, "LONG": 100.0})
+
+        broker.submit_order("SHORT", 10, OrderSide.SELL)
+        broker._process_orders()
+        assert broker.get_position("SHORT") is not None
+
+        broker.submit_order("LONG", 15, OrderSide.BUY)  # $1500
+        broker._process_orders()
+        assert broker.get_position("LONG") is None
+
+    def test_credit_proceeds_policy_allows_short_without_full_notional_cash(self):
+        broker = _make_broker(
+            initial_cash=250.0,
+            allow_short_selling=True,
+            allow_leverage=False,
+            short_cash_policy=ShortCashPolicy.CREDIT_PROCEEDS,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=False,
+        )
+        _set_prices(broker, {"SHORT": 100.0})
+        broker.submit_order("SHORT", 10, OrderSide.SELL)
+        broker._process_orders()
+        pos = broker.get_position("SHORT")
+        assert pos is not None
+        assert pos.quantity == -10.0
+
+    def test_vectorbt_strict_profile_preserves_native_cash_semantics(self):
+        config = BacktestConfig.from_preset("vectorbt_strict")
+        assert config.short_cash_policy == ShortCashPolicy.LOCK_NOTIONAL
+        assert config.fill_ordering == FillOrdering.PRIORITY
+        assert config.reject_on_insufficient_cash is True
+        assert config.partial_fills_allowed is True
+        assert config.entry_order_priority == EntryOrderPriority.FREE_CASH_ASC
+        assert config.rebalance_mode == RebalanceMode.SNAPSHOT
+        assert config.immediate_fill is False
+        assert get_profile_config("vectorbt_strict") != get_profile_config("vectorbt")
+
+    def test_vectorbt_oss_strict_uses_combined_order_cash_updates(self):
+        pro = BacktestConfig.from_preset("vectorbt_strict")
+        oss = BacktestConfig.from_preset("vectorbt_oss_strict")
+
+        assert pro.lock_notional_update_mode is LockNotionalUpdateMode.POSITION_LEGS
+        assert oss.lock_notional_update_mode is LockNotionalUpdateMode.COMBINED_ORDER
+        assert oss.fill_ordering is FillOrdering.PRIORITY
+        assert oss.entry_order_priority is EntryOrderPriority.ORDER_VALUE_ASC
+
+    def test_vectorbt_futures_strict_uses_immediate_multiplier_execution(self):
+        config = BacktestConfig.from_preset("vectorbt_futures_strict")
+
+        assert config.fill_ordering is FillOrdering.PRIORITY
+        assert config.entry_order_priority is EntryOrderPriority.FREE_CASH_ASC
+        assert config.immediate_fill is True
+
+    def test_lock_notional_update_modes_reproduce_native_cover_arithmetic(self):
+        initial_cash = 800_928.6801081297
+        entry_price = 445.1764349947099
+        short_quantity = 935.6511349828165
+        cover_quantity = 822.3137995772428
+        cover_price = 98.35685542114634
+
+        results = {}
+        for mode in LockNotionalUpdateMode:
+            broker = _make_broker(
+                initial_cash=initial_cash,
+                short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+                lock_notional_update_mode=mode,
+                share_type=ShareType.FRACTIONAL,
+                reject_on_insufficient_cash=True,
+                partial_fills_allowed=True,
+            )
+            _set_prices(broker, {"A": entry_price})
+            broker.submit_order("A", short_quantity, OrderSide.SELL)
+            broker._process_orders()
+            _set_prices(broker, {"A": cover_price}, ts=datetime(2024, 1, 2))
+            broker.submit_order("A", cover_quantity, OrderSide.BUY)
+            broker._process_orders()
+            results[mode] = broker.account._lock_notional_free_cash
+
+        assert results[LockNotionalUpdateMode.POSITION_LEGS] == 1_035_668.0954273958
+        assert results[LockNotionalUpdateMode.COMBINED_ORDER] == 1_035_668.0954273955
+
+    def test_zipline_strict_profile_uses_credit(self):
+        config = BacktestConfig.from_preset("zipline_strict")
+        assert config.short_cash_policy == ShortCashPolicy.CREDIT
+        assert config.allow_leverage is False
+        assert config.skip_cash_validation is True
+        assert config.fill_ordering == FillOrdering.FIFO
+        assert config.reject_on_insufficient_cash is False
+        assert config.partial_fills_allowed is False
+        assert config.commission_type == CommissionType.NONE
+        assert config.slippage_type == SlippageType.NONE
+        assert get_profile_config("zipline_strict") == get_profile_config("zipline")
+
+    def test_backtrader_strict_profile_enables_submission_precheck(self):
+        config = BacktestConfig.from_preset("backtrader_strict")
+        assert config.next_bar_submission_precheck is True
+        assert config.next_bar_simple_cash_check is True
+        assert config.share_rounding.value == "truncate"
+
+    def test_lean_profile_uses_margin_next_bar_open(self):
+        config = BacktestConfig.from_preset("lean")
+        assert config.allow_leverage is True
+        assert config.execution_mode == ExecutionMode.NEXT_BAR
+        assert config.execution_price == ExecutionPrice.OPEN
+
+    def test_lock_notional_reversal_obeys_partial_cash_cap(self):
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            allow_short_selling=True,
+            allow_leverage=False,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            share_type=ShareType.FRACTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+        )
+        _set_prices(broker, {"A": 100.0})
+        broker.submit_order("A", 10, OrderSide.SELL)
+        broker._process_orders()
+
+        _set_prices(broker, {"A": 150.0}, ts=datetime(2024, 1, 2))
+        broker.submit_order("A", 20, OrderSide.BUY)
+        broker._process_orders()
+
+        pos = broker.get_position("A")
+        assert pos is not None
+        assert pos.quantity == pytest.approx(3.333333333333334)
+
+    def test_lock_notional_reversal_reserves_collateral_for_other_shorts(self):
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            allow_short_selling=True,
+            allow_leverage=False,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            share_type=ShareType.FRACTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+        )
+        _set_prices(broker, {"A": 100.0, "B": 100.0})
+        broker.submit_order("A", 5, OrderSide.SELL)
+        broker.submit_order("B", 5, OrderSide.SELL)
+        broker._process_orders()
+
+        _set_prices(broker, {"A": 150.0, "B": 100.0}, ts=datetime(2024, 1, 2))
+        broker.submit_order("A", 10, OrderSide.BUY)
+        broker._process_orders()
+
+        position_a = broker.get_position("A")
+        position_b = broker.get_position("B")
+        assert position_a is not None
+        assert position_b is not None
+        assert position_a.quantity == pytest.approx(5.0 / 3.0)
+        assert position_b.quantity == -5.0
+
+    def test_lock_notional_long_to_short_reversal_reuses_long_sale_proceeds(self):
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            allow_short_selling=True,
+            allow_leverage=False,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            share_type=ShareType.FRACTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+        )
+        _set_prices(broker, {"A": 100.0})
+        broker.submit_order("A", 10, OrderSide.BUY)
+        broker._process_orders()
+
+        _set_prices(broker, {"A": 200.0}, ts=datetime(2024, 1, 2))
+        broker.submit_order("A", 20, OrderSide.SELL)
+        broker._process_orders()
+
+        position = broker.get_position("A")
+        assert position is not None
+        assert position.quantity == -10.0
+
+    def test_lock_notional_partial_cover_releases_proportional_aggregate_basis(self):
+        initial_cash = 100_000.0
+        first_qty = 13.436424411240122
+        second_qty = 84.74337369372327
+        first_price = 152.7549237953228
+        second_price = 51.01380514788434
+        covered = 48.64171682480172
+        cover_price = 73.25
+        broker = _make_broker(
+            initial_cash=initial_cash,
+            allow_short_selling=True,
+            allow_leverage=False,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            share_type=ShareType.FRACTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+        )
+
+        _set_prices(broker, {"A": first_price})
+        broker.submit_order("A", first_qty, OrderSide.SELL)
+        broker._process_orders()
+        _set_prices(broker, {"A": second_price}, ts=datetime(2024, 1, 2))
+        broker.submit_order("A", second_qty, OrderSide.SELL)
+        broker._process_orders()
+
+        aggregate_basis = first_qty * first_price + second_qty * second_price
+        total_qty = first_qty + second_qty
+        expected_before_cover = initial_cash - first_qty * first_price - second_qty * second_price
+        assert broker.account._lock_notional_short_basis["A"] == aggregate_basis
+        assert broker.account._lock_notional_free_cash == expected_before_cover
+
+        _set_prices(broker, {"A": cover_price}, ts=datetime(2024, 1, 3))
+        broker.submit_order("A", covered, OrderSide.BUY)
+        broker._process_orders()
+
+        released_basis = (covered / total_qty) * aggregate_basis
+        expected_free_cash = expected_before_cover + (
+            released_basis + released_basis - covered * cover_price
+        )
+        remaining_fraction = (total_qty - covered) / total_qty
+        assert broker.account._lock_notional_free_cash == expected_free_cash
+        assert broker.account._lock_notional_short_basis["A"] == (
+            remaining_fraction * aggregate_basis
+        )
+
+    def test_lock_notional_partial_fill_uses_direct_native_cash_quotient(self):
+        initial_cash = 20_697.596345718113
+        price = 680.4559000307344
+        broker = _make_broker(
+            initial_cash=initial_cash,
+            allow_short_selling=True,
+            allow_leverage=False,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            share_type=ShareType.FRACTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+        )
+        _set_prices(broker, {"A": price})
+
+        broker.submit_order("A", 100.0, OrderSide.SELL)
+        broker._process_orders()
+
+        assert broker.fills[0].quantity == initial_cash / price
+
+    def test_lock_notional_partial_reversal_retains_native_open_leg_quantity(self):
+        initial_cash = 8_837.873808549472
+        short_price = 88.37873808549472
+        reversal_price = 90.0615227583623
+        broker = _make_broker(
+            initial_cash=initial_cash,
+            allow_short_selling=True,
+            allow_leverage=False,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            share_type=ShareType.FRACTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+        )
+        _set_prices(broker, {"A": short_price})
+        broker.submit_order("A", 100.0, OrderSide.SELL)
+        broker._process_orders()
+
+        _set_prices(broker, {"A": reversal_price}, ts=datetime(2024, 1, 2))
+        broker.submit_order("A", 200.0, OrderSide.BUY)
+        broker._process_orders()
+
+        free_after_cover = initial_cash * 2.0 - 100.0 * reversal_price
+        expected_open_quantity = free_after_cover / reversal_price
+        position = broker.get_position("A")
+        assert position is not None
+        assert position.quantity == expected_open_quantity
+        assert position.quantity != broker.fills[-1].quantity - 100.0
+
+    @pytest.mark.parametrize(
+        (
+            "entry_side",
+            "entry_quantity",
+            "entry_price",
+            "side",
+            "quantity",
+            "fill_price",
+            "expected_quantity",
+        ),
+        [
+            (None, 0.0, 0.0, OrderSide.BUY, 20.0, 100.0, 10.0),
+            (None, 0.0, 0.0, OrderSide.SELL, 20.0, 100.0, 10.0),
+            (OrderSide.SELL, 10.0, 100.0, OrderSide.BUY, 50.0, 50.0, 40.0),
+            (OrderSide.SELL, 5.0, 100.0, OrderSide.BUY, 10.0, 400.0, 2.5),
+            (OrderSide.SELL, 5.0, 100.0, OrderSide.BUY, 10.0, 300.0, 5.0),
+            (OrderSide.BUY, 10.0, 100.0, OrderSide.SELL, 30.0, 200.0, 20.0),
+        ],
+    )
+    def test_combined_order_affordability_limits_match_native_operation_order(
+        self,
+        entry_side,
+        entry_quantity,
+        entry_price,
+        side,
+        quantity,
+        fill_price,
+        expected_quantity,
+    ):
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            lock_notional_update_mode=LockNotionalUpdateMode.COMBINED_ORDER,
+            share_type=ShareType.FRACTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+        )
+        if entry_side is not None:
+            _set_prices(broker, {"A": entry_price})
+            broker.submit_order("A", entry_quantity, entry_side)
+            broker._process_orders()
+            assert broker.fills[-1].quantity == pytest.approx(entry_quantity)
+
+        _set_prices(broker, {"A": fill_price}, ts=datetime(2024, 1, 2))
+        order = broker.submit_order("A", quantity, side)
+        assert order is not None
+        assert broker._fill_engine.get_max_affordable_quantity(order, fill_price) == pytest.approx(
+            expected_quantity
+        )
+
+        fill_count = len(broker.fills)
+        broker._process_orders()
+
+        assert len(broker.fills) == fill_count + 1
+        assert broker.fills[-1].quantity == pytest.approx(expected_quantity)
+
+    def test_combined_order_rejects_new_short_when_all_cash_is_locked(self):
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            lock_notional_update_mode=LockNotionalUpdateMode.COMBINED_ORDER,
+            share_type=ShareType.FRACTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+        )
+        _set_prices(broker, {"A": 100.0, "B": 100.0})
+        broker.submit_order("B", 10.0, OrderSide.SELL)
+        broker._process_orders()
+
+        order = broker.submit_order("A", 1.0, OrderSide.SELL)
+        assert order is not None
+        assert broker._fill_engine.get_max_affordable_quantity(order, 100.0) == 0.0
+
+        broker._process_orders()
+
+        assert broker.get_position("A") is None
+        assert len(broker.fills) == 1
+
+    def test_combined_order_partial_long_close_releases_sale_cash(self):
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            lock_notional_update_mode=LockNotionalUpdateMode.COMBINED_ORDER,
+            share_type=ShareType.FRACTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+        )
+        _set_prices(broker, {"A": 100.0})
+        broker.submit_order("A", 10.0, OrderSide.BUY)
+        broker._process_orders()
+        broker.submit_order("A", 5.0, OrderSide.SELL)
+        broker._process_orders()
+
+        position = broker.get_position("A")
+        assert position is not None
+        assert position.quantity == 5.0
+        assert broker.account._lock_notional_free_cash == 500.0
+
+    @pytest.mark.parametrize(
+        "fill_ordering",
+        [
+            FillOrdering.EXIT_FIRST,
+            FillOrdering.FIFO,
+            FillOrdering.SEQUENTIAL,
+            FillOrdering.PRIORITY,
+        ],
+    )
+    def test_position_legs_caps_underfunded_short_cover(self, fill_ordering):
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            lock_notional_update_mode=LockNotionalUpdateMode.POSITION_LEGS,
+            share_type=ShareType.FRACTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+            fill_ordering=fill_ordering,
+        )
+        _set_prices(broker, {"A": 100.0})
+        broker.submit_order("A", 5.0, OrderSide.SELL)
+        broker._process_orders()
+
+        _set_prices(broker, {"A": 400.0}, ts=datetime(2024, 1, 2))
+        order = broker.submit_order("A", 5.0, OrderSide.BUY)
+        assert order is not None
+        assert broker._fill_engine.get_max_affordable_quantity(order, 400.0) == pytest.approx(2.5)
+
+        fill_count = len(broker.fills)
+        broker._process_orders()
+
+        assert len(broker.fills) == fill_count + 1
+        assert broker.fills[-1].quantity == pytest.approx(2.5)
+        position = broker.get_position("A")
+        assert position is not None
+        assert position.quantity == pytest.approx(-2.5)
+        assert broker.account._lock_notional_free_cash == pytest.approx(0.0)
+
+    def test_immediate_fill_caps_underfunded_short_cover(self):
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            lock_notional_update_mode=LockNotionalUpdateMode.POSITION_LEGS,
+            share_type=ShareType.FRACTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+            immediate_fill=True,
+        )
+        _set_prices(broker, {"A": 100.0})
+        broker.submit_order("A", 5.0, OrderSide.SELL)
+
+        _set_prices(broker, {"A": 400.0}, ts=datetime(2024, 1, 2))
+        broker.submit_order("A", 5.0, OrderSide.BUY)
+
+        assert broker.fills[-1].quantity == pytest.approx(2.5)
+        position = broker.get_position("A")
+        assert position is not None
+        assert position.quantity == pytest.approx(-2.5)
+        assert broker.account._lock_notional_free_cash == pytest.approx(0.0)
+
+    def test_position_legs_rejects_cover_when_no_collateral_is_available(self):
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            lock_notional_update_mode=LockNotionalUpdateMode.POSITION_LEGS,
+            share_type=ShareType.FRACTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+        )
+        _set_prices(broker, {"A": 100.0})
+        broker.submit_order("A", 10.0, OrderSide.SELL)
+        broker._process_orders()
+
+        _set_prices(broker, {"A": 300.0}, ts=datetime(2024, 1, 2))
+        order = broker.submit_order("A", 10.0, OrderSide.BUY)
+        broker._process_orders()
+
+        assert order is not None
+        assert order.rejection_code == "insufficient_cash"
+        assert len(broker.fills) == 1
+        position = broker.get_position("A")
+        assert position is not None
+        assert position.quantity == pytest.approx(-10.0)
+        assert broker.account._lock_notional_free_cash == pytest.approx(0.0)
+
+    def test_position_legs_rejects_partial_cover_when_disabled(self):
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            lock_notional_update_mode=LockNotionalUpdateMode.POSITION_LEGS,
+            share_type=ShareType.FRACTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=False,
+        )
+        _set_prices(broker, {"A": 100.0})
+        broker.submit_order("A", 5.0, OrderSide.SELL)
+        broker._process_orders()
+
+        _set_prices(broker, {"A": 400.0}, ts=datetime(2024, 1, 2))
+        order = broker.submit_order("A", 5.0, OrderSide.BUY)
+        broker._process_orders()
+
+        assert order is not None
+        assert order.rejection_code == "insufficient_cash"
+        assert len(broker.fills) == 1
+        position = broker.get_position("A")
+        assert position is not None
+        assert position.quantity == pytest.approx(-5.0)
+
+    def test_position_legs_rounds_partial_short_cover_to_integer_shares(self):
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            lock_notional_update_mode=LockNotionalUpdateMode.POSITION_LEGS,
+            share_type=ShareType.INTEGER,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+        )
+        _set_prices(broker, {"A": 100.0})
+        broker.submit_order("A", 5.0, OrderSide.SELL)
+        broker._process_orders()
+
+        _set_prices(broker, {"A": 400.0}, ts=datetime(2024, 1, 2))
+        broker.submit_order("A", 5.0, OrderSide.BUY)
+        broker._process_orders()
+
+        assert broker.fills[-1].quantity == pytest.approx(2.0)
+        position = broker.get_position("A")
+        assert position is not None
+        assert position.quantity == pytest.approx(-3.0)
+        assert broker.account._lock_notional_free_cash == pytest.approx(100.0)
+
+    def test_position_legs_fully_funded_cover_can_reverse_long(self):
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            lock_notional_update_mode=LockNotionalUpdateMode.POSITION_LEGS,
+            share_type=ShareType.FRACTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+        )
+        _set_prices(broker, {"A": 100.0})
+        broker.submit_order("A", 5.0, OrderSide.SELL)
+        broker._process_orders()
+
+        _set_prices(broker, {"A": 50.0}, ts=datetime(2024, 1, 2))
+        broker.submit_order("A", 30.0, OrderSide.BUY)
+        broker._process_orders()
+
+        assert broker.fills[-1].quantity == pytest.approx(30.0)
+        position = broker.get_position("A")
+        assert position is not None
+        assert position.quantity == pytest.approx(25.0)
+        assert broker.account._lock_notional_free_cash == pytest.approx(0.0)
+
+    def test_position_legs_long_sale_can_reverse_short(self):
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            lock_notional_update_mode=LockNotionalUpdateMode.POSITION_LEGS,
+            share_type=ShareType.FRACTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+        )
+        _set_prices(broker, {"A": 100.0})
+        broker.submit_order("A", 5.0, OrderSide.BUY)
+        broker._process_orders()
+
+        broker.submit_order("A", 20.0, OrderSide.SELL)
+        broker._process_orders()
+
+        assert broker.fills[-1].quantity == pytest.approx(15.0)
+        position = broker.get_position("A")
+        assert position is not None
+        assert position.quantity == pytest.approx(-10.0)
+        assert broker.account._lock_notional_free_cash == pytest.approx(0.0)
+
+    def test_integer_affordability_rounds_to_whole_shares(self):
+        integer_broker = _make_broker(
+            initial_cash=1_000.0,
+            share_type=ShareType.INTEGER,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+        )
+        _set_prices(integer_broker, {"A": 100.0})
+        integer_order = integer_broker.submit_order("A", 20.0, OrderSide.BUY)
+        assert integer_order is not None
+        assert integer_broker._fill_engine.get_available_cash() == 1_000.0
+        assert integer_broker._fill_engine.get_max_affordable_quantity(integer_order, 0.0) == 0.0
+        assert integer_broker._fill_engine.get_max_affordable_quantity(integer_order, 100.0) == 10.0
+
+    def test_fractional_affordability_includes_commission_and_cash_tolerance(self):
+        fractional_broker = _make_broker(
+            initial_cash=1_000.0,
+            commission_model=PercentageCommission(rate=0.01),
+            share_type=ShareType.FRACTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+        )
+        _set_prices(fractional_broker, {"A": 100.0})
+        fractional_order = fractional_broker.submit_order("A", 20.0, OrderSide.BUY)
+        assert fractional_order is not None
+        affordable = fractional_broker._fill_engine.get_max_affordable_quantity(
+            fractional_order, 100.0
+        )
+        expected = (1_000.0 + CASH_TOLERANCE) / 101.0 - CASH_TOLERANCE / 100.0
+        assert affordable == pytest.approx(expected, rel=0.0, abs=1e-12)
+
+    def test_lock_notional_available_cash_respects_cash_buffer(self):
+        locked_broker = _make_broker(
+            initial_cash=1_000.0,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            cash_buffer_pct=0.1,
+        )
+        assert locked_broker._fill_engine.get_available_cash() == 900.0
+
+
+# ---------------------------------------------------------------------------
+# partial_fills_allowed
+# ---------------------------------------------------------------------------
+
+
+class TestPartialFills:
+    """partial_fills_allowed=True should fill max affordable quantity."""
+
+    def test_partial_fill_on_insufficient_cash(self):
+        broker = _make_broker(
+            initial_cash=5_000.0,
+            partial_fills_allowed=True,
+            reject_on_insufficient_cash=True,
+        )
+        _set_prices(broker, {"AAPL": 100.0})
+
+        # Try to buy 100 shares ($10k) but only have $5k
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        broker._process_orders()
+
+        pos = broker.get_position("AAPL")
+        assert pos is not None
+        # Should have filled ~50 shares (max affordable)
+        assert pos.quantity <= 50
+        assert pos.quantity > 0
+
+    def test_no_partial_fill_when_disabled(self):
+        broker = _make_broker(
+            initial_cash=5_000.0,
+            partial_fills_allowed=False,
+            reject_on_insufficient_cash=True,
+        )
+        _set_prices(broker, {"AAPL": 100.0})
+
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        broker._process_orders()
+
+        pos = broker.get_position("AAPL")
+        assert pos is None
+
+    def test_partial_fill_with_integer_shares(self):
+        broker = _make_broker(
+            initial_cash=5_250.0,
+            partial_fills_allowed=True,
+            share_type=ShareType.INTEGER,
+        )
+        _set_prices(broker, {"AAPL": 100.0})
+
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        broker._process_orders()
+
+        pos = broker.get_position("AAPL")
+        assert pos is not None
+        # Should be integer shares
+        assert pos.quantity == int(pos.quantity)
+        assert pos.quantity == 52.0  # floor(5250/100)
+
+    def test_integer_partial_fill_preserves_exact_affordability_boundary(self):
+        broker = _make_broker(
+            initial_cash=5_200.0,
+            partial_fills_allowed=True,
+            share_type=ShareType.INTEGER,
+        )
+        _set_prices(broker, {"AAPL": 100.0})
+
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        broker._process_orders()
+
+        pos = broker.get_position("AAPL")
+        assert pos is not None
+        assert pos.quantity == 52.0
+        assert broker.cash == 0.0
+
+    def test_partial_fill_accounts_for_commission_minimum(self):
+        broker = _make_broker(
+            initial_cash=5_005.0,
+            commission_model=PerShareCommission(per_share=0.01, minimum=10.0),
+            partial_fills_allowed=True,
+            share_type=ShareType.INTEGER,
+        )
+        _set_prices(broker, {"AAPL": 100.0})
+
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        broker._process_orders()
+
+        pos = broker.get_position("AAPL")
+        assert pos is not None
+        assert pos.quantity == 49.0
+        assert broker.cash == 95.0
+
+
+# ---------------------------------------------------------------------------
+# fill_ordering
+# ---------------------------------------------------------------------------
+
+
+class TestFillOrdering:
+    """fill_ordering controls order processing sequence."""
+
+    def test_exit_first_frees_capital(self):
+        """EXIT_FIRST processes exits before entries, freeing cash."""
+        broker = _make_broker(
+            initial_cash=10_000.0,
+            fill_ordering=FillOrdering.EXIT_FIRST,
+        )
+        _set_prices(broker, {"AAPL": 100.0, "GOOG": 100.0})
+
+        # Buy AAPL first (use all cash)
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        broker._process_orders()
+        assert broker.get_position("AAPL") is not None
+
+        # Now submit exit AAPL + entry GOOG in same bar
+        _set_prices(broker, {"AAPL": 100.0, "GOOG": 100.0})
+        broker.submit_order("AAPL", 100, OrderSide.SELL)
+        broker.submit_order("GOOG", 100, OrderSide.BUY)
+        broker._process_orders()
+
+        # EXIT_FIRST: AAPL sell frees $10k, then GOOG buy succeeds
+        assert broker.get_position("AAPL") is None
+        assert broker.get_position("GOOG") is not None
+
+    def test_exit_first_reclassifies_later_reversal_as_entry(self):
+        """Later same-asset orders must stop being exits once flat."""
+        broker = _make_broker(
+            initial_cash=10_000.0,
+            fill_ordering=FillOrdering.EXIT_FIRST,
+            allow_short_selling=False,
+            allow_leverage=False,
+        )
+        _set_prices(broker, {"AAPL": 100.0})
+
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        broker._process_orders()
+        assert broker.get_position("AAPL") is not None
+
+        _set_prices(broker, {"AAPL": 100.0})
+        broker.submit_order("AAPL", 80, OrderSide.SELL)
+        broker.submit_order("AAPL", 80, OrderSide.SELL)
+        broker._process_orders()
+
+        pos = broker.get_position("AAPL")
+        assert pos is not None
+        assert pos.quantity == 20.0
+        rejected = [o for o in broker.orders if o.rejection_reason]
+        assert len(rejected) == 1
+
+    def test_exit_first_preserves_submission_order_for_deferred_entries(self):
+        """Deferred same-asset entries must keep their original submission order."""
+        broker = _make_broker(
+            initial_cash=20_000.0,
+            fill_ordering=FillOrdering.EXIT_FIRST,
+            entry_order_priority=EntryOrderPriority.SUBMISSION,
+            allow_short_selling=False,
+            allow_leverage=False,
+        )
+        _set_prices(broker, {"AAPL": 100.0})
+
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        broker._process_orders()
+        assert broker.get_position("AAPL") is not None
+        assert broker.cash == 10_000.0
+
+        _set_prices(broker, {"AAPL": 100.0})
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        broker.submit_order("AAPL", 100, OrderSide.SELL)
+        broker.submit_order("AAPL", 100, OrderSide.SELL)
+        broker._process_orders()
+
+        # Submission order must be: older buy first, then deferred sell.
+        assert broker.get_position("AAPL") is None
+        rejected = [o for o in broker.orders if o.rejection_reason]
+        assert rejected == []
+
+
+class TestEntryOrderPriority:
+    """entry_order_priority controls constrained entry sequencing."""
+
+    def test_notional_asc_prioritizes_smaller_entries(self):
+        broker = _make_broker(
+            initial_cash=10_000.0,
+            fill_ordering=FillOrdering.EXIT_FIRST,
+            entry_order_priority=EntryOrderPriority.NOTIONAL_ASC,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=False,
+        )
+        _set_prices(broker, {"BIG": 100.0, "SMALL": 100.0})
+
+        # Submitted BIG first, but NOTIONAL_ASC should fill SMALL first.
+        broker.submit_order("BIG", 100, OrderSide.BUY)  # $10k
+        broker.submit_order("SMALL", 50, OrderSide.BUY)  # $5k
+        broker._process_orders()
+
+        assert broker.get_position("SMALL") is not None
+        assert broker.get_position("BIG") is None
+
+    def test_free_cash_asc_accounts_for_collateral_released_by_reversal(self):
+        broker = _make_broker(
+            initial_cash=100.0,
+            fill_ordering=FillOrdering.EXIT_FIRST,
+            entry_order_priority=EntryOrderPriority.FREE_CASH_ASC,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+        )
+        _set_prices(broker, {"REVERSAL": 10.0, "NEW": 10.0})
+        broker.submit_order("REVERSAL", 5, OrderSide.SELL)
+        broker._process_orders()
+
+        broker.submit_order("NEW", 10, OrderSide.BUY)
+        broker.submit_order("REVERSAL", 10, OrderSide.BUY)
+        broker._process_orders()
+
+        assert [fill.asset for fill in broker.fills[-2:]] == ["REVERSAL", "NEW"]
+        assert broker.get_position("REVERSAL").quantity == 5.0
+        assert broker.get_position("NEW").quantity == 5.0
+
+    def test_order_value_asc_processes_short_entry_before_long_entry(self):
+        broker = _make_broker(
+            initial_cash=100.0,
+            fill_ordering=FillOrdering.EXIT_FIRST,
+            entry_order_priority=EntryOrderPriority.ORDER_VALUE_ASC,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=False,
+        )
+        _set_prices(broker, {"LONG": 10.0, "SHORT": 10.0})
+        broker.submit_order("LONG", 5, OrderSide.BUY)
+        broker.submit_order("SHORT", 5, OrderSide.SELL)
+
+        broker._process_orders()
+
+        assert [fill.asset for fill in broker.fills] == ["SHORT", "LONG"]
+
+    def test_order_value_priority_preserves_equal_target_submission_order(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        broker = _make_broker(
+            initial_cash=100_000.0,
+            fill_ordering=FillOrdering.PRIORITY,
+            entry_order_priority=EntryOrderPriority.ORDER_VALUE_ASC,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=True,
+            share_type=ShareType.FRACTIONAL,
+        )
+        prices = {"ROVI": 70.69, "TIVO": 67.895320594601}
+        _set_prices(broker, prices)
+        equity = 1_305_526.2630508184
+        monkeypatch.setattr(broker, "get_account_value", lambda: equity)
+        weight = -0.059433628848188376
+        executor = TargetWeightExecutor(RebalanceConfig(allow_fractional=True, allow_short=True))
+
+        executor.execute(
+            {"ROVI": weight, "TIVO": weight},
+            {asset: {"close": price} for asset, price in prices.items()},
+            broker,
+        )
+        broker._process_orders()
+
+        assert [fill.asset for fill in broker.fills] == ["ROVI", "TIVO"]
+        assert broker.fills[0].quantity == pytest.approx(abs(equity * weight) / prices["ROVI"])
+
+    def test_priority_fill_ordering_sorts_exits_and_entries_together(self):
+        broker = _make_broker(
+            initial_cash=100.0,
+            fill_ordering=FillOrdering.PRIORITY,
+            entry_order_priority=EntryOrderPriority.ORDER_VALUE_ASC,
+            short_cash_policy=ShortCashPolicy.LOCK_NOTIONAL,
+            reject_on_insufficient_cash=True,
+            partial_fills_allowed=False,
+        )
+        _set_prices(broker, {"COVER": 10.0, "SHORT": 10.0})
+        broker.submit_order("COVER", 2, OrderSide.SELL)
+        broker._process_orders()
+
+        broker.submit_order("COVER", 2, OrderSide.BUY)
+        broker.submit_order("SHORT", 1, OrderSide.SELL)
+        broker._process_orders()
+
+        assert [fill.asset for fill in broker.fills[-2:]] == ["SHORT", "COVER"]
+
+    def test_fifo_processes_in_submission_order(self):
+        """FIFO processes orders in submission order."""
+        broker = _make_broker(
+            initial_cash=10_000.0,
+            fill_ordering=FillOrdering.FIFO,
+        )
+        _set_prices(broker, {"AAPL": 100.0, "GOOG": 100.0})
+
+        # Buy AAPL first
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        broker._process_orders()
+
+        # Submit sell AAPL + buy GOOG
+        _set_prices(broker, {"AAPL": 100.0, "GOOG": 100.0})
+        broker.submit_order("AAPL", 100, OrderSide.SELL)
+        broker.submit_order("GOOG", 100, OrderSide.BUY)
+        broker._process_orders()
+
+        # FIFO: sell AAPL first (frees cash via mark-to-market), then buy GOOG
+        assert broker.get_position("AAPL") is None
+        assert broker.get_position("GOOG") is not None
+
+    def test_from_config_backtrader_uses_fifo(self):
+        config = BacktestConfig.from_preset("backtrader")
+        assert config.fill_ordering == FillOrdering.FIFO
+
+    def test_from_config_vectorbt_uses_exit_first(self):
+        config = BacktestConfig.from_preset("vectorbt")
+        assert config.fill_ordering == FillOrdering.EXIT_FIRST
+
+    def test_from_config_default_uses_exit_first(self):
+        config = BacktestConfig.from_preset("default")
+        assert config.fill_ordering == FillOrdering.EXIT_FIRST
+
+    def test_sequential_interleaves_exits_and_entries(self):
+        """SEQUENTIAL processes orders in submission order without exit/entry separation."""
+        broker = _make_broker(
+            initial_cash=10_000.0,
+            fill_ordering=FillOrdering.SEQUENTIAL,
+        )
+        _set_prices(broker, {"AAPL": 100.0, "GOOG": 100.0})
+
+        # Buy AAPL first (use all cash)
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        broker._process_orders()
+        assert broker.get_position("AAPL") is not None
+
+        # Submit sell AAPL + buy GOOG (exit before entry in submission order)
+        _set_prices(broker, {"AAPL": 100.0, "GOOG": 100.0})
+        broker.submit_order("AAPL", 100, OrderSide.SELL)
+        broker.submit_order("GOOG", 100, OrderSide.BUY)
+        broker._process_orders()
+
+        # Sequential: sell AAPL frees cash, then buy GOOG succeeds
+        assert broker.get_position("AAPL") is None
+        assert broker.get_position("GOOG") is not None
+
+    def test_sequential_entry_before_exit_rejects(self):
+        """SEQUENTIAL rejects entry when exit hasn't freed cash yet."""
+        broker = _make_broker(
+            initial_cash=10_000.0,
+            fill_ordering=FillOrdering.SEQUENTIAL,
+            reject_on_insufficient_cash=True,
+        )
+        _set_prices(broker, {"AAPL": 100.0, "GOOG": 100.0})
+
+        # Buy AAPL first
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        broker._process_orders()
+
+        # Submit buy GOOG (entry) BEFORE sell AAPL (exit)
+        _set_prices(broker, {"AAPL": 100.0, "GOOG": 100.0})
+        broker.submit_order("GOOG", 100, OrderSide.BUY)  # entry first — no cash
+        broker.submit_order("AAPL", 100, OrderSide.SELL)  # exit after
+        broker._process_orders()
+
+        # Sequential: GOOG entry rejected (no cash), AAPL exit succeeds
+        assert broker.get_position("AAPL") is None
+        goog = broker.get_position("GOOG")
+        assert goog is None  # rejected because exit hadn't freed cash yet
+
+    def test_settlement_reduces_buying_power_flag(self):
+        """settlement_reduces_buying_power controls whether unsettled cash is deducted."""
+        config = BacktestConfig.from_preset("default")
+        assert config.settlement_reduces_buying_power is True  # default
+
+        # Round-trip through dict
+        d = config.to_dict()
+        d["settlement"]["reduces_buying_power"] = False
+        config2 = BacktestConfig.from_dict(d)
+        assert config2.settlement_reduces_buying_power is False
+
+
+# ---------------------------------------------------------------------------
+# Preset round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestNumericalRobustness:
+    """Small floating-point residuals should not leave ghost positions."""
+
+    def test_closing_0p1_plus_0p2_does_not_leave_ghost_position(self):
+        broker = _make_broker()
+        _set_prices(broker, {"AAPL": 100.0}, ts=datetime(2024, 1, 1))
+        broker.submit_order("AAPL", 0.3, OrderSide.BUY)
+        broker._process_orders()
+
+        _set_prices(broker, {"AAPL": 100.0}, ts=datetime(2024, 1, 2))
+        broker.submit_order("AAPL", 0.1, OrderSide.SELL)
+        broker._process_orders()
+
+        _set_prices(broker, {"AAPL": 100.0}, ts=datetime(2024, 1, 3))
+        broker.submit_order("AAPL", 0.2, OrderSide.SELL)
+        broker._process_orders()
+
+        assert broker.get_position("AAPL") is None
+
+    def test_short_to_long_reversal_blocks_unaffordable_reverse_size(self):
+        broker = _make_broker(initial_cash=1_000.0)
+        _set_prices(broker, {"AAPL": 100.0}, ts=datetime(2024, 1, 1))
+        broker.submit_order("AAPL", 10, OrderSide.SELL)
+        broker._process_orders()
+
+        # Reverse with size that would require cash not available in a
+        # non-levered account: close short 10, then open long 30.
+        _set_prices(broker, {"AAPL": 100.0}, ts=datetime(2024, 1, 2))
+        order = broker.submit_order("AAPL", 40, OrderSide.BUY)
+        broker._process_orders()
+
+        assert order is not None
+        assert order.status.value == "rejected"
+        assert broker.get_position("AAPL") is not None
+        assert broker.get_position("AAPL").quantity == -10
+
+
+class TestPresetRoundTrip:
+    """Presets should produce correct field values."""
+
+    @pytest.mark.parametrize(
+        "preset_name",
+        [
+            "default",
+            "fast",
+            "backtrader",
+            "vectorbt",
+            "zipline",
+            "realistic",
+            "ibkr_us_stocks_fixed",
+        ],
+    )
+    def test_preset_creates_valid_config(self, preset_name):
+        config = BacktestConfig.from_preset(preset_name)
+        assert config.preset_name == preset_name
+        assert isinstance(config.share_type, ShareType)
+        assert isinstance(config.fill_ordering, FillOrdering)
+
+    def test_default_preset_values(self):
+        config = BacktestConfig.from_preset("default")
+        assert config.share_type == ShareType.INTEGER
+        assert config.fill_ordering == FillOrdering.EXIT_FIRST
+        assert config.reject_on_insufficient_cash is True
+        assert config.commission_type == CommissionType.NONE
+        assert config.commission_per_share == 0.0
+        assert config.commission_minimum == 0.0
+        assert config.slippage_type == SlippageType.NONE
+
+    def test_fast_preset_values(self):
+        config = BacktestConfig.from_preset("fast")
+        assert config.share_type == ShareType.INTEGER
+        assert config.execution_mode == ExecutionMode.SAME_BAR
+        assert config.reject_on_insufficient_cash is False
+
+    def test_backtrader_preset_values(self):
+        config = BacktestConfig.from_preset("backtrader")
+        assert config.share_type == ShareType.INTEGER
+        assert config.fill_ordering == FillOrdering.FIFO
+        assert config.reject_on_insufficient_cash is True
+        assert config.allow_leverage is False
+        assert config.commission_type == CommissionType.NONE
+        assert config.slippage_type == SlippageType.NONE
+        assert config.missing_price_policy == MissingPricePolicy.USE_LAST
+        assert config.late_asset_policy == LateAssetPolicy.ALLOW
+        assert config.late_asset_min_bars == 1
+
+    def test_vectorbt_preset_values(self):
+        config = BacktestConfig.from_preset("vectorbt")
+        assert config.share_type == ShareType.FRACTIONAL
+        assert config.fill_ordering == FillOrdering.EXIT_FIRST
+        assert config.reject_on_insufficient_cash is False
+        assert config.partial_fills_allowed is True
+        assert config.missing_price_policy == MissingPricePolicy.SKIP
+
+    def test_realistic_preset_values(self):
+        config = BacktestConfig.from_preset("realistic")
+        assert config.share_type == ShareType.INTEGER
+        assert config.cash_buffer_pct == 0.02
+
+    def test_lean_preset_values(self):
+        config = BacktestConfig.from_preset("lean")
+        assert config.share_type == ShareType.INTEGER
+        assert config.fill_ordering == FillOrdering.SEQUENTIAL
+        assert config.rebalance_headroom_pct == 0.9975
+        assert config.slippage_type == SlippageType.NONE
+        assert config.next_bar_submission_precheck is True
+        assert config.next_bar_queue_shadow_validation is True
+
+    def test_zipline_preset_does_not_apply_buying_power_validation(self):
+        config = BacktestConfig.from_preset("zipline_strict")
+        assert config.skip_cash_validation is True
+        assert config.next_bar_queue_shadow_validation is False
+
+    def test_ibkr_us_stocks_fixed_preset_values(self):
+        config = BacktestConfig.from_preset("ibkr_us_stocks_fixed")
+        assert config.share_type == ShareType.INTEGER
+        assert config.execution_mode == ExecutionMode.NEXT_BAR
+        assert config.execution_price == ExecutionPrice.OPEN
+        assert config.commission_type == CommissionType.PER_SHARE
+        assert config.commission_per_share == 0.005
+        assert config.commission_minimum == 1.0
+        assert config.slippage_type == SlippageType.NONE
+
+    def test_to_dict_from_dict_roundtrip(self):
+        config = BacktestConfig.from_preset("backtrader")
+        config.retain_intent_history = True
+        config.retain_lifecycle_history = True
+        d = config.to_dict()
+        restored = BacktestConfig.from_dict(d)
+        assert restored.fill_ordering == config.fill_ordering
+        assert restored.share_type == config.share_type
+        assert restored.cash_buffer_pct == config.cash_buffer_pct
+        assert restored.reject_on_insufficient_cash == config.reject_on_insufficient_cash
+        assert restored.partial_fills_allowed == config.partial_fills_allowed
+        assert restored.next_bar_queue_shadow_validation == config.next_bar_queue_shadow_validation
+        assert restored.retain_intent_history is True
+        assert restored.retain_lifecycle_history is True
+
+    def test_sizing_method_removed_from_fields(self):
+        """sizing_method was removed from BacktestConfig fields."""
+        config = BacktestConfig()
+        assert not hasattr(config, "sizing_method")
+
+    def test_allow_negative_cash_removed(self):
+        """allow_negative_cash was removed from BacktestConfig fields."""
+        config = BacktestConfig()
+        assert not hasattr(config, "allow_negative_cash")
+
+
+# ---------------------------------------------------------------------------
+# immediate_fill
+# ---------------------------------------------------------------------------
+
+
+class TestImmediateFill:
+    """immediate_fill=True fills same-bar market orders at submit time."""
+
+    def test_immediate_fill_fills_during_submit(self):
+        """Order is filled immediately when submit_order() is called."""
+        broker = _make_broker(
+            initial_cash=100_000.0,
+            execution_mode=ExecutionMode.SAME_BAR,
+            immediate_fill=True,
+        )
+        _set_prices(broker, {"AAPL": 100.0})
+
+        order = broker.submit_order("AAPL", 50, OrderSide.BUY)
+        assert order is not None
+        assert order.status.value == "filled"
+
+        # Position is created immediately (no _process_orders needed)
+        pos = broker.get_position("AAPL")
+        assert pos is not None
+        assert pos.quantity == 50
+
+    def test_immediate_fill_rejects_entry_on_insufficient_cash(self):
+        """Entries validate against real cash via gatekeeper."""
+        broker = _make_broker(
+            initial_cash=1_000.0,
+            execution_mode=ExecutionMode.SAME_BAR,
+            immediate_fill=True,
+            reject_on_insufficient_cash=True,
+        )
+        _set_prices(broker, {"AAPL": 100.0})
+
+        order = broker.submit_order("AAPL", 100, OrderSide.BUY)  # costs $10k
+        assert order is not None
+        assert order.status.value == "rejected"
+        assert broker.get_position("AAPL") is None
+
+    def test_immediate_fill_exit_always_fills(self):
+        """Exit orders always fill (free capital)."""
+        broker = _make_broker(
+            initial_cash=10_000.0,
+            execution_mode=ExecutionMode.SAME_BAR,
+            immediate_fill=True,
+        )
+        _set_prices(broker, {"AAPL": 100.0})
+
+        # Create position first (also via immediate fill)
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        assert broker.get_position("AAPL") is not None
+        assert broker.cash == 0.0
+
+        # Exit should fill immediately
+        order = broker.submit_order("AAPL", 100, OrderSide.SELL)
+        assert order is not None
+        assert order.status.value == "filled"
+        assert broker.get_position("AAPL") is None
+        assert broker.cash == 10_000.0
+
+    def test_immediate_fill_exit_preserves_unfilled_quantity(self):
+        broker = _make_broker(
+            initial_cash=10_000.0,
+            execution_mode=ExecutionMode.SAME_BAR,
+            immediate_fill=True,
+            execution_limits=VolumeParticipationLimit(max_participation=0.5),
+        )
+        _set_prices(broker, {"AAPL": 100.0})
+        broker._current_volumes = {"AAPL": 1_000.0}
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+
+        broker._current_volumes = {"AAPL": 100.0}
+        order = broker.submit_order("AAPL", 100, OrderSide.SELL)
+
+        assert order is not None
+        assert order.status.value == "pending"
+        assert order.quantity == 50.0
+        assert broker.get_position("AAPL").quantity == 50.0
+
+    def test_immediate_fill_sequential_cash_tracking(self):
+        """Each fill updates cash before the next submit sees it."""
+        broker = _make_broker(
+            initial_cash=10_000.0,
+            execution_mode=ExecutionMode.SAME_BAR,
+            immediate_fill=True,
+            reject_on_insufficient_cash=True,
+        )
+        _set_prices(broker, {"AAPL": 100.0, "GOOG": 100.0})
+
+        # Buy AAPL uses all cash
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        assert broker.cash == 0.0
+
+        # Sell AAPL frees cash
+        broker.submit_order("AAPL", 100, OrderSide.SELL)
+        assert broker.cash == 10_000.0
+
+        # Buy GOOG now succeeds because AAPL sale freed cash
+        order = broker.submit_order("GOOG", 100, OrderSide.BUY)
+        assert order is not None
+        assert order.status.value == "filled"
+        assert broker.get_position("GOOG") is not None
+
+    def test_immediate_fill_partial_fill_on_insufficient_cash(self):
+        """Partial fills work with immediate fill mode."""
+        broker = _make_broker(
+            initial_cash=5_000.0,
+            execution_mode=ExecutionMode.SAME_BAR,
+            immediate_fill=True,
+            partial_fills_allowed=True,
+            reject_on_insufficient_cash=True,
+        )
+        _set_prices(broker, {"AAPL": 100.0})
+
+        order = broker.submit_order("AAPL", 100, OrderSide.BUY)  # wants $10k, has $5k
+        assert order is not None
+        pos = broker.get_position("AAPL")
+        assert pos is not None
+        assert pos.quantity <= 50
+        assert pos.quantity > 0
+
+    def test_immediate_fill_integer_share_rounding(self):
+        """Integer share rounding applies during immediate fill."""
+        broker = _make_broker(
+            initial_cash=100_000.0,
+            execution_mode=ExecutionMode.SAME_BAR,
+            immediate_fill=True,
+            share_type=ShareType.INTEGER,
+        )
+        _set_prices(broker, {"AAPL": 100.0})
+
+        broker.submit_order("AAPL", 10.7, OrderSide.BUY)
+        pos = broker.get_position("AAPL")
+        assert pos is not None
+        assert pos.quantity == 10.0
+
+    def test_immediate_fill_not_added_to_pending(self):
+        """Immediately filled orders are NOT added to pending_orders."""
+        broker = _make_broker(
+            initial_cash=100_000.0,
+            execution_mode=ExecutionMode.SAME_BAR,
+            immediate_fill=True,
+        )
+        _set_prices(broker, {"AAPL": 100.0})
+
+        broker.submit_order("AAPL", 50, OrderSide.BUY)
+        assert len(broker.pending_orders) == 0
+
+    def test_immediate_fill_disabled_queues_normally(self):
+        """With immediate_fill=False, orders queue as before."""
+        broker = _make_broker(
+            initial_cash=100_000.0,
+            execution_mode=ExecutionMode.SAME_BAR,
+            immediate_fill=False,
+        )
+        _set_prices(broker, {"AAPL": 100.0})
+
+        broker.submit_order("AAPL", 50, OrderSide.BUY)
+        assert len(broker.pending_orders) == 1
+        assert broker.get_position("AAPL") is None  # not yet filled
+
+    def test_from_config_propagates(self):
+        config = BacktestConfig(immediate_fill=True)
+        broker = Broker.from_config(config)
+        assert broker.immediate_fill is True
+
+    def test_to_dict_from_dict_roundtrip(self):
+        config = BacktestConfig(immediate_fill=True, mark_price=ExecutionPrice.QUOTE_MID)
+        d = config.to_dict()
+        assert d["orders"]["immediate_fill"] is True
+        assert d["execution"]["mark_price"] == "quote_mid"
+        restored = BacktestConfig.from_dict(d)
+        assert restored.immediate_fill is True
+        assert restored.mark_price == ExecutionPrice.QUOTE_MID
+
+    def test_margin_pct_schedule_roundtrip(self):
+        config = BacktestConfig(margin_pct_schedule={"ES": (0.05, 0.035)})
+        restored = BacktestConfig.from_dict(config.to_dict())
+        assert restored.margin_pct_schedule == {"ES": (0.05, 0.035)}
+
+    def test_validate_rejects_overlapping_margin_models(self):
+        config = BacktestConfig(
+            fixed_margin_schedule={"ES": (12_000.0, 6_000.0)},
+            margin_pct_schedule={"ES": (0.05, 0.035)},
+        )
+        issues = config.validate(warn=False)
+        assert any("cannot both define" in issue for issue in issues)
+
+    def test_validate_rejects_malformed_margin_pct_schedule(self):
+        config = BacktestConfig(margin_pct_schedule={"ES": (0.05,)})  # type: ignore[dict-item]
+        issues = config.validate(warn=False)
+        assert any("margin_pct_schedule" in issue for issue in issues)
+
+    def test_validate_rejects_non_numeric_margin_pct_schedule(self):
+        config = BacktestConfig(
+            margin_pct_schedule={"ES": ("initial", "maintenance")}  # type: ignore[dict-item]
+        )
+        issues = config.validate(warn=False)
+        assert any("values must be numeric" in issue for issue in issues)
+
+    def test_invalid_margin_pct_schedule_export_does_not_raise(self):
+        config = BacktestConfig(margin_pct_schedule={"ES": (0.05,)})  # type: ignore[dict-item]
+        data = config.to_dict()
+        assert data["account"]["margin_pct_schedule"] == {"ES": [0.05]}
+
+    def test_invalid_margin_pct_schedule_export_keeps_non_sequences_scalar(self):
+        class CountingIterator:
+            def __init__(self):
+                self.read_count = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.read_count >= 5:
+                    raise StopIteration
+                self.read_count += 1
+                return f"value-{self.read_count}"
+
+        iterator = CountingIterator()
+
+        config = BacktestConfig(
+            margin_pct_schedule={
+                "DICT": {"initial": 0.05, "maintenance": 0.035},  # type: ignore[dict-item]
+                "ITER": iterator,  # type: ignore[dict-item]
+                "STR": "im",  # type: ignore[dict-item]
+            }
+        )
+
+        data = config.to_dict()
+
+        assert isinstance(data["account"]["margin_pct_schedule"]["DICT"], str)
+        assert isinstance(data["account"]["margin_pct_schedule"]["ITER"], str)
+        assert data["account"]["margin_pct_schedule"]["STR"] == "im"
+        assert iterator.read_count == 0
+
+    def test_margin_pct_schedule_float_overflow_is_reported(self, tmp_path):
+        class OverflowFloat:
+            def __float__(self):
+                raise OverflowError("too large")
+
+        config = BacktestConfig(
+            margin_pct_schedule={"ES": (OverflowFloat(), 0.05)}  # type: ignore[dict-item]
+        )
+
+        issues = config.validate(warn=False)
+        data = config.to_dict()
+
+        assert any("values must be numeric" in issue for issue in issues)
+        assert isinstance(data["account"]["margin_pct_schedule"]["ES"][0], str)
+        config.to_yaml(tmp_path / "invalid.yaml")
+
+    def test_validate_rejects_invalid_margin_pct_rates(self):
+        config = BacktestConfig(margin_pct_schedule={"ES": (0.03, 0.05)})
+        issues = config.validate(warn=False)
+        assert any("maintenance" in issue and "initial" in issue for issue in issues)
+
+    def test_margin_pct_schedule_yaml_roundtrip_is_safe(self, tmp_path):
+        config = BacktestConfig(margin_pct_schedule={"ES": (0.05, 0.035)})
+        path = tmp_path / "config.yaml"
+
+        config.to_yaml(path)
+        restored = BacktestConfig.from_yaml(path)
+
+        assert restored.margin_pct_schedule == {"ES": (0.05, 0.035)}
+
+
+class TestFromDictDefaultParity:
+    """from_dict({}) must produce the same defaults as BacktestConfig()."""
+
+    def test_empty_dict_matches_constructor_defaults(self):
+        default = BacktestConfig()
+        from_empty = BacktestConfig.from_dict({})
+
+        assert from_empty == default
+
+    def test_constructor_defaults_to_integer_shares(self):
+        config = BacktestConfig()
+        assert config.share_type == ShareType.INTEGER
+        assert config.commission_type == CommissionType.NONE
+        assert config.commission_per_share == 0.0
+        assert config.commission_minimum == 0.0
+        assert config.slippage_type == SlippageType.NONE
+        assert config.slippage_rate == 0.0
+
+    def test_per_contract_commission_alias_loads_from_dict(self):
+        config = BacktestConfig.from_dict({"commission": {"model": "per_contract"}})
+        assert config.commission_type == CommissionType.PER_SHARE
+
+
+class TestFeedSpecConfigResolution:
+    def test_constructor_canonicalizes_feed_spec_metadata(self):
+        config = BacktestConfig(
+            feed_spec={
+                "calendar": "NYSE",
+                "timezone": "America/New_York",
+                "data_frequency": "minute",
+            }
+        )
+
+        assert isinstance(config.feed_spec, FeedSpec)
+        assert config.calendar == "NYSE"
+        assert config.timezone == "America/New_York"
+        assert config.data_frequency == DataFrequency.MINUTE_1
+
+    def test_constructor_rejects_unsupported_morning_session_boundary(self):
+        with pytest.raises(ValueError, match="custom morning session_start_time"):
+            BacktestConfig(
+                feed_spec=FeedSpec(
+                    calendar="CRYPTO",
+                    session_start_time="06:00",
+                )
+            )
+
+    def test_constructor_rejects_unverifiable_morning_session_boundary(self):
+        with pytest.raises(ValueError, match="requires exchange calendar metadata"):
+            BacktestConfig(feed_spec=FeedSpec(session_start_time="09:30"))
+
+    def test_resolved_feed_spec_preserves_explicit_runtime_over_feed_metadata(self):
+        config = BacktestConfig(
+            timezone="UTC",
+            data_frequency=DataFrequency.DAILY,
+            feed_spec=FeedSpec(
+                calendar="CME_Equity",
+                timezone="America/Chicago",
+                data_frequency="minute",
+                session_start_time="17:00",
+                timestamp_semantics="event_time",
+            ),
+        )
+
+        assert config.feed_spec is not None
+        assert config.feed_spec.timezone == "America/Chicago"
+        assert config.timezone == "UTC"
+        assert config.data_frequency == DataFrequency.DAILY
+        assert config.resolved_calendar == "CME_Equity"
+        assert config.resolved_timezone == "UTC"
+        assert config.resolved_data_frequency == DataFrequency.DAILY
+        assert config.resolved_session_start_time == "17:00"
+        assert config.resolved_timestamp_semantics is not None
+        assert config.resolved_timestamp_semantics.value == "event_time"
+        assert config.resolved_feed_spec.calendar == "CME_Equity"
+        assert config.resolved_feed_spec.timezone == "UTC"
+        assert config.resolved_feed_spec.data_frequency == DataFrequency.DAILY
+        assert config.resolved_feed_spec.session_start_time == "17:00"
+
+    def test_merge_feed_spec_fills_missing_runtime_fields(self):
+        config = BacktestConfig()
+
+        merged = config.merge_feed_spec(
+            FeedSpec(
+                calendar="NYSE",
+                timezone="America/New_York",
+                data_frequency="minute",
+            )
+        )
+
+        assert merged is not config
+        assert merged.feed_spec is not None
+        assert merged.calendar == "NYSE"
+        assert merged.timezone == "America/New_York"
+        assert merged.data_frequency == DataFrequency.MINUTE_1
+        assert merged._explicit_timezone is False
+        assert merged._explicit_data_frequency is False
+
+    def test_merge_feed_spec_preserves_explicit_runtime_fields(self):
+        config = BacktestConfig(timezone="UTC", data_frequency=DataFrequency.DAILY)
+
+        merged = config.merge_feed_spec(
+            FeedSpec(
+                calendar="NYSE",
+                timezone="America/New_York",
+                data_frequency="minute",
+            )
+        )
+
+        assert merged.calendar == "NYSE"
+        assert merged.timezone == "UTC"
+        assert merged.data_frequency == DataFrequency.DAILY
+        assert merged._explicit_timezone is True
+        assert merged._explicit_data_frequency is True
+
+    def test_merge_feed_spec_ignores_runtime_argument_when_constructor_spec_exists(self):
+        config = BacktestConfig(
+            feed_spec=FeedSpec(
+                calendar="NYSE",
+                timezone="America/New_York",
+                data_frequency="minute",
+            )
+        )
+
+        merged = config.merge_feed_spec(
+            FeedSpec(
+                calendar="CME_Equity",
+                timezone="America/Chicago",
+                data_frequency="daily",
+            )
+        )
+
+        assert merged is config
+        assert merged.feed_spec is not None
+        assert merged.feed_spec.calendar == "NYSE"
+        assert merged.feed_spec.timezone == "America/New_York"
+        assert merged.feed_spec.data_frequency == "minute"
+
+    def test_merge_feed_spec_returns_identity_when_no_updates_are_needed(self):
+        config = BacktestConfig(
+            feed_spec=FeedSpec(
+                calendar="NYSE",
+                timezone="America/New_York",
+                data_frequency="minute",
+            )
+        )
+
+        merged = config.merge_feed_spec(config.feed_spec)
+
+        assert merged is config
+        assert config.merge_feed_spec(None) is config
+
+
+class TestStructuredAssumptions:
+    def test_from_assumptions_ibkr_us_stocks_fixed(self):
+        config = BacktestConfig.from_assumptions(
+            broker="ibkr",
+            region="us",
+            asset_class="stocks",
+            plan="fixed",
+        )
+
+        assert config.preset_name == "ibkr_us_stocks_fixed"
+        assert config.commission_type == CommissionType.PER_SHARE
+        assert config.commission_per_share == 0.005
+        assert config.commission_minimum == 1.0
+        assert config.slippage_type == SlippageType.NONE
+
+    def test_from_assumptions_accepts_broker_and_asset_aliases(self):
+        config = BacktestConfig.from_assumptions(
+            broker="interactive_brokers",
+            region="usa",
+            asset_class="equities",
+            plan="fixed",
+        )
+
+        assert config.preset_name == "ibkr_us_stocks_fixed"
+        assert config.commission_per_share == 0.005
+        assert config.commission_minimum == 1.0
+
+    def test_from_user_config_uses_default_assumptions_and_global_defaults(self, tmp_path):
+        config_dir = tmp_path / "ml4t"
+        config_dir.mkdir()
+        (config_dir / "defaults.yaml").write_text(
+            "cash:\n  initial: 250000\ncalendar:\n  timezone: America/New_York\n"
+        )
+        (config_dir / "assumptions.yaml").write_text(
+            "default_assumptions:\n"
+            "  broker: ibkr\n"
+            "  region: us\n"
+            "  asset_class: stocks\n"
+            "  plan: fixed\n"
+        )
+
+        config = BacktestConfig.from_user_config(config_dir=config_dir)
+
+        assert config.preset_name == "user_config"
+        assert config.initial_cash == 250000
+        assert config.timezone == "America/New_York"
+        assert config.commission_type == CommissionType.PER_SHARE
+        assert config.commission_per_share == 0.005
+        assert config.commission_minimum == 1.0
+
+    def test_from_user_config_broker_override_beats_global_defaults(self, tmp_path):
+        config_dir = tmp_path / "ml4t"
+        config_dir.mkdir()
+        (config_dir / "defaults.yaml").write_text(
+            "commission:\n  model: none\nslippage:\n  model: none\n"
+        )
+        (config_dir / "assumptions.yaml").write_text(
+            "default_assumptions:\n"
+            "  broker: ibkr\n"
+            "  region: us\n"
+            "  asset_class: stocks\n"
+            "  plan: fixed\n"
+            "brokers:\n"
+            "  ibkr:\n"
+            "    us:\n"
+            "      stocks:\n"
+            "        fixed:\n"
+            "          commission:\n"
+            "            minimum: 2.5\n"
+        )
+
+        config = BacktestConfig.from_user_config(config_dir=config_dir)
+
+        assert config.commission_type == CommissionType.PER_SHARE
+        assert config.commission_per_share == 0.005
+        assert config.commission_minimum == 2.5
+
+    def test_from_user_config_requires_complete_assumptions_tuple(self, tmp_path):
+        config_dir = tmp_path / "ml4t"
+        config_dir.mkdir()
+        (config_dir / "assumptions.yaml").write_text(
+            "default_assumptions:\n  broker: ibkr\n  region: us\n"
+        )
+
+        with pytest.raises(ValueError, match="broker, region, asset_class, and plan"):
+            BacktestConfig.from_user_config(config_dir=config_dir)
+
+
+class TestConfigModelWiring:
+    """All commission/slippage enum choices should map to model instances."""
+
+    def test_per_trade_commission_maps_to_combined_commission(self):
+        broker = Broker.from_config(
+            BacktestConfig(
+                commission_type=CommissionType.PER_TRADE,
+                commission_per_trade=2.5,
+            )
+        )
+        assert isinstance(broker.commission_model, CombinedCommission)
+        assert broker.commission_model.fixed == 2.5
+
+    def test_tiered_commission_maps_to_tiered_commission(self):
+        broker = Broker.from_config(
+            BacktestConfig(
+                commission_type=CommissionType.TIERED,
+                commission_rate=0.0012,
+            )
+        )
+        assert isinstance(broker.commission_model, TieredCommission)
+        assert broker.commission_model.tiers == [(float("inf"), 0.0012)]
+
+    def test_volume_based_slippage_maps_to_volume_share_slippage(self):
+        broker = Broker.from_config(
+            BacktestConfig(
+                slippage_type=SlippageType.VOLUME_BASED,
+                slippage_rate=0.25,
+            )
+        )
+        assert isinstance(broker.slippage_model, VolumeShareSlippage)
+        assert broker.slippage_model.impact_factor == 0.25
+
+    def test_spread_slippage_maps_to_spread_slippage(self):
+        broker = Broker.from_config(
+            BacktestConfig(
+                slippage_type=SlippageType.SPREAD,
+                slippage_spread=0.04,
+                slippage_spread_by_asset={"AAPL": 0.02},
+                slippage_spread_convention=SpreadConvention.HALF_SPREAD,
+            )
+        )
+        assert isinstance(broker.slippage_model, SpreadSlippage)
+        assert broker.slippage_model.spread == 0.04
+        assert broker.slippage_model.asset_spreads == {"AAPL": 0.02}
+        assert broker.slippage_model.convention == "half_spread"
+
+    def test_per_share_commission_still_maps_correctly(self):
+        broker = Broker.from_config(
+            BacktestConfig(
+                commission_type=CommissionType.PER_SHARE,
+                commission_per_share=0.01,
+                commission_minimum=1.0,
+            )
+        )
+        assert isinstance(broker.commission_model, PerShareCommission)
+        assert broker.commission_model.per_share == 0.01
+
+    def test_legacy_direct_cost_fields_still_activate_models(self):
+        broker = Broker.from_config(
+            BacktestConfig(
+                commission_rate=0.001,
+                slippage_rate=0.002,
+            )
+        )
+        assert isinstance(broker.commission_model, PercentageCommission)
+        assert broker.commission_model.rate == 0.001
+        assert isinstance(broker.slippage_model, PercentageSlippage)
+        assert broker.slippage_model.rate == 0.002
+
+    def test_spread_slippage_roundtrip_preserves_asset_map(self):
+        config = BacktestConfig(
+            slippage_type=SlippageType.SPREAD,
+            slippage_spread=0.05,
+            slippage_spread_by_asset={"AAPL": 0.03, "MSFT": 0.04},
+            slippage_spread_convention=SpreadConvention.FULL_SPREAD,
+        )
+        restored = BacktestConfig.from_dict(config.to_dict())
+        assert restored.slippage_type == SlippageType.SPREAD
+        assert restored.slippage_spread == 0.05
+        assert restored.slippage_spread_by_asset == {"AAPL": 0.03, "MSFT": 0.04}
+        assert restored.slippage_spread_convention == SpreadConvention.FULL_SPREAD
+
+    def test_spread_slippage_validation_requires_configured_spread(self):
+        issues = BacktestConfig(slippage_type=SlippageType.SPREAD).validate(warn=False)
+        assert any("slippage_type='spread' requires" in issue for issue in issues)

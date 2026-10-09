@@ -1,0 +1,527 @@
+"""Trade analysis and statistics."""
+
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+import numpy as np
+
+if TYPE_CHECKING:
+    from ..types import Trade
+
+
+@dataclass
+class TradeAnalyzer:
+    """Analyze realized exit legs and full-close position lifecycles.
+
+    P&L statistics use every supplied realized exit leg, including partial
+    reductions. Holding-period and excursion statistics use only records whose
+    status is ``"closed"``. If realized legs exist but no position lifecycle has
+    closed, lifecycle statistics return NaN instead of an unmeasured zero.
+    """
+
+    trades: Sequence["Trade"]
+    _lifecycle_trades: list["Trade"] = field(init=False, repr=False)
+
+    def __post_init__(self):
+        self._pnls = np.array([t.pnl for t in self.trades]) if self.trades else np.array([])
+        self._returns = (
+            np.array([t.pnl_percent for t in self.trades]) if self.trades else np.array([])
+        )
+        self._lifecycle_trades = [
+            trade for trade in self.trades if getattr(trade, "status", "closed") == "closed"
+        ]
+
+    @property
+    def num_trades(self) -> int:
+        """Total number of trades."""
+        return len(self.trades)
+
+    @property
+    def num_winners(self) -> int:
+        """Number of winning trades (pnl > 0)."""
+        return int(np.sum(self._pnls > 0))
+
+    @property
+    def num_losers(self) -> int:
+        """Number of losing trades (pnl < 0)."""
+        return int(np.sum(self._pnls < 0))
+
+    @property
+    def win_rate(self) -> float:
+        """Percentage of winning trades."""
+        if self.num_trades == 0:
+            return 0.0
+        return self.num_winners / self.num_trades
+
+    @property
+    def gross_profit(self) -> float:
+        """Sum of all winning trade PnLs."""
+        winners = self._pnls[self._pnls > 0]
+        return float(np.sum(winners)) if len(winners) > 0 else 0.0
+
+    @property
+    def gross_loss(self) -> float:
+        """Sum of all losing trade PnLs (negative)."""
+        losers = self._pnls[self._pnls < 0]
+        return float(np.sum(losers)) if len(losers) > 0 else 0.0
+
+    @property
+    def net_profit(self) -> float:
+        """Total profit/loss."""
+        return float(np.sum(self._pnls)) if len(self._pnls) > 0 else 0.0
+
+    @property
+    def profit_factor(self) -> float:
+        """Gross profit / |Gross loss|. Higher is better."""
+        if self.gross_loss == 0:
+            return float("inf") if self.gross_profit > 0 else 0.0
+        return self.gross_profit / abs(self.gross_loss)
+
+    # --- Per-trade return metrics (percentage-based) ---
+    # All per-trade metrics use pnl_percent (direction-aware return),
+    # not dollar P&L. Dollar extremes are misleading when equity changes:
+    # a -5% trade at high equity is a larger dollar loss than -30% at low equity.
+
+    @property
+    def avg_win(self) -> float:
+        """Average winning trade return (as decimal)."""
+        winner_returns = self._returns[self._returns > 0]
+        return float(np.mean(winner_returns)) if len(winner_returns) > 0 else 0.0
+
+    @property
+    def avg_loss(self) -> float:
+        """Average losing trade return (as decimal, negative)."""
+        loser_returns = self._returns[self._returns < 0]
+        return float(np.mean(loser_returns)) if len(loser_returns) > 0 else 0.0
+
+    @property
+    def avg_trade(self) -> float:
+        """Average trade return (as decimal)."""
+        return float(np.mean(self._returns)) if len(self._returns) > 0 else 0.0
+
+    @property
+    def expectancy(self) -> float:
+        """Expected return per trade: (win_rate * avg_win) + ((1 - win_rate) * avg_loss)."""
+        return self.win_rate * self.avg_win + (1 - self.win_rate) * self.avg_loss
+
+    @property
+    def largest_win(self) -> float:
+        """Best single trade return (as decimal)."""
+        winner_returns = self._returns[self._returns > 0]
+        return float(np.max(winner_returns)) if len(winner_returns) > 0 else 0.0
+
+    @property
+    def largest_loss(self) -> float:
+        """Worst single trade return (as decimal, most negative)."""
+        loser_returns = self._returns[self._returns < 0]
+        return float(np.min(loser_returns)) if len(loser_returns) > 0 else 0.0
+
+    @property
+    def payoff_ratio(self) -> float:
+        """avg_win / |avg_loss|. Size-normalized reward-to-risk."""
+        if self.avg_loss == 0:
+            return float("inf") if self.avg_win > 0 else 0.0
+        return self.avg_win / abs(self.avg_loss)
+
+    @property
+    def avg_bars_held(self) -> float:
+        """Average bars held across fully closed position lifecycles."""
+        if not self._lifecycle_trades:
+            return float("nan") if self.trades else 0.0
+        return float(np.mean([trade.bars_held for trade in self._lifecycle_trades]))
+
+    @property
+    def total_fees(self) -> float:
+        """Total transaction fees paid across all trades."""
+        return sum(t.fees for t in self.trades)
+
+    @property
+    def total_commission(self) -> float:
+        """Total commission paid across all trades (alias for total_fees)."""
+        return self.total_fees
+
+    @property
+    def total_slippage(self) -> float:
+        """Total slippage cost across all trades (entry + exit)."""
+        return sum(t.total_slippage_cost for t in self.trades)
+
+    # --- Cost Decomposition Metrics ---
+
+    @property
+    def total_gross_pnl(self) -> float:
+        """Total gross P&L (price moves only, before all costs)."""
+        return sum(t.gross_pnl for t in self.trades)
+
+    @property
+    def total_costs(self) -> float:
+        """Total transaction costs (fees + slippage)."""
+        return self.total_fees + self.total_slippage
+
+    @property
+    def avg_cost_drag(self) -> float:
+        """Average cost drag across trades (costs as fraction of notional)."""
+        if not self.trades:
+            return 0.0
+        drags = [t.cost_drag for t in self.trades]
+        return float(np.mean(drags))
+
+    @property
+    def gross_profit_factor(self) -> float:
+        """Profit factor using gross P&L (before costs).
+
+        Compares raw price-move profits to losses, isolating strategy
+        edge from execution costs.
+        """
+        gross_pnls = np.array([t.gross_pnl for t in self.trades]) if self.trades else np.array([])
+        gross_wins = float(np.sum(gross_pnls[gross_pnls > 0])) if len(gross_pnls) > 0 else 0.0
+        gross_losses = float(np.sum(gross_pnls[gross_pnls < 0])) if len(gross_pnls) > 0 else 0.0
+        if gross_losses == 0:
+            return float("inf") if gross_wins > 0 else 0.0
+        return gross_wins / abs(gross_losses)
+
+    def by_side(self, side: str) -> "TradeAnalyzer":
+        """Filter trades by side ('long' or 'short')."""
+        filtered = [t for t in self.trades if t.direction == side]
+        return TradeAnalyzer(filtered)
+
+    def by_symbol(self, symbol: str) -> "TradeAnalyzer":
+        """Filter trades by symbol."""
+        filtered = [t for t in self.trades if t.symbol == symbol]
+        return TradeAnalyzer(filtered)
+
+    def by_asset(self, asset: str) -> "TradeAnalyzer":
+        """Filter trades by asset (alias for by_symbol)."""
+        return self.by_symbol(asset)
+
+    # MFE/MAE Analysis Methods
+
+    @property
+    def avg_mfe(self) -> float:
+        """Average maximum favorable excursion across fully closed lifecycles."""
+        if not self._lifecycle_trades:
+            return float("nan") if self.trades else 0.0
+        mfes = [t.mfe for t in self._lifecycle_trades]
+        return float(np.mean(mfes))
+
+    @property
+    def avg_mae(self) -> float:
+        """Average maximum adverse excursion across fully closed lifecycles."""
+        if not self._lifecycle_trades:
+            return float("nan") if self.trades else 0.0
+        maes = [t.mae for t in self._lifecycle_trades]
+        return float(np.mean(maes))
+
+    @property
+    def mfe_capture_ratio(self) -> float:
+        """Average ratio of realized return to MFE for fully closed lifecycles.
+
+        Values close to 1.0 indicate exits near peak profit.
+        Values close to 0.0 indicate exits gave back most gains.
+        """
+        if not self._lifecycle_trades:
+            return float("nan") if self.trades else 0.0
+        ratios = []
+        for t in self._lifecycle_trades:
+            if t.mfe > 0:
+                ratios.append(t.pnl_percent / t.mfe)
+        return float(np.mean(ratios)) if ratios else 0.0
+
+    @property
+    def mae_recovery_ratio(self) -> float:
+        """Average MAE recovery ratio for fully closed position lifecycles.
+
+        Calculated as (MAE - final_loss) / MAE for losing trades.
+        Higher values indicate better recovery from drawdowns.
+        """
+        if not self._lifecycle_trades:
+            return float("nan") if self.trades else 0.0
+        ratios = []
+        for t in self._lifecycle_trades:
+            if t.mae < 0 and t.pnl_percent < 0:
+                # Both negative: MAE was -10%, final was -5% = recovered 50%
+                recovery = (t.pnl_percent - t.mae) / abs(t.mae)
+                ratios.append(recovery)
+        return float(np.mean(ratios)) if ratios else 0.0
+
+    def to_dict(self) -> dict:
+        """Export statistics as dictionary."""
+        return {
+            "num_trades": self.num_trades,
+            "num_winners": self.num_winners,
+            "num_losers": self.num_losers,
+            "win_rate": self.win_rate,
+            "gross_profit": self.gross_profit,
+            "gross_loss": self.gross_loss,
+            "net_profit": self.net_profit,
+            "profit_factor": self.profit_factor,
+            "avg_win": self.avg_win,
+            "avg_loss": self.avg_loss,
+            "avg_trade": self.avg_trade,
+            "expectancy": self.expectancy,
+            "largest_win": self.largest_win,
+            "largest_loss": self.largest_loss,
+            "payoff_ratio": self.payoff_ratio,
+            "avg_bars_held": self.avg_bars_held,
+            "total_commission": self.total_commission,
+            "total_slippage": self.total_slippage,
+            # Cost decomposition
+            "total_gross_pnl": self.total_gross_pnl,
+            "total_costs": self.total_costs,
+            "avg_cost_drag": self.avg_cost_drag,
+            "gross_profit_factor": self.gross_profit_factor,
+            # MFE/MAE metrics
+            "avg_mfe": self.avg_mfe,
+            "avg_mae": self.avg_mae,
+            "mfe_capture_ratio": self.mfe_capture_ratio,
+            "mae_recovery_ratio": self.mae_recovery_ratio,
+        }
+
+
+@dataclass
+class MAEMFEAnalyzer:
+    """Analyze MAE/MFE distributions for optimal stop/target discovery.
+
+    Provides statistical analysis of Maximum Adverse Excursion (MAE) and
+    Maximum Favorable Excursion (MFE) to help optimize exit strategies.
+
+    Attributes:
+        trades: Sequence of Trade objects with MAE/MFE data
+        _maes: Array of MAE values (negative for losses)
+        _mfes: Array of MFE values (positive for gains)
+
+    Example:
+        analyzer = MAEMFEAnalyzer(trades)
+
+        # Find stop that would preserve 90% of winning trades
+        optimal_stop = analyzer.suggest_stop_loss(percentile=90)
+
+        # Find target that captures 75% of MFE
+        optimal_target = analyzer.suggest_take_profit(percentile=75)
+
+        # Get edge ratio
+        edge = analyzer.edge_ratio
+
+    Note:
+        MAE values are typically negative (adverse = loss)
+        MFE values are typically positive (favorable = gain)
+    """
+
+    trades: Sequence["Trade"]
+    _maes: np.ndarray = field(init=False, repr=False)
+    _mfes: np.ndarray = field(init=False, repr=False)
+
+    def __post_init__(self):
+        if self.trades:
+            self._maes = np.array([t.mae for t in self.trades])
+            self._mfes = np.array([t.mfe for t in self.trades])
+        else:
+            self._maes = np.array([])
+            self._mfes = np.array([])
+
+    @property
+    def num_trades(self) -> int:
+        """Number of trades analyzed."""
+        return len(self.trades)
+
+    # --- MAE Statistics ---
+
+    @property
+    def mae_mean(self) -> float:
+        """Mean MAE across all trades (typically negative)."""
+        return float(np.mean(self._maes)) if len(self._maes) > 0 else 0.0
+
+    @property
+    def mae_median(self) -> float:
+        """Median MAE across all trades."""
+        return float(np.median(self._maes)) if len(self._maes) > 0 else 0.0
+
+    @property
+    def mae_std(self) -> float:
+        """Standard deviation of MAE."""
+        return float(np.std(self._maes)) if len(self._maes) > 0 else 0.0
+
+    def mae_percentile(self, q: float) -> float:
+        """MAE at given percentile (0-100).
+
+        Args:
+            q: Percentile (e.g., 10 = worst 10% of trades)
+
+        Returns:
+            MAE value at that percentile (negative)
+        """
+        if len(self._maes) == 0:
+            return 0.0
+        return float(np.percentile(self._maes, q))
+
+    # --- MFE Statistics ---
+
+    @property
+    def mfe_mean(self) -> float:
+        """Mean MFE across all trades (typically positive)."""
+        return float(np.mean(self._mfes)) if len(self._mfes) > 0 else 0.0
+
+    @property
+    def mfe_median(self) -> float:
+        """Median MFE across all trades."""
+        return float(np.median(self._mfes)) if len(self._mfes) > 0 else 0.0
+
+    @property
+    def mfe_std(self) -> float:
+        """Standard deviation of MFE."""
+        return float(np.std(self._mfes)) if len(self._mfes) > 0 else 0.0
+
+    def mfe_percentile(self, q: float) -> float:
+        """MFE at given percentile (0-100).
+
+        Args:
+            q: Percentile (e.g., 75 = captured by 75% of trades)
+
+        Returns:
+            MFE value at that percentile
+        """
+        if len(self._mfes) == 0:
+            return 0.0
+        return float(np.percentile(self._mfes, q))
+
+    # --- Combined Metrics ---
+
+    @property
+    def edge_ratio(self) -> float:
+        """Ratio of average MFE to average |MAE|.
+
+        Values > 1.0 indicate trades tend to go further in favor
+        than against. Higher is better.
+        """
+        if self.mae_mean == 0:
+            return float("inf") if self.mfe_mean > 0 else 0.0
+        return self.mfe_mean / abs(self.mae_mean)
+
+    @property
+    def efficiency(self) -> float:
+        """Average trade efficiency: realized_return / MFE.
+
+        Values close to 1.0 indicate exits near peak profit.
+        """
+        if len(self.trades) == 0:
+            return 0.0
+        efficiencies = []
+        for t in self.trades:
+            if t.mfe > 0:
+                efficiencies.append(t.pnl_percent / t.mfe)
+        return float(np.mean(efficiencies)) if efficiencies else 0.0
+
+    # --- Optimization Suggestions ---
+
+    def suggest_stop_loss(self, percentile: float = 90) -> float:
+        """Suggest stop loss level that preserves given % of winning trades.
+
+        Args:
+            percentile: Percentage of winning trades to preserve (default 90)
+
+        Returns:
+            Suggested stop loss as return percentage (e.g., -0.05 = -5%)
+
+        Example:
+            # Stop that would save 90% of winners
+            stop = analyzer.suggest_stop_loss(percentile=90)
+            # Returns e.g., -0.03 meaning -3% stop
+        """
+        if len(self.trades) == 0:
+            return 0.0
+
+        # Get MAE for winning trades only
+        winner_maes = np.array([t.mae for t in self.trades if t.pnl > 0])
+        if len(winner_maes) == 0:
+            return self.mae_percentile(100 - percentile)
+
+        # Find MAE that preserves `percentile`% of winners
+        # Lower percentile = tighter stop (fewer trades hit it)
+        return float(np.percentile(winner_maes, 100 - percentile))
+
+    def suggest_take_profit(self, percentile: float = 75) -> float:
+        """Suggest take profit level based on MFE distribution.
+
+        Args:
+            percentile: Percentage of trades that reach this level (default 75)
+
+        Returns:
+            Suggested take profit as return percentage (e.g., 0.05 = 5%)
+
+        Example:
+            # Target that 75% of trades reach
+            target = analyzer.suggest_take_profit(percentile=75)
+            # Returns e.g., 0.05 meaning +5% target
+        """
+        if len(self._mfes) == 0:
+            return 0.0
+
+        # Find MFE that `percentile`% of trades achieve
+        # Lower percentile = more conservative target
+        return float(np.percentile(self._mfes, 100 - percentile))
+
+    def optimal_exit_levels(
+        self,
+        stop_percentile: float = 90,
+        target_percentile: float = 75,
+    ) -> dict[str, float]:
+        """Get optimized stop loss and take profit levels.
+
+        Args:
+            stop_percentile: % of winning trades to preserve (default 90)
+            target_percentile: % of trades that reach target (default 75)
+
+        Returns:
+            Dictionary with 'stop_loss' and 'take_profit' levels
+        """
+        return {
+            "stop_loss": self.suggest_stop_loss(stop_percentile),
+            "take_profit": self.suggest_take_profit(target_percentile),
+            "risk_reward": abs(
+                self.suggest_take_profit(target_percentile)
+                / self.suggest_stop_loss(stop_percentile)
+            )
+            if self.suggest_stop_loss(stop_percentile) != 0
+            else float("inf"),
+        }
+
+    def distribution_data(self) -> dict[str, list[float]]:
+        """Get MAE/MFE distribution data for visualization.
+
+        Returns:
+            Dictionary with 'mae' and 'mfe' lists for plotting
+        """
+        return {
+            "mae": self._maes.tolist() if len(self._maes) > 0 else [],
+            "mfe": self._mfes.tolist() if len(self._mfes) > 0 else [],
+        }
+
+    def to_dict(self) -> dict:
+        """Export analysis results as dictionary."""
+        return {
+            "num_trades": self.num_trades,
+            # MAE stats
+            "mae_mean": self.mae_mean,
+            "mae_median": self.mae_median,
+            "mae_std": self.mae_std,
+            "mae_p10": self.mae_percentile(10),
+            "mae_p25": self.mae_percentile(25),
+            "mae_p50": self.mae_percentile(50),
+            "mae_p75": self.mae_percentile(75),
+            "mae_p90": self.mae_percentile(90),
+            # MFE stats
+            "mfe_mean": self.mfe_mean,
+            "mfe_median": self.mfe_median,
+            "mfe_std": self.mfe_std,
+            "mfe_p10": self.mfe_percentile(10),
+            "mfe_p25": self.mfe_percentile(25),
+            "mfe_p50": self.mfe_percentile(50),
+            "mfe_p75": self.mfe_percentile(75),
+            "mfe_p90": self.mfe_percentile(90),
+            # Combined
+            "edge_ratio": self.edge_ratio,
+            "efficiency": self.efficiency,
+            # Suggestions
+            "suggested_stop_loss": self.suggest_stop_loss(),
+            "suggested_take_profit": self.suggest_take_profit(),
+        }

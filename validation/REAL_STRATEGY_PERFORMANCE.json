@@ -1,0 +1,1176 @@
+{
+  "correctness_evidence_generated_at": "2026-10-08T20:00:49.510846+00:00",
+  "environment": {
+    "cpu_count": 24,
+    "frameworks": {
+      "backtrader": {
+        "access": "public",
+        "artifact": "backtrader-1.9.78.123-py2.py3-none-any.whl",
+        "display_name": "Backtrader",
+        "environment": ".venv-backtrader",
+        "immutable_id": "sha256:9a07a516b0de9155539a35c56e9404d8711dd7020b3d37b30495e83e1b9d5dfd",
+        "license": "GPL-3.0-or-later",
+        "package": "backtrader",
+        "profile": "backtrader_strict",
+        "python": "3.12 audit interpreter; upstream package metadata does not declare a range",
+        "python_env_var": "ML4T_BACKTRADER_PYTHON",
+        "required_scenarios": 17,
+        "scenario_matrix": true,
+        "source": "https://pypi.org/project/backtrader/1.9.78.123/",
+        "unsupported_scenarios": 0,
+        "version": "1.9.78.123"
+      },
+      "lean": {
+        "access": "public",
+        "artifact": "quantconnect/lean@sha256:ecd62b0e418d40d1d7c0cd95e90a94e397642a21d2c8810614830c8a4e9a8f70",
+        "cli_immutable_id": "sha256:eaa4c08f16295b76f005e429d9ca0d0453784dc1a40c1f5cbe5e50c02a05bd7c",
+        "cli_version": "1.0.228",
+        "display_name": "LEAN",
+        "environment": ".venv-lean",
+        "immutable_id": "sha256:ecd62b0e418d40d1d7c0cd95e90a94e397642a21d2c8810614830c8a4e9a8f70",
+        "license": "Apache-2.0",
+        "package": "lean",
+        "platform_artifact": "linux/amd64@sha256:cbe3f26b3f16c57be836b2cf913253d434f58e010c84ed038360d26b9df88307",
+        "profile": "lean",
+        "python": "3.11",
+        "python_env_var": "ML4T_LEAN_PYTHON",
+        "required_scenarios": 0,
+        "scenario_matrix": false,
+        "source": "https://github.com/QuantConnect/Lean",
+        "source_commit": "278fcb3d1b815b63ccadba68d7ae54422e34b792",
+        "unsupported_scenarios": 0,
+        "version": "18001"
+      },
+      "vectorbt_oss": {
+        "access": "public",
+        "artifact": "vectorbt-1.1.0.tar.gz",
+        "display_name": "VectorBT OSS",
+        "environment": ".venv-vectorbt-oss",
+        "immutable_id": "sha256:67a3b41466234485af70c18d201da105f1ebb2c1d1fac079db20059e45ddc73b",
+        "license": "Apache-2.0 WITH Commons-Clause",
+        "package": "vectorbt",
+        "profile": "vectorbt_oss_strict",
+        "python": ">=3.11,<3.15",
+        "python_env_var": "ML4T_VECTORBT_OSS_PYTHON",
+        "required_scenarios": 16,
+        "scenario_matrix": true,
+        "source": "https://pypi.org/project/vectorbt/1.1.0/",
+        "source_commit": "259d2d89fe2e7638baf3ca76c394937cd32b656d",
+        "unsupported_scenarios": 1,
+        "version": "1.1.0"
+      },
+      "vectorbt_pro": {
+        "access": "licensed",
+        "display_name": "VectorBT Pro",
+        "environment": ".venv-vectorbt-pro",
+        "immutable_id": "git:6e18cf0aa37849cfc20848f40f1d26ecfdc771b4",
+        "license": "Proprietary",
+        "package": "vectorbtpro",
+        "profile": "vectorbt_strict",
+        "python": ">=3.11",
+        "python_env_var": "ML4T_VECTORBT_PRO_PYTHON",
+        "required_scenarios": 17,
+        "scenario_matrix": true,
+        "source": "https://github.com/polakowo/vectorbt.pro",
+        "source_commit": "6e18cf0aa37849cfc20848f40f1d26ecfdc771b4",
+        "unsupported_scenarios": 0,
+        "version": "2026.6.27"
+      },
+      "zipline": {
+        "access": "public",
+        "artifact": "zipline_reloaded-3.1.1.tar.gz",
+        "display_name": "Zipline Reloaded",
+        "environment": ".venv-zipline",
+        "immutable_id": "sha256:4a305524616f7aad836f929e5a2ba5afc7db0e238757f47eb49487d9e2457a6f",
+        "license": "Apache-2.0",
+        "package": "zipline-reloaded",
+        "profile": "zipline_strict",
+        "python": ">=3.10",
+        "python_env_var": "ML4T_ZIPLINE_PYTHON",
+        "required_scenarios": 16,
+        "scenario_matrix": true,
+        "source": "https://pypi.org/project/zipline-reloaded/3.1.1/",
+        "source_commit": "09885a2ebc7567d40942c891b3879dc03c745070",
+        "unsupported_scenarios": 1,
+        "version": "3.1.1"
+      }
+    },
+    "machine": "x86_64",
+    "platform": "Linux-6.8.0-139-generic-x86_64-with-glibc2.39",
+    "processor": "x86_64"
+  },
+  "generated_at": "2026-09-24T05:37:41.451299+00:00",
+  "provenance": {
+    "certified_equivalent_sources": [
+      {
+        "certified_at": "2026-10-08T19:28:11.762869+00:00",
+        "correctness_evidence_generated_at": "2026-10-08T19:27:55.214328+00:00",
+        "correctness_evidence_sha256": "8818058c974a2beac7edc59013224bb0fd818f828e656dac5f5a41650a704aa5",
+        "correctness_pairs_passed": 17,
+        "engine_source_sha256": "b1ebee1ef59f82269fb69cb4103927398254bfa5d8ad620a23c588260de99aca",
+        "ml4t_commit": "a1649d9f4271c56dcb1de9688b97218f8c50cb13",
+        "reason": "The only engine source change is the new module src/ml4t/backtest/prediction_market_fees.py. Nothing in src/ml4t/backtest or the real-strategy runners imports it (grep finds no import outside the module itself), so it is never loaded by the timed region, result = engine.run() in validation/real_strategy_runner.py, and cannot move an engine timing. Real-strategy correctness was rebuilt under this source at f349264: 17/17 pass with no compared value moved.",
+        "sources": {
+          "backtrader": "a456cc3bf9ed6708d239f21ed2c2495a3c19a9a8306634fee24619c2c0484459",
+          "benchmark": "0ccc3c90786dc6bc7b8d5992097cd977e2568c39c20f1490d83531b20e6a5188",
+          "comparison_input": "a00bf9383c3e5561333ef0fa734745296cf9cda6fe7155ce950713c1ba2da4f9",
+          "lean_crypto": "82f1fbb6054fba25d74a4eabbc9ad4eae808caf89c00f560edefa63304da0dc4",
+          "lean_equity": "f566341d0f4103eda45280684be1b8a91f9da1a46a3a06477cba3b49674d89e8",
+          "lean_fx": "85c18eb1368bfac938fd9909eaa481de867cd864b1f6852281da8af7c2b44951",
+          "ml4t": "c8a5eb818a64a128dce41bc9827adea0a46fdab87a11f418abb19d5df8c7bff9",
+          "vectorbt_oss": "c1817727bbf49d1551a072717db324c3e70484eefbdc27aa84af2a093e3e4d52",
+          "vectorbt_pro": "c1817727bbf49d1551a072717db324c3e70484eefbdc27aa84af2a093e3e4d52",
+          "zipline": "c23b547767fad7a60f8bd6b0abd1d8f1c1acf99ef0faab3da8fd34621b0ec482"
+        }
+      },
+      {
+        "certified_at": "2026-10-08T20:00:56.038473+00:00",
+        "correctness_evidence_generated_at": "2026-10-08T20:00:49.510846+00:00",
+        "correctness_evidence_sha256": "3f26dc66ec0874de379a4fe97fa149ccf262688901a7b6aa2c3a973e4376a861",
+        "correctness_pairs_passed": 17,
+        "engine_source_sha256": "2a0d9b9b0570f22772090e2204b97fb7aa970b99ca6814b63f443b47539bf41f",
+        "ml4t_commit": "e76e95d5b3ca5ef1daf833c82b9548e1db726fed",
+        "reason": "The engine source differs from the measured one only by the new module src/ml4t/backtest/prediction_market_fees.py. Nothing in src/ml4t/backtest or the real-strategy runners imports it, so it is never loaded in the timed region (result = engine.run() in validation/real_strategy_runner.py) and cannot move an engine timing. Real-strategy correctness was rebuilt under this source at 5b7a27e: 17/17 pass.",
+        "sources": {
+          "backtrader": "a456cc3bf9ed6708d239f21ed2c2495a3c19a9a8306634fee24619c2c0484459",
+          "benchmark": "0ccc3c90786dc6bc7b8d5992097cd977e2568c39c20f1490d83531b20e6a5188",
+          "comparison_input": "a00bf9383c3e5561333ef0fa734745296cf9cda6fe7155ce950713c1ba2da4f9",
+          "lean_crypto": "82f1fbb6054fba25d74a4eabbc9ad4eae808caf89c00f560edefa63304da0dc4",
+          "lean_equity": "f566341d0f4103eda45280684be1b8a91f9da1a46a3a06477cba3b49674d89e8",
+          "lean_fx": "85c18eb1368bfac938fd9909eaa481de867cd864b1f6852281da8af7c2b44951",
+          "ml4t": "c8a5eb818a64a128dce41bc9827adea0a46fdab87a11f418abb19d5df8c7bff9",
+          "vectorbt_oss": "c1817727bbf49d1551a072717db324c3e70484eefbdc27aa84af2a093e3e4d52",
+          "vectorbt_pro": "c1817727bbf49d1551a072717db324c3e70484eefbdc27aa84af2a093e3e4d52",
+          "zipline": "c23b547767fad7a60f8bd6b0abd1d8f1c1acf99ef0faab3da8fd34621b0ec482"
+        }
+      }
+    ],
+    "ml4t_engine_source_sha256": "553e3e351f2de59bc17fc4f42b67e4e4f923d059b44eecd6a69e114df4b4a8fe",
+    "sources": {
+      "backtrader": "a456cc3bf9ed6708d239f21ed2c2495a3c19a9a8306634fee24619c2c0484459",
+      "benchmark": "0ccc3c90786dc6bc7b8d5992097cd977e2568c39c20f1490d83531b20e6a5188",
+      "comparison_input": "a00bf9383c3e5561333ef0fa734745296cf9cda6fe7155ce950713c1ba2da4f9",
+      "lean_crypto": "82f1fbb6054fba25d74a4eabbc9ad4eae808caf89c00f560edefa63304da0dc4",
+      "lean_equity": "f566341d0f4103eda45280684be1b8a91f9da1a46a3a06477cba3b49674d89e8",
+      "lean_fx": "85c18eb1368bfac938fd9909eaa481de867cd864b1f6852281da8af7c2b44951",
+      "ml4t": "c8a5eb818a64a128dce41bc9827adea0a46fdab87a11f418abb19d5df8c7bff9",
+      "vectorbt_oss": "c1817727bbf49d1551a072717db324c3e70484eefbdc27aa84af2a093e3e4d52",
+      "vectorbt_pro": "c1817727bbf49d1551a072717db324c3e70484eefbdc27aa84af2a093e3e4d52",
+      "zipline": "c23b547767fad7a60f8bd6b0abd1d8f1c1acf99ef0faab3da8fd34621b0ec482"
+    }
+  },
+  "records": [
+    {
+      "case_study": "etfs",
+      "correctness_status": "pass",
+      "framework": "vectorbt_pro",
+      "framework_engine": {
+        "ci_95_seconds": [
+          0.2900016970233992,
+          0.297742429014761
+        ],
+        "maximum_seconds": 0.31405577599070966,
+        "median_seconds": 0.2925560909206979,
+        "minimum_seconds": 0.289397667045705,
+        "output_identity": {
+          "equity.parquet": "9bef5099c36b4a61b32670d19340ebb9f4adba07c63359a5c31a345ad51d1cd6",
+          "fills.parquet": "698baf228da467fcce287f6f7da4903b3421d2649b181e3905a3681905251ffd"
+        },
+        "samples_seconds": [
+          0.28968335897661746,
+          0.2900016970233992,
+          0.29298339993692935,
+          0.31405577599070966,
+          0.289397667045705,
+          0.2975651180604473,
+          0.29627046699170023,
+          0.2904333530459553,
+          0.29921439103782177,
+          0.29212878190446645
+        ]
+      },
+      "framework_to_ml4t_median_ratio": 0.6906261460648622,
+      "input_bundle_sha256": "01f38079ce47821a5379d3769e86f4a2170b88033108153bfc0f928698e946db",
+      "ml4t_engine": {
+        "ci_95_seconds": [
+          0.4206434920197353,
+          0.43413781898561865
+        ],
+        "maximum_seconds": 0.44225622492376715,
+        "median_seconds": 0.4236099264235236,
+        "minimum_seconds": 0.4181013370398432,
+        "output_identity": {
+          "equity.parquet": "30c2d39d1165342a599754cfd6ae76019d212f753ab49c837895c9f6ce942339",
+          "fills.parquet": "904a72fd66278fbb84c164e799c8dfc3d826bb1efdb0c3a4132f72203039368f",
+          "rejected_orders.parquet": "043204927e46137ca25cc0fa23883f4868af2b57f48c50d034fd56e113da12e8"
+        },
+        "samples_seconds": [
+          0.4181013370398432,
+          0.4206434920197353,
+          0.431770077906549,
+          0.4251039489172399,
+          0.44225622492376715,
+          0.42823008296545595,
+          0.42211590392980725,
+          0.4197556939907372,
+          0.4218772370368242,
+          0.44004555500578135
+        ]
+      }
+    },
+    {
+      "case_study": "etfs",
+      "correctness_status": "pass",
+      "framework": "vectorbt_oss",
+      "framework_engine": {
+        "ci_95_seconds": [
+          0.175615189014934,
+          0.49315099901286885
+        ],
+        "maximum_seconds": 1.029292443068698,
+        "median_seconds": 0.19159923505503684,
+        "minimum_seconds": 0.17306145397014916,
+        "output_identity": {
+          "equity.parquet": "9bef5099c36b4a61b32670d19340ebb9f4adba07c63359a5c31a345ad51d1cd6",
+          "fills.parquet": "a563dc47e59cc8d1ecf49a490f1e83842e5c4ca67a6a56adb411a58eb0842646"
+        },
+        "samples_seconds": [
+          0.19964565406553447,
+          0.20955988799687475,
+          0.1835528160445392,
+          1.029292443068698,
+          0.239498105016537,
+          0.776742110028863,
+          0.175615189014934,
+          0.17990780505351722,
+          0.17306145397014916,
+          0.1735441500786692
+        ]
+      },
+      "framework_to_ml4t_median_ratio": 0.4623417459666571,
+      "input_bundle_sha256": "01f38079ce47821a5379d3769e86f4a2170b88033108153bfc0f928698e946db",
+      "ml4t_engine": {
+        "ci_95_seconds": [
+          0.41261054255301133,
+          0.4170511480187997
+        ],
+        "maximum_seconds": 0.4176567249232903,
+        "median_seconds": 0.4144104155129753,
+        "minimum_seconds": 0.40947630698792636,
+        "output_identity": {
+          "equity.parquet": "30c2d39d1165342a599754cfd6ae76019d212f753ab49c837895c9f6ce942339",
+          "fills.parquet": "904a72fd66278fbb84c164e799c8dfc3d826bb1efdb0c3a4132f72203039368f",
+          "rejected_orders.parquet": "043204927e46137ca25cc0fa23883f4868af2b57f48c50d034fd56e113da12e8"
+        },
+        "samples_seconds": [
+          0.4147904319688678,
+          0.41382401203736663,
+          0.4170511480187997,
+          0.40947630698792636,
+          0.41271749197039753,
+          0.41403039905708283,
+          0.4176567249232903,
+          0.411397073068656,
+          0.4174045389518142,
+          0.41666107904165983
+        ]
+      }
+    },
+    {
+      "case_study": "etfs",
+      "correctness_status": "pass",
+      "framework": "backtrader",
+      "framework_engine": {
+        "ci_95_seconds": [
+          9.428437763010152,
+          9.710194949992001
+        ],
+        "maximum_seconds": 10.17647002497688,
+        "median_seconds": 9.630951289960649,
+        "minimum_seconds": 9.37383054906968,
+        "output_identity": {
+          "equity.parquet": "194818b08af3ceac17f2ff8b143d76184b63f95a92ab2db1ee4a13b903843d92",
+          "fills.parquet": "8fbc351395431fcaf3d986c1d72011520394fa202db5b25ea2a79f49f4c013ab",
+          "rejected_orders.parquet": "29756624602e47c7f667e995e892fd158828381420d570a8a8a65d23d84d617b"
+        },
+        "samples_seconds": [
+          9.679804097977467,
+          9.616229709936306,
+          9.740585802006535,
+          9.645672869984992,
+          9.479653650079854,
+          9.37722187594045,
+          9.703809328028001,
+          10.17647002497688,
+          9.37383054906968,
+          9.46689756307751
+        ]
+      },
+      "framework_to_ml4t_median_ratio": 21.954399486329535,
+      "input_bundle_sha256": "01f38079ce47821a5379d3769e86f4a2170b88033108153bfc0f928698e946db",
+      "ml4t_engine": {
+        "ci_95_seconds": [
+          0.4344198580365628,
+          0.4441501100664027
+        ],
+        "maximum_seconds": 0.4469653470441699,
+        "median_seconds": 0.43867978698108345,
+        "minimum_seconds": 0.4290196599904448,
+        "output_identity": {
+          "equity.parquet": "c0d9b87df7d1d490134679c571414ee3f5d5dc96cba2fd81e18c24c920ee9b60",
+          "fills.parquet": "7dac5c83214c8d03368049095db934a284d7f89b46e240ccb9896cce90bcfd1b",
+          "rejected_orders.parquet": "cc78f48b47cfd5253b16288011b7811dc5e702ada6927580bdfa2353a0d05ea8"
+        },
+        "samples_seconds": [
+          0.4290196599904448,
+          0.44298302405513823,
+          0.43867243302520365,
+          0.43726814200636,
+          0.4425441790372133,
+          0.43315088690724224,
+          0.4469653470441699,
+          0.4457560410955921,
+          0.43868714093696326,
+          0.4344198580365628
+        ]
+      }
+    },
+    {
+      "case_study": "etfs",
+      "correctness_status": "pass",
+      "framework": "zipline",
+      "framework_engine": {
+        "ci_95_seconds": [
+          3.87795311602531,
+          3.9590794310206547
+        ],
+        "maximum_seconds": 4.06156149005983,
+        "median_seconds": 3.888152966508642,
+        "minimum_seconds": 3.8552848449908197,
+        "output_identity": {
+          "equity.parquet": "e67ccdf71043cd216a9d8ea6f96f6cc0eba564907919ef1b867bce4726e36b31",
+          "fills.parquet": "611b2ca3adc8a24484dcee08d5fba4c9219c0c0c6f4b27d701db51ea98390572"
+        },
+        "samples_seconds": [
+          3.8822625660104677,
+          3.908796950010583,
+          3.9590794310206547,
+          3.962741830968298,
+          4.06156149005983,
+          3.8736436660401523,
+          3.8913325699977577,
+          3.8796646130504087,
+          3.8552848449908197,
+          3.884973363019526
+        ]
+      },
+      "framework_to_ml4t_median_ratio": 6.256086160815378,
+      "input_bundle_sha256": "01f38079ce47821a5379d3769e86f4a2170b88033108153bfc0f928698e946db",
+      "ml4t_engine": {
+        "ci_95_seconds": [
+          0.6179514050018042,
+          0.6255218000151217
+        ],
+        "maximum_seconds": 0.62759894807823,
+        "median_seconds": 0.621499267523177,
+        "minimum_seconds": 0.6117444499395788,
+        "output_identity": {
+          "equity.parquet": "578498185c7abd3b869578c8492937a09ce6cf8904ea64650375587fd397952a",
+          "fills.parquet": "d3daa2754b23c49802344748cd082d98920a97014694b1af1e40055ea4a4a76b",
+          "rejected_orders.parquet": "043204927e46137ca25cc0fa23883f4868af2b57f48c50d034fd56e113da12e8"
+        },
+        "samples_seconds": [
+          0.6209644980262965,
+          0.6202658739639446,
+          0.6159874090226367,
+          0.6179514050018042,
+          0.62759894807823,
+          0.6227562909480184,
+          0.6255218000151217,
+          0.6117444499395788,
+          0.6220340370200574,
+          0.6265018660342321
+        ]
+      }
+    },
+    {
+      "case_study": "etfs",
+      "correctness_status": "pass",
+      "framework": "lean",
+      "framework_engine": {
+        "ci_95_seconds": [
+          2.515638191951439,
+          2.707405475433916
+        ],
+        "maximum_seconds": 4.277152065886185,
+        "median_seconds": 2.6383553470368497,
+        "minimum_seconds": 2.463276338065043,
+        "output_identity": {
+          "equity.parquet": "0a644fee4073605011407b32f7cc1443360ce939e00602c2ab357d2d2f797baa",
+          "fills.parquet": "a24ebc61f9cb814d9e786d3256f64634d90122d475ed5d1c2dbf75668adcf536",
+          "rejected_orders.parquet": "9e7aedba072cbcd23432976f03fb6edef656da961cd2e73dbd75188842b29c36"
+        },
+        "samples_seconds": [
+          2.4993772000307217,
+          2.515638191951439,
+          2.6755189020186663,
+          2.7485075009753928,
+          2.463276338065043,
+          2.666303449892439,
+          4.277152065886185,
+          2.6394270199816674,
+          2.5843563260277733,
+          2.637283674092032
+        ]
+      },
+      "framework_to_ml4t_median_ratio": 3.5199600238072577,
+      "input_bundle_sha256": "01f38079ce47821a5379d3769e86f4a2170b88033108153bfc0f928698e946db",
+      "ml4t_engine": {
+        "ci_95_seconds": [
+          0.7431577030802146,
+          0.7573418769752607
+        ],
+        "maximum_seconds": 0.7589061490725726,
+        "median_seconds": 0.7495412814896554,
+        "minimum_seconds": 0.740414077998139,
+        "output_identity": {
+          "equity.parquet": "9d2ae671c05691680de1a947edc07b5805d3d17c4fffdb0d9cb002908d5d9189",
+          "fills.parquet": "e8903f6676292f1021bd420c2d530322639bdb2f9534e5130f4ae8b41a04ddd0",
+          "rejected_orders.parquet": "043204927e46137ca25cc0fa23883f4868af2b57f48c50d034fd56e113da12e8"
+        },
+        "samples_seconds": [
+          0.7563386870315298,
+          0.7482074870495126,
+          0.7428623960586265,
+          0.7431577030802146,
+          0.7573418769752607,
+          0.749361485010013,
+          0.7579125961055979,
+          0.7589061490725726,
+          0.7497210779692978,
+          0.740414077998139
+        ]
+      }
+    },
+    {
+      "case_study": "cme_futures",
+      "correctness_status": "pass",
+      "framework": "vectorbt_pro",
+      "framework_engine": {
+        "ci_95_seconds": [
+          0.2885498870164156,
+          0.2940297279856168
+        ],
+        "maximum_seconds": 0.3007154769729823,
+        "median_seconds": 0.29048270400380716,
+        "minimum_seconds": 0.2882876090006903,
+        "output_identity": {
+          "equity.parquet": "40991bd7b1641af22425d7bac85980f54f37d25e460f56710a7994eeaf5669c0",
+          "fills.parquet": "6348edba773d059a5417470a3fca1378a6853909266e833b99dc6ec0160b3b78"
+        },
+        "samples_seconds": [
+          0.288515966036357,
+          0.2905243040295318,
+          0.29565473296679556,
+          0.2882876090006903,
+          0.3007154769729823,
+          0.28967332001775503,
+          0.29044110397808254,
+          0.2885498870164156,
+          0.2926626129774377,
+          0.292404723004438
+        ]
+      },
+      "framework_to_ml4t_median_ratio": 0.7082094829709413,
+      "input_bundle_sha256": "c7191027f550ef1be0c9528dac08e7c2bf6a76c86d935f593efeb1ad8b628c39",
+      "ml4t_engine": {
+        "ci_95_seconds": [
+          0.40621895994991064,
+          0.9579270925023593
+        ],
+        "maximum_seconds": 1.5739495350280777,
+        "median_seconds": 0.41016494552604854,
+        "minimum_seconds": 0.4042154859052971,
+        "output_identity": {
+          "equity.parquet": "b61097a9c1c8635ccc9278db28aa955a69c16bac261515fa6ccff06211ca45f6",
+          "fills.parquet": "0cea5189115b3c7ec680d7f73895278b83ff097e863324bd944c9272d794edbb",
+          "rejected_orders.parquet": "2b4e500b98a08814aa8b42e0693c7bca7076cf9006444f5b26600bb9669647a7"
+        },
+        "samples_seconds": [
+          0.40621895994991064,
+          0.40606525202747434,
+          0.4074287120020017,
+          0.4042154859052971,
+          0.4106503500370309,
+          0.4132733520818874,
+          0.41067701298743486,
+          0.4096795410150662,
+          1.5051771720172837,
+          1.5739495350280777
+        ]
+      }
+    },
+    {
+      "case_study": "cme_futures",
+      "correctness_status": "pass",
+      "framework": "backtrader",
+      "framework_engine": {
+        "ci_95_seconds": [
+          5.8306038425071165,
+          8.332070957985707
+        ],
+        "maximum_seconds": 8.799221163033508,
+        "median_seconds": 6.63913488748949,
+        "minimum_seconds": 5.297625788953155,
+        "output_identity": {
+          "equity.parquet": "8f7ec2015c441a7d7723116aadcc7b30bdabb8f30fa4ea108fa96cfff6dcf075",
+          "fills.parquet": "e9888baac855ce576654e66159958eceb70833876507b7228737c7d49a9f8d0b",
+          "rejected_orders.parquet": "28769b824e4cce25769e28dd6764b6ae4e66b1fad0b70e695eba96fa27eb3cef"
+        },
+        "samples_seconds": [
+          5.936102256993763,
+          5.662118365056813,
+          5.297625788953155,
+          5.99908931995742,
+          7.196253928937949,
+          7.160146994981915,
+          8.332070957985707,
+          8.799221163033508,
+          8.426080056931823,
+          6.118122779997066
+        ]
+      },
+      "framework_to_ml4t_median_ratio": 15.503975288952617,
+      "input_bundle_sha256": "c7191027f550ef1be0c9528dac08e7c2bf6a76c86d935f593efeb1ad8b628c39",
+      "ml4t_engine": {
+        "ci_95_seconds": [
+          0.42172171105630696,
+          1.2346106839831918
+        ],
+        "maximum_seconds": 1.2817764669889584,
+        "median_seconds": 0.4282214569975622,
+        "minimum_seconds": 0.41942463093437254,
+        "output_identity": {
+          "equity.parquet": "2478697a24a7b812e5e84dda67fa5fdbb3dc27455f9bb1b28491f082e96ff501",
+          "fills.parquet": "4cc366af96c4484a6e84db18f6367b89fabb4d98784b883ef1cde7bcc766eb78",
+          "rejected_orders.parquet": "043204927e46137ca25cc0fa23883f4868af2b57f48c50d034fd56e113da12e8"
+        },
+        "samples_seconds": [
+          1.249723534914665,
+          1.2817764669889584,
+          1.2346106839831918,
+          0.43139286199584603,
+          0.41945610602851957,
+          0.42398731608409435,
+          0.4265086619416252,
+          0.4218658530153334,
+          0.4299342520534992,
+          0.41942463093437254
+        ]
+      }
+    },
+    {
+      "case_study": "crypto_perps_funding",
+      "correctness_status": "pass",
+      "framework": "lean",
+      "framework_engine": {
+        "ci_95_seconds": [
+          2.737479996983893,
+          2.9521514074876904
+        ],
+        "maximum_seconds": 5.8178522599628195,
+        "median_seconds": 2.828298416978214,
+        "minimum_seconds": 2.661781172035262,
+        "output_identity": {
+          "equity.parquet": "7175e01ac24e001ebcc1ae56855f198cd5e4f07d92a376e0361a314ffd766cb8",
+          "fills.parquet": "c095672f9b5d9bcafdce2f003cb93952c118e5b1eede9db853b1a39b282fcad8",
+          "rejected_orders.parquet": "9e7aedba072cbcd23432976f03fb6edef656da961cd2e73dbd75188842b29c36"
+        },
+        "samples_seconds": [
+          3.0119967089267448,
+          2.737479996983893,
+          5.8178522599628195,
+          2.764150841976516,
+          2.910047380020842,
+          2.661781172035262,
+          2.892306106048636,
+          2.7186104599386454,
+          2.796464517014101,
+          2.8601323169423267
+        ]
+      },
+      "framework_to_ml4t_median_ratio": 2.1307424559523884,
+      "input_bundle_sha256": "2acee3c8542043266e6f9c0dfc9434c95b4469ef6fcaf0556efc569fc9721cdd",
+      "ml4t_engine": {
+        "ci_95_seconds": [
+          0.6565737564815208,
+          2.1832261129748076
+        ],
+        "maximum_seconds": 2.2424513859441504,
+        "median_seconds": 1.327376947447192,
+        "minimum_seconds": 0.6452092870604247,
+        "output_identity": {
+          "equity.parquet": "0b98b8b65e7cc6885a27f9ffff6268d6d15a82b613ab06e4e57bbf96805ef1c9",
+          "fills.parquet": "57998fb15bb342363f4046982dc9a4a267778875314687991cbdcca1750060d5",
+          "rejected_orders.parquet": "043204927e46137ca25cc0fa23883f4868af2b57f48c50d034fd56e113da12e8"
+        },
+        "samples_seconds": [
+          0.6590511460090056,
+          0.6540963669540361,
+          0.6452092870604247,
+          0.65794847602956,
+          0.7014746950007975,
+          1.9532791998935863,
+          2.2369316320400685,
+          2.115875629009679,
+          2.2424513859441504,
+          2.1832261129748076
+        ]
+      }
+    },
+    {
+      "case_study": "fx_pairs",
+      "correctness_status": "pass",
+      "framework": "vectorbt_pro",
+      "framework_engine": {
+        "ci_95_seconds": [
+          0.28634460049215704,
+          0.2939993189647794
+        ],
+        "maximum_seconds": 2.133399173966609,
+        "median_seconds": 0.2883332470082678,
+        "minimum_seconds": 0.2853023150237277,
+        "output_identity": {
+          "equity.parquet": "c667f7404ce6368f5fa73e165414980287d8943b3ac2abc2d434d6db14786f6f",
+          "fills.parquet": "9c7d40cd1f2cb24ce6288084615f64696192c391547568f60116807dfbc0758f"
+        },
+        "samples_seconds": [
+          2.133399173966609,
+          0.2853023150237277,
+          0.2870907839387655,
+          0.2871479649329558,
+          0.2939993189647794,
+          0.2943767210235819,
+          0.2855412360513583,
+          0.28801989706698805,
+          0.28864659694954753,
+          0.29183984093833715
+        ]
+      },
+      "framework_to_ml4t_median_ratio": 1.94688518348125,
+      "input_bundle_sha256": "48922296cea03bfc9867a9c4e1a1d352a0bd54c0b48671e3ca8d1fdddb95d762",
+      "ml4t_engine": {
+        "ci_95_seconds": [
+          0.14696804992854595,
+          0.14891324302880093
+        ],
+        "maximum_seconds": 0.15570206800475717,
+        "median_seconds": 0.148099769547116,
+        "minimum_seconds": 0.14523314801044762,
+        "output_identity": {
+          "equity.parquet": "d2ab479f54be94a77da5d6b5edcc4e019c985b2edf134c2082df9b90e8bbddf9",
+          "fills.parquet": "a2cea17b1aa5c792685c78c97d3700d19e3a12abf03f1ef53224d41403a2ff1d",
+          "rejected_orders.parquet": "043204927e46137ca25cc0fa23883f4868af2b57f48c50d034fd56e113da12e8"
+        },
+        "samples_seconds": [
+          0.14716051891446114,
+          0.1495700170053169,
+          0.14885442389640957,
+          0.148092049988918,
+          0.14810748910531402,
+          0.14714952395297587,
+          0.14825646905228496,
+          0.14523314801044762,
+          0.14677558094263077,
+          0.15570206800475717
+        ]
+      }
+    },
+    {
+      "case_study": "fx_pairs",
+      "correctness_status": "pass",
+      "framework": "vectorbt_oss",
+      "framework_engine": {
+        "ci_95_seconds": [
+          0.14231256995117292,
+          0.14608762296848
+        ],
+        "maximum_seconds": 0.15810407302342355,
+        "median_seconds": 0.14366071502445266,
+        "minimum_seconds": 0.13813161593861878,
+        "output_identity": {
+          "equity.parquet": "116edf23b5f28d364e865907b69c84cadcd46cc7094764b77b38c3be4a0643da",
+          "fills.parquet": "43cc7f5cde82d078b5620d532fd35a704d4372a28dad196eaa1b0cbe7a4f697f"
+        },
+        "samples_seconds": [
+          0.14351372991222888,
+          0.14292211702559143,
+          0.1436876190127805,
+          0.13813161593861878,
+          0.14363381103612483,
+          0.14608762296848,
+          0.1466356300516054,
+          0.15810407302342355,
+          0.14471301797311753,
+          0.14111140999011695
+        ]
+      },
+      "framework_to_ml4t_median_ratio": 0.9882869360716513,
+      "input_bundle_sha256": "48922296cea03bfc9867a9c4e1a1d352a0bd54c0b48671e3ca8d1fdddb95d762",
+      "ml4t_engine": {
+        "ci_95_seconds": [
+          0.1448381410446018,
+          0.1464932659873739
+        ],
+        "maximum_seconds": 0.1472564940340817,
+        "median_seconds": 0.14536336541641504,
+        "minimum_seconds": 0.143077731016092,
+        "output_identity": {
+          "equity.parquet": "91fc93f96be91701932992950807a28c8d0e70bf96b36419171ddfd3f7e3e4ff",
+          "fills.parquet": "d526ec929f9291d9fc1d1842d7337fe24b0b5216a9f479a4107c70834c4ff3ee",
+          "rejected_orders.parquet": "043204927e46137ca25cc0fa23883f4868af2b57f48c50d034fd56e113da12e8"
+        },
+        "samples_seconds": [
+          0.147095917025581,
+          0.143077731016092,
+          0.14579966804012656,
+          0.14477691904176027,
+          0.1464932659873739,
+          0.1449414169183001,
+          0.1448524680454284,
+          0.14578531391452998,
+          0.14489936304744333,
+          0.1472564940340817
+        ]
+      }
+    },
+    {
+      "case_study": "fx_pairs",
+      "correctness_status": "pass",
+      "framework": "backtrader",
+      "framework_engine": {
+        "ci_95_seconds": [
+          0.4298818615498021,
+          0.43957427295390517
+        ],
+        "maximum_seconds": 0.4604668020037934,
+        "median_seconds": 0.4338197730248794,
+        "minimum_seconds": 0.42206139594782144,
+        "output_identity": {
+          "equity.parquet": "8356c90186bb5ee467d3c3c1ee473acecbb89bdb0b36c9dec8ba35bf68b315ef",
+          "fills.parquet": "4d1f97749b28f76c2736ba9df05fdc5aee46409054cd3e43cede9144a03ab83c",
+          "rejected_orders.parquet": "28769b824e4cce25769e28dd6764b6ae4e66b1fad0b70e695eba96fa27eb3cef"
+        },
+        "samples_seconds": [
+          0.4375792840728536,
+          0.43166758795268834,
+          0.43957427295390517,
+          0.4269790221005678,
+          0.44113637891132385,
+          0.42206139594782144,
+          0.43439839396160096,
+          0.43278470099903643,
+          0.4604668020037934,
+          0.43324115208815783
+        ]
+      },
+      "framework_to_ml4t_median_ratio": 2.946996815690775,
+      "input_bundle_sha256": "48922296cea03bfc9867a9c4e1a1d352a0bd54c0b48671e3ca8d1fdddb95d762",
+      "ml4t_engine": {
+        "ci_95_seconds": [
+          0.1461060909787193,
+          0.14869934448506683
+        ],
+        "maximum_seconds": 0.15201944101136178,
+        "median_seconds": 0.14720741152996197,
+        "minimum_seconds": 0.14476263104006648,
+        "output_identity": {
+          "equity.parquet": "8303060ba6c52232569452705febab5a6eb308b7f98bc82985bd06bfc56c28fb",
+          "fills.parquet": "82f617a7584707dc1075534e0a981e689481e7e2ebb78bcff043154d5b6189c6",
+          "rejected_orders.parquet": "043204927e46137ca25cc0fa23883f4868af2b57f48c50d034fd56e113da12e8"
+        },
+        "samples_seconds": [
+          0.1461060909787193,
+          0.14564719202462584,
+          0.14662873395718634,
+          0.15201944101136178,
+          0.14476263104006648,
+          0.14772679307498038,
+          0.1479792109457776,
+          0.14668802998494357,
+          0.14941947802435607,
+          0.14838470797985792
+        ]
+      }
+    },
+    {
+      "case_study": "fx_pairs",
+      "correctness_status": "pass",
+      "framework": "lean",
+      "framework_engine": {
+        "ci_95_seconds": [
+          0.9356942480662838,
+          1.163711266941391
+        ],
+        "maximum_seconds": 1.6388701400719583,
+        "median_seconds": 0.952616770984605,
+        "minimum_seconds": 0.9163093130337074,
+        "output_identity": {
+          "equity.parquet": "0d2751a207b9fee6360548c61c7d4f8c5975384a639575adcdc632ac562bffe7",
+          "fills.parquet": "b57996e6b2cc4b261de38866c0c64878c1e5220b750de80b04564767080a52d9",
+          "rejected_orders.parquet": "9e7aedba072cbcd23432976f03fb6edef656da961cd2e73dbd75188842b29c36"
+        },
+        "samples_seconds": [
+          0.9163093130337074,
+          0.9724616790190339,
+          0.9485308360308409,
+          1.186076671932824,
+          1.6388701400719583,
+          0.9356942480662838,
+          0.9487062549451366,
+          0.9565272870240733,
+          1.163711266941391,
+          0.9338941839523613
+        ]
+      },
+      "framework_to_ml4t_median_ratio": 6.033058566969102,
+      "input_bundle_sha256": "48922296cea03bfc9867a9c4e1a1d352a0bd54c0b48671e3ca8d1fdddb95d762",
+      "ml4t_engine": {
+        "ci_95_seconds": [
+          0.15491063089575619,
+          0.1641812429879792
+        ],
+        "maximum_seconds": 0.1727963569574058,
+        "median_seconds": 0.15789947344455868,
+        "minimum_seconds": 0.15280074696056545,
+        "output_identity": {
+          "equity.parquet": "20c7470a3770a852d56bb4790ba22e21010d061f2aa077b328ffbbdca1651cc2",
+          "fills.parquet": "630cd7753bf97bcdde690e05b1065e960f520d22a5622fd0ca4f7f26835a054f",
+          "rejected_orders.parquet": "043204927e46137ca25cc0fa23883f4868af2b57f48c50d034fd56e113da12e8"
+        },
+        "samples_seconds": [
+          0.15562730294186622,
+          0.1727963569574058,
+          0.16888348700013012,
+          0.15849790291395038,
+          0.15491063089575619,
+          0.1594789989758283,
+          0.1537122828885913,
+          0.15968903002794832,
+          0.15280074696056545,
+          0.15730104397516698
+        ]
+      }
+    },
+    {
+      "case_study": "us_equities_panel",
+      "correctness_status": "pass",
+      "framework": "vectorbt_pro",
+      "framework_engine": {
+        "ci_95_seconds": [
+          3.336437991936691,
+          4.340994625003077
+        ],
+        "maximum_seconds": 4.953136228956282,
+        "median_seconds": 3.8055060979677364,
+        "minimum_seconds": 0.8202721000416204,
+        "output_identity": {
+          "equity.parquet": "533030a43e7dcfd5961b898ad78139632b57cdc36952680fac5dbf651e664885",
+          "fills.parquet": "12fe4de7986d8803f6de85dab2089777823ade9300fda127d62aec08b68d1f72"
+        },
+        "samples_seconds": [
+          3.878830279922113,
+          0.8202721000416204,
+          3.3738032239489257,
+          3.364297664957121,
+          3.73218191601336,
+          3.2990727599244565,
+          4.087871203082614,
+          4.555743600009009,
+          4.340994625003077,
+          4.953136228956282
+        ]
+      },
+      "framework_to_ml4t_median_ratio": 0.16328304156486445,
+      "input_bundle_sha256": "02926d8a7f1c1f5b4855b2393d1763885288ef64950d5cf521ca96c61f454d88",
+      "ml4t_engine": {
+        "ci_95_seconds": [
+          21.905962607008405,
+          25.832905145478435
+        ],
+        "maximum_seconds": 29.599702261039056,
+        "median_seconds": 23.30619310797192,
+        "minimum_seconds": 21.732965360977687,
+        "output_identity": {
+          "equity.parquet": "974f900cf826b55a2cda697c7f8b11abb3c526fa472c5a406cdb7b8c7d0613c0",
+          "fills.parquet": "923752318482ad571f2d677a6ae1440448200b6cd87616264deb95a9a31b7d9c",
+          "rejected_orders.parquet": "4222d93b23310ba3c189de88d51ef83d28b54fb7f4a09b95e46ea94f8ad58e56"
+        },
+        "samples_seconds": [
+          25.161155793000944,
+          21.871996363974176,
+          24.40696905099321,
+          26.504654497955926,
+          25.386266839923337,
+          29.599702261039056,
+          22.20541716495063,
+          21.939928850042634,
+          21.732965360977687,
+          21.91702615795657
+        ]
+      }
+    },
+    {
+      "case_study": "us_equities_panel",
+      "correctness_status": "pass",
+      "framework": "vectorbt_oss",
+      "framework_engine": {
+        "ci_95_seconds": [
+          17.069319283997174,
+          17.633346832939424
+        ],
+        "maximum_seconds": 18.72887076297775,
+        "median_seconds": 17.11634712049272,
+        "minimum_seconds": 16.98897422896698,
+        "output_identity": {
+          "equity.parquet": "3af99a56f5f6366c769907b955bd752be34ba56d59ae475667ee12482c6ed23e",
+          "fills.parquet": "374d0949b1a63984f6fee5c20699a67c8337d13bc89f25a81d9e7529e206d2c4"
+        },
+        "samples_seconds": [
+          17.094699335983023,
+          17.03593622101471,
+          16.98897422896698,
+          17.10580162203405,
+          18.019019889063202,
+          17.10270234697964,
+          17.234466051100753,
+          17.126892618951388,
+          17.633346832939424,
+          18.72887076297775
+        ]
+      },
+      "framework_to_ml4t_median_ratio": 0.6650299261095273,
+      "input_bundle_sha256": "02926d8a7f1c1f5b4855b2393d1763885288ef64950d5cf521ca96c61f454d88",
+      "ml4t_engine": {
+        "ci_95_seconds": [
+          24.983315304969437,
+          27.163160011463333
+        ],
+        "maximum_seconds": 29.06330027198419,
+        "median_seconds": 25.73770961049013,
+        "minimum_seconds": 24.81676509801764,
+        "output_identity": {
+          "equity.parquet": "9a820fbc8f125ccce82789572667ed58120140a531b18d5b3e162ec9b241fed8",
+          "fills.parquet": "a61d4d9a4a7781bc7d0d8d800aae715becae0a3901fc13566385e4fdf70f7379",
+          "rejected_orders.parquet": "c9ea02a0d5fdc7867b5c507fa2dafb5984c2d734678b22abc0098a433f4b56b1"
+        },
+        "samples_seconds": [
+          25.70389811799396,
+          24.81676509801764,
+          26.260063141933642,
+          29.06330027198419,
+          24.983315304969437,
+          24.871099403011613,
+          25.211128549068235,
+          28.066256880993024,
+          27.121518951957114,
+          25.7715211029863
+        ]
+      }
+    },
+    {
+      "case_study": "us_equities_panel",
+      "correctness_status": "pass",
+      "framework": "backtrader",
+      "framework_engine": {
+        "ci_95_seconds": [
+          642.9925360960187,
+          718.2018002989935
+        ],
+        "maximum_seconds": 755.0583970909938,
+        "median_seconds": 668.6108569320058,
+        "minimum_seconds": 571.016019238974,
+        "output_identity": {
+          "equity.parquet": "d4500a220d756773171dc588722b82c57cc1c7948670c2f0e41fde3862778b58",
+          "fills.parquet": "7f3d118ca01063450d37d9e70ed6aa4ce5b6a0d975aa1b279723f516484f77b0",
+          "rejected_orders.parquet": "28769b824e4cce25769e28dd6764b6ae4e66b1fad0b70e695eba96fa27eb3cef"
+        },
+        "samples_seconds": [
+          571.016019238974,
+          671.0628502479522,
+          642.9925360960187,
+          638.342453709105,
+          666.1588636160595,
+          755.0583970909938,
+          698.4066179379588,
+          737.8176368899876,
+          718.2018002989935,
+          663.2327087180456
+        ]
+      },
+      "framework_to_ml4t_median_ratio": 24.8676628499208,
+      "input_bundle_sha256": "02926d8a7f1c1f5b4855b2393d1763885288ef64950d5cf521ca96c61f454d88",
+      "ml4t_engine": {
+        "ci_95_seconds": [
+          26.405730456055608,
+          29.40559812099673
+        ],
+        "maximum_seconds": 42.88268547307234,
+        "median_seconds": 26.886758959502913,
+        "minimum_seconds": 25.705174163915217,
+        "output_identity": {
+          "equity.parquet": "69d7e17ff26305c728572cc82e019c28e29c950de01ce51940e205965de245f4",
+          "fills.parquet": "e5a8c855ed69fdb9a024dd8408bea72892d617f147c8e465bc9e5a1b2fab0265",
+          "rejected_orders.parquet": "043204927e46137ca25cc0fa23883f4868af2b57f48c50d034fd56e113da12e8"
+        },
+        "samples_seconds": [
+          42.88268547307234,
+          25.705174163915217,
+          26.063800260075368,
+          26.747660652035847,
+          26.934621419990435,
+          26.459219371899962,
+          29.40559812099673,
+          30.456195703940466,
+          27.435421627946198,
+          26.83889649901539
+        ]
+      }
+    },
+    {
+      "case_study": "us_equities_panel",
+      "correctness_status": "pass",
+      "framework": "zipline",
+      "framework_engine": {
+        "ci_95_seconds": [
+          116.30800138204359,
+          118.39059418800753
+        ],
+        "maximum_seconds": 118.78390398900956,
+        "median_seconds": 117.44515722896904,
+        "minimum_seconds": 115.46986341103911,
+        "output_identity": {
+          "equity.parquet": "916f29fa7170cf1d1318154aff2bdb61db9838da5a780513ba06c42ccf98d3a0",
+          "fills.parquet": "916a68a6f44ea70b6905cca094028d16f8746e3f19c3029637ecb50c5462306a"
+        },
+        "samples_seconds": [
+          116.30800138204359,
+          117.57503147993702,
+          117.31528297800105,
+          117.06837280991022,
+          118.78390398900956,
+          115.46986341103911,
+          118.77544961904641,
+          117.87836588697974,
+          116.18007634195965,
+          118.39059418800753
+        ]
+      },
+      "framework_to_ml4t_median_ratio": 4.378906780114713,
+      "input_bundle_sha256": "02926d8a7f1c1f5b4855b2393d1763885288ef64950d5cf521ca96c61f454d88",
+      "ml4t_engine": {
+        "ci_95_seconds": [
+          25.47267946100328,
+          27.643725128495134
+        ],
+        "maximum_seconds": 28.743276142980903,
+        "median_seconds": 26.82065710151801,
+        "minimum_seconds": 25.11828896997031,
+        "output_identity": {
+          "equity.parquet": "6f1c371e4fcce3c1c3829f71c398807c721e95fa7d03a5c4796119a398453a66",
+          "fills.parquet": "2db9ccefd91648644c1abefca68701deb4795a8e6da509935beaffa5793e8501",
+          "rejected_orders.parquet": "043204927e46137ca25cc0fa23883f4868af2b57f48c50d034fd56e113da12e8"
+        },
+        "samples_seconds": [
+          27.13208918296732,
+          27.896943790954538,
+          27.457406406058,
+          26.06535679800436,
+          28.743276142980903,
+          26.509225020068698,
+          25.191814696067013,
+          25.11828896997031,
+          25.47267946100328,
+          27.39050646603573
+        ]
+      }
+    },
+    {
+      "case_study": "us_equities_panel",
+      "correctness_status": "pass",
+      "framework": "lean",
+      "framework_engine": {
+        "ci_95_seconds": [
+          48.22138740302762,
+          48.98638103704434
+        ],
+        "maximum_seconds": 49.30812434700783,
+        "median_seconds": 48.43596676498419,
+        "minimum_seconds": 48.0310333740199,
+        "output_identity": {
+          "equity.parquet": "a943d6831889ddc227f4f12f103797c854ae6facecac3fbe399d3a84be2579e1",
+          "fills.parquet": "fd13eeca0e70144131f5a231a2a2e2ec8581437035f887c3af604c9ffec5cc75",
+          "rejected_orders.parquet": "9e7aedba072cbcd23432976f03fb6edef656da961cd2e73dbd75188842b29c36"
+        },
+        "samples_seconds": [
+          48.241816133027896,
+          48.25772183504887,
+          48.49347179895267,
+          48.0310333740199,
+          48.98638103704434,
+          48.945306104957126,
+          48.18505297100637,
+          48.99020988610573,
+          49.30812434700783,
+          48.378461731015705
+        ]
+      },
+      "framework_to_ml4t_median_ratio": 1.7493778180777746,
+      "input_bundle_sha256": "02926d8a7f1c1f5b4855b2393d1763885288ef64950d5cf521ca96c61f454d88",
+      "ml4t_engine": {
+        "ci_95_seconds": [
+          27.575467039016075,
+          27.796223080484197
+        ],
+        "maximum_seconds": 27.996221969951876,
+        "median_seconds": 27.687539115024265,
+        "minimum_seconds": 27.42275011492893,
+        "output_identity": {
+          "equity.parquet": "b5907100a1469d4c9ff63af5bbeb328cddf7d72e6d98db6d9d796488c95545f2",
+          "fills.parquet": "7eb685423c6c5f32168e7ea8cc19976cb0404aef075514e657cee9e3f458d0d2",
+          "rejected_orders.parquet": "043204927e46137ca25cc0fa23883f4868af2b57f48c50d034fd56e113da12e8"
+        },
+        "samples_seconds": [
+          27.42275011492893,
+          27.996221969951876,
+          27.575467039016075,
+          27.580613891012035,
+          27.69515867100563,
+          27.767369729001075,
+          27.528504969901405,
+          27.825076431967318,
+          27.6799195590429,
+          27.79439065803308
+        ]
+      }
+    }
+  ],
+  "schema_version": 1,
+  "timing_policy": {
+    "boundary": "engine call only",
+    "excluded": [
+      "input loading",
+      "model inference",
+      "target construction",
+      "adapter preparation",
+      "result extraction",
+      "serialization",
+      "reporting"
+    ],
+    "interval": "10,000-draw percentile bootstrap of the sample median",
+    "measured_processes": 10,
+    "process_isolation": true,
+    "publication_scope": "only correctness-passing case-study/framework pairs",
+    "warmup_processes": 1
+  }
+}

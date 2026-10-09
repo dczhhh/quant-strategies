@@ -1,0 +1,2787 @@
+#!/usr/bin/env python3
+"""Comprehensive Performance Benchmark Suite.
+
+This script benchmarks ml4t.backtest against VectorBT Pro, VectorBT OSS,
+Backtrader, and Zipline across realistic trading scenarios.
+
+Key scenarios:
+1. Long/short top-N/bottom-N with daily rebalancing
+2. Stop-loss and take-profit orders
+3. Commission and slippage models
+4. Scale from small (100 assets × 1 month) to large (500 assets × 1 year)
+
+Usage:
+    # Run with VectorBT Pro
+    source .venv-vectorbt-pro/bin/activate
+    python validation/benchmark_suite.py --framework vbt-pro
+
+    # Run with Backtrader
+    source .venv-backtrader/bin/activate
+    python validation/benchmark_suite.py --framework backtrader
+
+    # Run with Nautilus Trader
+    source .venv-nautilus/bin/activate
+    python validation/benchmark_suite.py --framework nautilus
+
+    # Run ml4t only (any venv)
+    python validation/benchmark_suite.py --framework ml4t
+
+    # Run all scenarios for specific framework
+    python validation/benchmark_suite.py --framework vbt-pro --all
+
+    # Run specific scenario
+    python validation/benchmark_suite.py --framework ml4t --scenario baseline
+"""
+
+import argparse
+import builtins
+import gc
+import hashlib
+import json
+import os
+import pickle
+import sys
+import tempfile
+import time
+import tracemalloc
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from decimal import ROUND_HALF_EVEN, Decimal
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+# Add project root to path
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from ml4t.backtest._validation.backtrader_runner import load_backtrader_package  # noqa: E402
+from ml4t.backtest._validation.backtrader_runner import (  # noqa: E402
+    run_backtrader_target_shares as shared_run_backtrader_target_shares,
+)
+from ml4t.backtest._validation.backtrader_runner import (  # noqa: E402
+    transactions_to_trade_log as reconstruct_closed_trades,
+)
+from ml4t.backtest._validation.lean_runner import (  # noqa: E402
+    build_sequential_ticker_map,
+    check_lean_cli,
+    copy_lean_artifacts,
+    encode_sequential_ticker,
+    export_lean_daily_data,
+    make_lean_env,
+    resolve_lean_command,
+    run_lean_backtest,
+)
+from ml4t.backtest._validation.lean_runner import (  # noqa: E402
+    load_lean_artifacts as shared_load_lean_artifacts,
+)
+from ml4t.backtest._validation.lean_runner import (  # noqa: E402
+    load_lean_symbol_map as shared_load_lean_symbol_map,
+)
+from ml4t.backtest._validation.lean_runner import (  # noqa: E402
+    parse_lean_float as shared_parse_lean_float,
+)
+from ml4t.backtest._validation.lean_runner import (  # noqa: E402
+    parse_lean_int as shared_parse_lean_int,
+)
+from ml4t.backtest._validation.lean_runner import (  # noqa: E402
+    read_lean_csv as shared_read_lean_csv,
+)
+from ml4t.backtest._validation.vectorbt_runner import (  # noqa: E402
+    extract_order_log as shared_extract_vectorbt_order_log,
+)
+from ml4t.backtest._validation.vectorbt_runner import (  # noqa: E402
+    extract_trade_log as shared_extract_vectorbt_trade_log,
+)
+from ml4t.backtest._validation.vectorbt_runner import (  # noqa: E402
+    get_equity_curve as shared_get_vectorbt_equity_curve,
+)
+from ml4t.backtest._validation.vectorbt_runner import (  # noqa: E402
+    load_vectorbt_package,
+)
+from ml4t.backtest._validation.vectorbt_runner import (  # noqa: E402
+    run_vectorbt_orders as shared_run_vectorbt_orders,
+)
+from ml4t.backtest._validation.zipline_runner import load_zipline_modules  # noqa: E402
+from ml4t.backtest._validation.zipline_runner import (  # noqa: E402
+    run_zipline_target_shares as shared_run_zipline_target_shares,
+)
+from validation.common.framework_registry import load_framework_manifest  # noqa: E402
+
+_BENCHMARK_LOG_FILE = os.getenv("ML4T_BENCHMARK_LOG_FILE")
+DEFAULT_REAL_DATA_PATH = Path(
+    os.getenv(
+        "ML4T_BENCHMARK_DATA_PATH",
+        str(Path.home() / ".cache" / "ml4t" / "us_equities.parquet"),
+    )
+)
+DEFAULT_CACHE_ROOT = Path(
+    os.getenv(
+        "ML4T_BENCHMARK_CACHE_DIR",
+        str(Path(tempfile.gettempdir()) / "ml4t-benchmark-cache"),
+    )
+)
+CANONICAL_QUANTUM = Decimal("0.00000001")
+CANONICAL_MONEY_QUANTUM = Decimal("0.01")
+
+
+def _log(*args, **kwargs):
+    """Write benchmark progress to stdout and optional log file."""
+    kwargs = dict(kwargs)
+    sep = kwargs.pop("sep", " ")
+    end = kwargs.pop("end", "\n")
+    flush = kwargs.pop("flush", True)
+
+    builtins.print(*args, sep=sep, end=end, flush=flush, **kwargs)
+
+    if _BENCHMARK_LOG_FILE:
+        log_path = Path(_BENCHMARK_LOG_FILE)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(sep.join(str(arg) for arg in args) + end)
+
+
+def _to_naive_date(ts_like: pd.Timestamp | datetime | str) -> pd.Timestamp:
+    ts = pd.Timestamp(ts_like)
+    if ts.tz is not None:
+        ts = ts.tz_convert(None)
+    return ts.normalize()
+
+
+def _get_nyse_sessions(
+    start_date: pd.Timestamp | datetime | str, end_date: pd.Timestamp | datetime | str
+) -> pd.DatetimeIndex:
+    start = _to_naive_date(start_date)
+    end = _to_naive_date(end_date)
+    if start > end:
+        return pd.DatetimeIndex([], dtype="datetime64[ns]")
+
+    try:
+        import pandas_market_calendars as mcal
+
+        schedule = mcal.get_calendar("XNYS").schedule(start_date=start, end_date=end)
+        if not schedule.empty:
+            return pd.DatetimeIndex(schedule.index).tz_localize(None)
+    except Exception:
+        pass
+
+    try:
+        import exchange_calendars as xcals
+
+        nyse = xcals.get_calendar("XNYS")
+        first_session = _to_naive_date(nyse.first_session)
+        last_session = _to_naive_date(nyse.last_session)
+        clipped_start = max(start, first_session)
+        clipped_end = min(end, last_session)
+        if clipped_start <= clipped_end:
+            sessions = nyse.sessions_in_range(clipped_start, clipped_end)
+            return pd.DatetimeIndex(sessions).tz_localize(None)
+    except Exception:
+        pass
+
+    return pd.bdate_range(start=start, end=end)
+
+
+def _get_trailing_nyse_sessions(
+    n_bars: int, end_date: pd.Timestamp | datetime | str | None = None
+) -> pd.DatetimeIndex:
+    if n_bars <= 0:
+        return pd.DatetimeIndex([], dtype="datetime64[ns]")
+
+    end_session = _to_naive_date(end_date if end_date is not None else pd.Timestamp.today())
+    lookback_days = max(366, int(n_bars * 2.2))
+    sessions = pd.DatetimeIndex([], dtype="datetime64[ns]")
+
+    min_date = pd.Timestamp("1970-01-02")
+    for _ in range(8):
+        start_session = end_session - pd.DateOffset(days=lookback_days)
+        if start_session < min_date:
+            start_session = min_date
+        sessions = _get_nyse_sessions(start_session, end_session)
+        if len(sessions) >= n_bars:
+            return sessions[-n_bars:]
+        lookback_days = min(lookback_days * 2, (end_session - min_date).days)
+
+    return sessions
+
+
+@dataclass
+class BenchmarkConfig:
+    """Configuration for a benchmark run."""
+
+    name: str
+    n_bars: int
+    n_assets: int
+    frequency: str  # "D" for daily, "1min" for minute
+    top_n: int  # Number of assets to go long
+    bottom_n: int  # Number of assets to go short (0 = long only)
+    rebalance_freq: int  # Bars between rebalancing
+    stop_loss: float | None = None  # e.g., 0.02 = 2%
+    take_profit: float | None = None  # e.g., 0.05 = 5%
+    commission_pct: float = 0.0
+    slippage_pct: float = 0.0
+    initial_cash: float = 1_000_000.0
+    zipline_max_leverage: float | None = None
+    lean_order_type: str = "market"
+    lean_account_type: str = "default"
+    lean_security_leverage: float | None = None
+    lean_force_zero_fee: bool | None = None
+    lean_force_zero_slippage: bool | None = None
+    end_session: str = "2025-12-31"
+
+    @property
+    def data_points(self) -> int:
+        """Total data points (n_bars × n_assets)."""
+        return self.n_bars * self.n_assets
+
+
+# Benchmark scenarios - progressive scaling
+SCENARIOS = {
+    # === Baseline: Quick sanity check ===
+    "baseline": BenchmarkConfig(
+        name="Baseline (100×1mo minute)",
+        n_bars=8_580,  # ~1 month of minute data (390 min/day × 22 days)
+        n_assets=100,
+        frequency="1min",
+        top_n=10,
+        bottom_n=10,
+        rebalance_freq=390,  # Daily rebalance
+    ),
+    # === Scale tests ===
+    "scale_1": BenchmarkConfig(
+        name="Scale 1 (100×3mo minute)",
+        n_bars=25_740,  # ~3 months
+        n_assets=100,
+        frequency="1min",
+        top_n=10,
+        bottom_n=10,
+        rebalance_freq=390,
+    ),
+    "scale_2": BenchmarkConfig(
+        name="Scale 2 (250×6mo minute)",
+        n_bars=51_480,  # ~6 months
+        n_assets=250,
+        frequency="1min",
+        top_n=25,
+        bottom_n=25,
+        rebalance_freq=390,
+    ),
+    "scale_3": BenchmarkConfig(
+        name="Scale 3 (500×1yr minute)",
+        n_bars=97_500,  # ~1 year (390 × 250 trading days)
+        n_assets=500,
+        frequency="1min",
+        top_n=25,
+        bottom_n=25,
+        rebalance_freq=390,
+    ),
+    # === Daily data (faster, 10 years) ===
+    "daily_baseline": BenchmarkConfig(
+        name="Daily (500×10yr daily)",
+        n_bars=2_520,  # 10 years of daily data
+        n_assets=500,
+        frequency="D",
+        top_n=25,
+        bottom_n=25,
+        rebalance_freq=1,  # Daily rebalance
+    ),
+    # === Feature tests ===
+    "stop_loss": BenchmarkConfig(
+        name="Stop-loss (100×1mo)",
+        n_bars=8_580,
+        n_assets=100,
+        frequency="1min",
+        top_n=10,
+        bottom_n=10,
+        rebalance_freq=390,
+        stop_loss=0.02,  # 2% stop-loss
+    ),
+    "take_profit": BenchmarkConfig(
+        name="Take-profit (100×1mo)",
+        n_bars=8_580,
+        n_assets=100,
+        frequency="1min",
+        top_n=10,
+        bottom_n=10,
+        rebalance_freq=390,
+        take_profit=0.05,  # 5% take-profit
+    ),
+    "stop_and_profit": BenchmarkConfig(
+        name="Stop+Take (100×1mo)",
+        n_bars=8_580,
+        n_assets=100,
+        frequency="1min",
+        top_n=10,
+        bottom_n=10,
+        rebalance_freq=390,
+        stop_loss=0.02,
+        take_profit=0.05,
+    ),
+    "with_costs": BenchmarkConfig(
+        name="With costs (100×1mo)",
+        n_bars=8_580,
+        n_assets=100,
+        frequency="1min",
+        top_n=10,
+        bottom_n=10,
+        rebalance_freq=390,
+        commission_pct=0.001,  # 10 bps
+        slippage_pct=0.0005,  # 5 bps
+    ),
+    # === Long-only variant ===
+    "long_only": BenchmarkConfig(
+        name="Long-only (100×1mo)",
+        n_bars=8_580,
+        n_assets=100,
+        frequency="1min",
+        top_n=25,
+        bottom_n=0,  # No shorts
+        rebalance_freq=390,
+    ),
+    # === Single-asset scale tests ===
+    "single_10yr": BenchmarkConfig(
+        name="Single-asset (1×10yr daily)",
+        n_bars=2_520,  # 10 years of daily data
+        n_assets=1,
+        frequency="D",
+        top_n=1,
+        bottom_n=0,
+        rebalance_freq=1,
+    ),
+    "single_20yr": BenchmarkConfig(
+        name="Single-asset (1×20yr daily)",
+        n_bars=5_040,  # 20 years of daily data
+        n_assets=1,
+        frequency="D",
+        top_n=1,
+        bottom_n=0,
+        rebalance_freq=1,
+    ),
+    "single_50yr": BenchmarkConfig(
+        name="Single-asset (1×50yr daily)",
+        n_bars=12_600,  # 50 years of daily data
+        n_assets=1,
+        frequency="D",
+        top_n=1,
+        bottom_n=0,
+        rebalance_freq=1,
+    ),
+    # === Multi-asset scale tests ===
+    "multi_500_10yr": BenchmarkConfig(
+        name="Multi-asset (500×10yr daily)",
+        n_bars=2_520,
+        n_assets=500,
+        frequency="D",
+        top_n=25,
+        bottom_n=25,
+        rebalance_freq=1,
+    ),
+    "multi_100_10yr": BenchmarkConfig(
+        name="Multi-asset (100×10yr daily)",
+        n_bars=2_520,
+        n_assets=100,
+        frequency="D",
+        top_n=25,
+        bottom_n=25,
+        rebalance_freq=1,
+    ),
+    "multi_250_20yr": BenchmarkConfig(
+        name="Multi-asset (250×20yr daily)",
+        n_bars=5_040,
+        n_assets=250,
+        frequency="D",
+        top_n=25,
+        bottom_n=25,
+        rebalance_freq=1,
+    ),
+    "multi_1000_10yr": BenchmarkConfig(
+        name="Multi-asset (1000×10yr daily)",
+        n_bars=2_520,
+        n_assets=1000,
+        frequency="D",
+        top_n=50,
+        bottom_n=50,
+        rebalance_freq=1,
+    ),
+    # === Parameter sweep simulation ===
+    "param_sweep_base": BenchmarkConfig(
+        name="Param sweep base (100×1yr)",
+        n_bars=252,
+        n_assets=100,
+        frequency="D",
+        top_n=10,
+        bottom_n=10,
+        rebalance_freq=1,
+        stop_loss=0.02,
+        take_profit=0.05,
+    ),
+}
+
+
+def generate_benchmark_data(config: BenchmarkConfig, seed: int = 42) -> tuple:
+    """Generate synthetic market data and signals for benchmarking.
+
+    Returns:
+        Tuple of (price_data, signals, dates) where:
+        - price_data: dict of asset_name -> DataFrame with OHLCV
+        - signals: DataFrame with timestamp, asset, score columns
+        - dates: DatetimeIndex
+    """
+    np.random.seed(seed)
+
+    # Generate dates
+    if config.frequency == "1min":
+        # Generate minute bars (market hours only: 9:30-16:00 = 390 mins/day)
+        start = datetime(2023, 1, 3, 9, 30)  # First trading day
+        dates = []
+        current = start
+        bars_generated = 0
+        while bars_generated < config.n_bars:
+            # Add minute
+            dates.append(current)
+            bars_generated += 1
+            current += timedelta(minutes=1)
+            # Skip to next day at 16:00
+            if current.hour == 16 and current.minute == 0:
+                current = current.replace(hour=9, minute=30) + timedelta(days=1)
+                # Skip weekends
+                while current.weekday() >= 5:
+                    current += timedelta(days=1)
+        dates = pd.DatetimeIndex(dates)
+    else:
+        dates = _get_trailing_nyse_sessions(config.n_bars, end_date=config.end_session)
+        if len(dates) < config.n_bars:
+            raise ValueError(
+                f"Requested {config.n_bars} bars, but only {len(dates)} NYSE sessions are available"
+            )
+
+    n_bars = len(dates)
+
+    # Generate price data for each asset
+    price_data = {}
+    for i in range(config.n_assets):
+        asset_name = f"ASSET_{i:03d}"
+        base_price = 50.0 + np.random.rand() * 150  # $50-200 starting price
+
+        # Generate realistic returns (different vol/drift per asset)
+        daily_vol = 0.01 + np.random.rand() * 0.03  # 1-4% daily vol
+        drift = -0.0001 + np.random.rand() * 0.0002  # Small drift
+
+        if config.frequency == "1min":
+            # Scale vol for minute bars
+            bar_vol = daily_vol / np.sqrt(390)
+            bar_drift = drift / 390
+        else:
+            bar_vol = daily_vol
+            bar_drift = drift
+
+        returns = np.random.randn(n_bars) * bar_vol + bar_drift
+        prices = base_price * np.exp(np.cumsum(returns))
+
+        # Generate OHLCV with realistic intraday patterns
+        high_mult = 1 + np.abs(np.random.randn(n_bars)) * bar_vol
+        low_mult = 1 - np.abs(np.random.randn(n_bars)) * bar_vol
+        open_offset = np.random.randn(n_bars) * bar_vol * 0.3
+
+        price_data[asset_name] = pd.DataFrame(
+            {
+                "open": prices * (1 + open_offset),
+                "high": prices * high_mult,
+                "low": prices * low_mult,
+                "close": prices,
+                "volume": np.random.randint(10000, 1000000, n_bars).astype(float),
+            },
+            index=dates,
+        )
+
+    # Generate signals (scores for ranking)
+    # Score = momentum + noise, changes each rebalance period
+    signal_rows = []
+    rebalance_bars = list(range(0, n_bars, config.rebalance_freq))
+
+    for bar_idx in rebalance_bars:
+        ts = dates[bar_idx]
+        # Generate random scores for all assets
+        scores = np.random.randn(config.n_assets)
+        for i, score in enumerate(scores):
+            signal_rows.append(
+                {
+                    "timestamp": ts,
+                    "asset": f"ASSET_{i:03d}",
+                    "score": score,
+                }
+            )
+
+    signals = pd.DataFrame(signal_rows)
+
+    return price_data, signals, dates
+
+
+def load_real_benchmark_data(
+    config: BenchmarkConfig,
+    parquet_path: Path,
+    seed: int = 42,
+    cache_mode: str = "auto",
+) -> tuple:
+    """Load benchmark data from real daily OHLCV parquet data."""
+    if config.frequency != "D":
+        raise ValueError("Real-data mode currently supports daily scenarios only")
+    if not parquet_path.exists():
+        raise FileNotFoundError(f"Real data parquet not found: {parquet_path}")
+    if cache_mode not in {"auto", "off", "refresh"}:
+        raise ValueError(f"Invalid cache_mode: {cache_mode}")
+
+    resolved_path = parquet_path.resolve()
+    stat = resolved_path.stat()
+    cache_sig = hashlib.md5(
+        (
+            f"schema=real_data_v2_nyse_sessions|"
+            f"path={resolved_path}|size={stat.st_size}|mtime={stat.st_mtime_ns}|"
+            f"bars={config.n_bars}|assets={config.n_assets}|rebalance={config.rebalance_freq}|seed={seed}"
+        ).encode()
+    ).hexdigest()
+    cache_dir = DEFAULT_CACHE_ROOT / "real_data"
+    cache_file = cache_dir / f"{cache_sig}.pkl"
+
+    if cache_mode == "auto" and cache_file.exists():
+        with cache_file.open("rb") as fh:
+            payload = pickle.load(fh)
+        _log(f"  Real data cache hit: {cache_file}")
+        return payload["price_data"], payload["signals"], payload["dates"]
+
+    use_columns = [
+        "ticker",
+        "date",
+        "adj_open",
+        "adj_high",
+        "adj_low",
+        "adj_close",
+        "adj_volume",
+    ]
+    raw = pd.read_parquet(parquet_path, columns=use_columns)
+    raw = raw.rename(
+        columns={
+            "adj_open": "open",
+            "adj_high": "high",
+            "adj_low": "low",
+            "adj_close": "close",
+            "adj_volume": "volume",
+        }
+    )
+    raw["date"] = pd.to_datetime(raw["date"]).dt.normalize()
+    raw = raw.dropna(subset=["ticker", "date", "open", "high", "low", "close", "volume"])
+
+    session_dates = _get_nyse_sessions(raw["date"].min(), raw["date"].max())
+
+    if len(session_dates) < config.n_bars:
+        raise ValueError(
+            f"Requested {config.n_bars} bars, but real dataset only has {len(session_dates)} sessions"
+        )
+    dates = session_dates[-config.n_bars :]
+
+    window = raw[raw["date"].isin(dates)].copy()
+    counts = window.groupby("ticker")["date"].nunique().sort_values(ascending=False)
+    if len(counts) < config.n_assets:
+        raise ValueError(
+            f"Requested {config.n_assets} assets, but only {len(counts)} have rows in selected window"
+        )
+
+    selected_assets = sorted(counts.head(config.n_assets).index.tolist())
+    window = window[window["ticker"].isin(selected_assets)]
+
+    panels: dict[str, pd.DataFrame] = {}
+    for field in ["open", "high", "low", "close", "volume"]:
+        panel = window.pivot(index="date", columns="ticker", values=field)
+        panel = panel.reindex(index=dates, columns=selected_assets).sort_index()
+        panel = panel.ffill().bfill()
+        panels[field] = panel
+
+    price_data: dict[str, pd.DataFrame] = {}
+    for asset in selected_assets:
+        df = pd.DataFrame(
+            {
+                "open": panels["open"][asset].astype(float),
+                "high": panels["high"][asset].astype(float),
+                "low": panels["low"][asset].astype(float),
+                "close": panels["close"][asset].astype(float),
+                "volume": panels["volume"][asset].astype(float).clip(lower=1.0),
+            },
+            index=dates,
+        )
+        high = df[["open", "high", "low", "close"]].max(axis=1)
+        low = df[["open", "high", "low", "close"]].min(axis=1)
+        df["high"] = high
+        df["low"] = low
+        price_data[asset] = df
+
+    np.random.seed(seed)
+    signal_rows = []
+    rebalance_bars = list(range(0, config.n_bars, config.rebalance_freq))
+    for bar_idx in rebalance_bars:
+        ts = dates[bar_idx]
+        scores = np.random.randn(len(selected_assets))
+        for i, score in enumerate(scores):
+            signal_rows.append(
+                {
+                    "timestamp": ts,
+                    "asset": selected_assets[i],
+                    "score": score,
+                }
+            )
+    signals = pd.DataFrame(signal_rows)
+
+    if cache_mode != "off":
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        payload = {"price_data": price_data, "signals": signals, "dates": dates}
+        with cache_file.open("wb") as fh:
+            pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        _log(f"  Real data cache saved: {cache_file}")
+
+    return price_data, signals, dates
+
+
+@dataclass(frozen=True)
+class CanonicalTopBottomSpec:
+    """Canonical strategy contract shared by all benchmark adapters."""
+
+    signal_column: str = "score"
+    long_shares: float = 100.0
+    short_shares: float = -100.0
+    rank_method: str = "first"
+
+
+CANONICAL_TOP_BOTTOM_SPEC = CanonicalTopBottomSpec()
+
+
+def build_canonical_target_shares(
+    config: BenchmarkConfig,
+    signals: pd.DataFrame,
+    dates: pd.DatetimeIndex,
+    asset_names: list[str],
+    spec: CanonicalTopBottomSpec = CANONICAL_TOP_BOTTOM_SPEC,
+) -> pd.DataFrame:
+    """Build canonical per-bar target shares from ranked signals."""
+    signal_pivot = signals.pivot(index="timestamp", columns="asset", values=spec.signal_column)
+    signal_pivot = signal_pivot.reindex(index=dates, columns=asset_names).ffill()
+
+    ranks = signal_pivot.rank(axis=1, ascending=False, method=spec.rank_method)
+
+    long_mask = ranks <= config.top_n
+    short_mask = (
+        ranks > (config.n_assets - config.bottom_n)
+        if config.bottom_n > 0
+        else pd.DataFrame(False, index=ranks.index, columns=ranks.columns)
+    )
+
+    target_shares = pd.DataFrame(0.0, index=dates, columns=asset_names)
+    target_shares[long_mask.reindex(target_shares.index).ffill().fillna(False)] = spec.long_shares
+    if config.bottom_n > 0:
+        target_shares[short_mask.reindex(target_shares.index).ffill().fillna(False)] = (
+            spec.short_shares
+        )
+
+    return target_shares
+
+
+def build_canonical_target_lookup(
+    target_shares: pd.DataFrame,
+) -> dict[pd.Timestamp, dict[str, float]]:
+    """Build sparse timestamp -> non-zero target map."""
+    target_lookup: dict[pd.Timestamp, dict[str, float]] = {}
+    values = target_shares.to_numpy()
+    columns = target_shares.columns.to_numpy()
+
+    for idx, ts in enumerate(target_shares.index):
+        row = values[idx]
+        nz_idx = np.flatnonzero(row)
+        if len(nz_idx) == 0:
+            target_lookup[pd.Timestamp(ts)] = {}
+            continue
+        target_lookup[pd.Timestamp(ts)] = {str(columns[i]): float(row[i]) for i in nz_idx}
+
+    return target_lookup
+
+
+def build_canonical_target_trace(target_shares: pd.DataFrame) -> pd.DataFrame:
+    """Create an event trace of target changes for cross-engine debugging."""
+    prev = target_shares.shift(1).fillna(0.0)
+    delta = target_shares - prev
+    changed = delta != 0.0
+
+    trace_targets = target_shares.where(changed).stack().dropna()
+    trace_prev = prev.where(changed).stack().dropna()
+    trace_delta = delta.where(changed).stack().dropna()
+
+    if len(trace_targets) == 0:
+        return pd.DataFrame(
+            columns=["timestamp", "asset", "prev_target", "target", "delta", "action"]
+        )
+
+    trace = pd.DataFrame(
+        {
+            "prev_target": trace_prev,
+            "target": trace_targets,
+            "delta": trace_delta,
+        }
+    ).reset_index()
+    trace = trace.rename(columns={"level_0": "timestamp", "level_1": "asset"})
+
+    prev_vals = trace["prev_target"].to_numpy()
+    target_vals = trace["target"].to_numpy()
+    actions = np.select(
+        [
+            (prev_vals == 0.0) & (target_vals != 0.0),
+            (prev_vals != 0.0) & (target_vals == 0.0),
+            (prev_vals * target_vals < 0.0),
+        ],
+        ["open", "close", "flip"],
+        default="resize",
+    )
+    trace["action"] = actions
+    return trace
+
+
+@dataclass
+class BenchmarkResult:
+    """Result from a benchmark run."""
+
+    framework: str
+    scenario: str
+    runtime_sec: float
+    num_trades: int
+    final_value: float
+    memory_mb: float
+    error: str | None = None
+    fills_df: pd.DataFrame | None = None  # Canonical fill log for exact comparison
+    trades_df: pd.DataFrame | None = None  # Trade log for validation
+    equity_df: pd.DataFrame | None = None  # Equity curve for validation
+    order_events_df: pd.DataFrame | None = None  # Raw order-event log for debugging
+    positions_df: pd.DataFrame | None = None  # PyFolio positions (Backtrader/Zipline)
+    transactions_df: pd.DataFrame | None = None  # PyFolio transactions (Backtrader/Zipline)
+    target_trace_df: pd.DataFrame | None = None  # Canonical target-change trace
+    # Enhanced metrics
+    setup_time_sec: float = 0.0  # Time for data prep, bundle creation, etc.
+    data_points: int = 0  # n_bars × n_assets
+
+    @property
+    def bars_per_second(self) -> float:
+        """Processing speed in bars per second."""
+        if self.runtime_sec > 0 and self.data_points > 0:
+            return self.data_points / self.runtime_sec
+        return 0.0
+
+    @property
+    def trades_per_second(self) -> float:
+        """Trade generation speed."""
+        if self.runtime_sec > 0 and self.num_trades > 0:
+            return self.num_trades / self.runtime_sec
+        return 0.0
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON export."""
+        return {
+            "framework": self.framework,
+            "scenario": self.scenario,
+            "runtime_sec": self.runtime_sec,
+            "setup_time_sec": self.setup_time_sec,
+            "num_trades": self.num_trades,
+            "final_value": self.final_value,
+            "memory_mb": self.memory_mb,
+            "data_points": self.data_points,
+            "bars_per_second": self.bars_per_second,
+            "trades_per_second": self.trades_per_second,
+            "error": self.error,
+        }
+
+
+def _timestamp_value(value: object, timestamp_domain: str = "timestamp") -> str | None:
+    if value is None or pd.isna(value):
+        return None
+    timestamp = pd.Timestamp(value)
+    if timestamp.tz is not None:
+        timestamp = timestamp.tz_convert("UTC").tz_localize(None)
+    if timestamp_domain == "session_date":
+        return timestamp.date().isoformat()
+    if timestamp_domain != "timestamp":
+        raise ValueError(f"Unknown timestamp domain: {timestamp_domain}")
+    return timestamp.isoformat()
+
+
+def _asset_value(value: object) -> str:
+    symbol = getattr(value, "symbol", None)
+    if isinstance(symbol, str) and symbol:
+        return symbol
+    text = str(value)
+    if " [" in text and text.endswith("])"):
+        return text.rsplit(" [", 1)[1][:-2]
+    return text
+
+
+def _canonical_float(value: object, quantum: Decimal = CANONICAL_QUANTUM) -> float:
+    canonical = float(Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_EVEN))
+    return 0.0 if canonical == 0.0 else canonical
+
+
+def _side_value(value: object, quantity: float) -> str:
+    text = str(value).lower()
+    if text.endswith(".buy") or text in {"buy", "long", "bought"}:
+        return "buy"
+    if text.endswith(".sell") or text in {"sell", "short", "sold"}:
+        return "sell"
+    return "buy" if quantity >= 0 else "sell"
+
+
+def _row_value(row: pd.Series, names: tuple[str, ...], default: object = None) -> object:
+    for name in names:
+        if name in row.index and not pd.isna(row[name]):
+            return row[name]
+    return default
+
+
+def _frame_with_index(frame: pd.DataFrame) -> pd.DataFrame:
+    work = frame.copy()
+    if not isinstance(work.index, pd.RangeIndex):
+        index_name = work.index.name or "index"
+        if index_name not in work.columns:
+            work = work.reset_index()
+    return work
+
+
+def canonical_fill_records(
+    frame: pd.DataFrame | None,
+    *,
+    timestamp_domain: str = "timestamp",
+) -> list[dict[str, object]] | None:
+    """Normalize a framework fill log without applying numeric tolerances."""
+    if frame is None:
+        return None
+    work = _frame_with_index(frame)
+    records: list[dict[str, object]] = []
+    for _, row in work.iterrows():
+        signed_quantity = _canonical_float(
+            _row_value(row, ("quantity", "amount", "filled_qty", "last_qty", "size"), 0.0)
+        )
+        if signed_quantity == 0.0:
+            continue
+        records.append(
+            {
+                "timestamp": _timestamp_value(
+                    _row_value(row, ("timestamp", "dt", "date", "index", "filled_at")),
+                    timestamp_domain,
+                ),
+                "asset": _asset_value(
+                    _row_value(row, ("asset", "symbol", "instrument_id", "sid"), "unknown")
+                ),
+                "side": _side_value(_row_value(row, ("side", "order_side"), ""), signed_quantity),
+                "quantity": _canonical_float(abs(signed_quantity)),
+                "price": _canonical_float(_row_value(row, ("price", "fill_price", "avg_px"), 0.0)),
+                "commission": _canonical_float(
+                    _row_value(row, ("commission", "fee", "fees", "comm"), 0.0)
+                ),
+            }
+        )
+    return sorted(
+        records,
+        key=lambda record: (
+            record["timestamp"] or "",
+            record["asset"],
+            record["side"],
+            record["quantity"],
+            record["price"],
+        ),
+    )
+
+
+def closed_trades_from_fills(frame: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Reconstruct fill-backed closed round trips on a framework-neutral ledger."""
+    records = canonical_fill_records(frame)
+    if not records:
+        return None
+    transactions = pd.DataFrame(records)
+    transactions["amount"] = transactions["quantity"].where(
+        transactions["side"] == "buy", -transactions["quantity"]
+    )
+    transactions["symbol"] = transactions["asset"]
+    transactions = transactions.set_index("timestamp")
+    return reconstruct_closed_trades(transactions[["amount", "price", "symbol"]])
+
+
+def canonical_trade_records(
+    frame: pd.DataFrame | None,
+    *,
+    timestamp_domain: str = "timestamp",
+) -> list[dict[str, object]] | None:
+    """Normalize a framework round-trip trade log without applying numeric tolerances."""
+    if frame is None:
+        return None
+    work = _frame_with_index(frame)
+    records: list[dict[str, object]] = []
+    for _, row in work.iterrows():
+        quantity = _canonical_float(_row_value(row, ("quantity", "size"), 0.0))
+        if quantity == 0.0:
+            continue
+        side = str(_row_value(row, ("side", "direction"), "")).lower()
+        if side in {"buy", "long", "bought"} or side.endswith(".buy"):
+            side = "long"
+        elif side in {"sell", "short", "sold"} or side.endswith(".sell"):
+            side = "short"
+        records.append(
+            {
+                "entry_time": _timestamp_value(
+                    _row_value(row, ("entry_time", "entry_date", "timestamp", "index")),
+                    timestamp_domain,
+                ),
+                "exit_time": _timestamp_value(
+                    _row_value(row, ("exit_time", "exit_date")), timestamp_domain
+                ),
+                "asset": _asset_value(
+                    _row_value(row, ("asset", "symbol", "instrument_id"), "unknown")
+                ),
+                "side": side,
+                "quantity": _canonical_float(abs(quantity)),
+                "entry_price": _canonical_float(_row_value(row, ("entry_price",), 0.0)),
+                "exit_price": _canonical_float(_row_value(row, ("exit_price",), 0.0)),
+                "pnl": _canonical_float(_row_value(row, ("pnl",), 0.0)),
+            }
+        )
+    return sorted(
+        records,
+        key=lambda record: (
+            record["entry_time"] or "",
+            record["exit_time"] or "",
+            record["asset"],
+            record["side"],
+        ),
+    )
+
+
+def canonical_target_records(frame: pd.DataFrame | None) -> list[dict[str, object]] | None:
+    """Normalize the canonical target-intent trace."""
+    if frame is None:
+        return None
+    work = _frame_with_index(frame)
+    records: list[dict[str, object]] = []
+    for _, row in work.iterrows():
+        records.append(
+            {
+                "timestamp": _timestamp_value(_row_value(row, ("timestamp", "index"))),
+                "asset": str(_row_value(row, ("asset", "symbol"), "unknown")),
+                "prev_target": _canonical_float(_row_value(row, ("prev_target",), 0.0)),
+                "target": _canonical_float(_row_value(row, ("target",), 0.0)),
+                "delta": _canonical_float(_row_value(row, ("delta",), 0.0)),
+                "action": str(_row_value(row, ("action",), "")),
+            }
+        )
+    return records
+
+
+def _records_hash(records: list[dict[str, object]] | None) -> str | None:
+    if records is None:
+        return None
+    payload = json.dumps(records, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _surface_check(
+    name: str,
+    expected: list[dict[str, object]] | None,
+    actual: list[dict[str, object]] | None,
+) -> dict[str, object]:
+    passed = expected is not None and actual is not None and expected == actual
+    first_difference = None
+    if expected is None or actual is None:
+        first_difference = {
+            "expected_available": expected is not None,
+            "actual_available": actual is not None,
+        }
+    elif expected != actual:
+        limit = min(len(expected), len(actual))
+        index = next((i for i in range(limit) if expected[i] != actual[i]), limit)
+        first_difference = {
+            "index": index,
+            "expected": expected[index] if index < len(expected) else None,
+            "actual": actual[index] if index < len(actual) else None,
+        }
+    return {
+        "name": name,
+        "passed": passed,
+        "expected_count": None if expected is None else len(expected),
+        "actual_count": None if actual is None else len(actual),
+        "expected_sha256": _records_hash(expected),
+        "actual_sha256": _records_hash(actual),
+        "first_difference": first_difference,
+    }
+
+
+def _scalar_check(name: str, expected: int | float, actual: int | float) -> dict[str, object]:
+    quantum = CANONICAL_QUANTUM if name == "trade_count" else CANONICAL_MONEY_QUANTUM
+    canonical_expected = _canonical_float(expected, quantum)
+    canonical_actual = _canonical_float(actual, quantum)
+    return {
+        "name": name,
+        "passed": canonical_expected == canonical_actual,
+        "expected": expected,
+        "actual": actual,
+        "canonical_expected": canonical_expected,
+        "canonical_actual": canonical_actual,
+        "canonical_difference": abs(canonical_expected - canonical_actual),
+        "raw_difference": abs(expected - actual),
+    }
+
+
+def compare_benchmark_results_exact(
+    expected: BenchmarkResult,
+    actual: BenchmarkResult,
+    *,
+    initial_cash: float,
+    timestamp_domain: str = "timestamp",
+) -> dict[str, object]:
+    """Compare every release-covered benchmark surface using exact equality."""
+    checks = [
+        _surface_check(
+            "order_intents",
+            canonical_target_records(expected.target_trace_df),
+            canonical_target_records(actual.target_trace_df),
+        ),
+        _surface_check(
+            "fills",
+            canonical_fill_records(expected.fills_df, timestamp_domain=timestamp_domain),
+            canonical_fill_records(actual.fills_df, timestamp_domain=timestamp_domain),
+        ),
+        _surface_check(
+            "trades",
+            canonical_trade_records(expected.trades_df, timestamp_domain=timestamp_domain),
+            canonical_trade_records(actual.trades_df, timestamp_domain=timestamp_domain),
+        ),
+        _scalar_check("trade_count", expected.num_trades, actual.num_trades),
+        _scalar_check(
+            "total_pnl",
+            expected.final_value - initial_cash,
+            actual.final_value - initial_cash,
+        ),
+        _scalar_check("final_value", expected.final_value, actual.final_value),
+    ]
+    return {
+        "schema_version": 1,
+        "canonical_record_quantum": str(CANONICAL_QUANTUM),
+        "canonical_money_quantum": str(CANONICAL_MONEY_QUANTUM),
+        "timestamp_domain": timestamp_domain,
+        "scenario": expected.scenario,
+        "expected_framework": expected.framework,
+        "actual_framework": actual.framework,
+        "passed": expected.error is None
+        and actual.error is None
+        and all(bool(check["passed"]) for check in checks),
+        "expected_error": expected.error,
+        "actual_error": actual.error,
+        "checks": checks,
+    }
+
+
+def write_exact_comparison_artifact(artifact: dict[str, object], output_path: Path) -> None:
+    """Write a deterministic exact-comparison artifact."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(artifact, indent=2, sort_keys=True, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def save_trades(result: BenchmarkResult, output_dir: Path):
+    """Save trade log to CSV for validation."""
+    if result.trades_df is not None and len(result.trades_df) > 0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{result.framework.replace(' ', '_').lower()}_{result.scenario.replace(' ', '_').replace('×', 'x').lower()}.csv"
+        filepath = output_dir / filename
+        result.trades_df.to_csv(filepath, index=False)
+        _log(f"  Saved trades to: {filepath}")
+
+
+def generate_json_report(
+    results: list[BenchmarkResult], output_path: Path, metadata: dict | None = None
+):
+    """Generate JSON report for CI/CD integration.
+
+    Args:
+        results: List of BenchmarkResult objects
+        output_path: Path to write JSON file
+        metadata: Optional metadata (e.g., git hash, version)
+    """
+    import json as json_lib
+
+    report = {
+        "meta": {
+            "timestamp": datetime.now().isoformat(),
+            "python_version": sys.version.split()[0],
+            "num_results": len(results),
+            **(metadata or {}),
+        },
+        "results": [r.to_dict() for r in results],
+        "summary": {
+            "total_scenarios": len({r.scenario for r in results}),
+            "total_frameworks": len({r.framework for r in results}),
+            "errors": sum(1 for r in results if r.error),
+        },
+    }
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        json_lib.dump(report, f, indent=2)
+    _log(f"JSON report written to: {output_path}")
+
+
+def generate_markdown_report(
+    results: list[BenchmarkResult], output_path: Path, title: str = "Benchmark Results"
+):
+    """Generate Markdown report for human review.
+
+    Args:
+        results: List of BenchmarkResult objects
+        output_path: Path to write Markdown file
+        title: Report title
+    """
+    lines = [
+        f"# {title}",
+        "",
+        f"Generated: {datetime.now().isoformat()}",
+        "",
+        "## Summary",
+        "",
+        f"- Total scenarios: {len({r.scenario for r in results})}",
+        f"- Frameworks tested: {', '.join(sorted({r.framework for r in results}))}",
+        f"- Errors: {sum(1 for r in results if r.error)}",
+        "",
+        "## Results by Scenario",
+        "",
+    ]
+
+    # Group by scenario
+    scenarios: dict[str, list[BenchmarkResult]] = {}
+    for r in results:
+        if r.scenario not in scenarios:
+            scenarios[r.scenario] = []
+        scenarios[r.scenario].append(r)
+
+    for scenario, scenario_results in scenarios.items():
+        lines.extend(
+            [
+                f"### {scenario}",
+                "",
+                "| Framework | Runtime | Trades | Final Value | Memory | Bars/sec |",
+                "|-----------|---------|--------|-------------|--------|----------|",
+            ]
+        )
+
+        for r in scenario_results:
+            if r.error:
+                lines.append(f"| {r.framework} | ERROR | - | - | - | - |")
+            else:
+                runtime = (
+                    f"{r.runtime_sec:.3f}s" if r.runtime_sec < 60 else f"{r.runtime_sec / 60:.1f}m"
+                )
+                bars_sec = f"{r.bars_per_second:,.0f}" if r.bars_per_second > 0 else "-"
+                lines.append(
+                    f"| {r.framework} | {runtime} | {r.num_trades:,} | "
+                    f"${r.final_value:,.2f} | {r.memory_mb:.0f}MB | {bars_sec} |"
+                )
+
+        lines.append("")
+
+    # Performance comparison if multiple frameworks
+    frameworks = sorted({r.framework for r in results if not r.error})
+    if len(frameworks) > 1:
+        lines.extend(
+            [
+                "## Performance Comparison",
+                "",
+                "| Scenario | " + " | ".join(frameworks) + " |",
+                "|----------|" + "|".join(["---"] * len(frameworks)) + "|",
+            ]
+        )
+
+        for scenario, scenario_results in scenarios.items():
+            row = [scenario]
+            for fw in frameworks:
+                fw_result = next((r for r in scenario_results if r.framework == fw), None)
+                if fw_result and not fw_result.error:
+                    row.append(f"{fw_result.runtime_sec:.3f}s")
+                else:
+                    row.append("-")
+            lines.append("| " + " | ".join(row) + " |")
+
+        lines.append("")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        f.write("\n".join(lines))
+    _log(f"Markdown report written to: {output_path}")
+
+
+def compare_trades(results: list[BenchmarkResult]) -> dict:
+    """Compare trades between frameworks to detect compounding errors."""
+    if len(results) < 2:
+        return {}
+
+    comparisons = {}
+    baseline = None
+    for r in results:
+        if r.framework == "ml4t.backtest" and r.trades_df is not None:
+            baseline = r
+            break
+
+    if baseline is None:
+        return {}
+
+    for r in results:
+        if r == baseline or r.trades_df is None:
+            continue
+
+        # Compare trade counts
+        count_diff = abs(r.num_trades - baseline.num_trades)
+        count_pct = count_diff / baseline.num_trades * 100 if baseline.num_trades > 0 else 0
+
+        # Compare final values
+        value_diff = abs(r.final_value - baseline.final_value)
+        value_pct = value_diff / baseline.final_value * 100 if baseline.final_value > 0 else 0
+
+        comparisons[r.framework] = {
+            "trade_count_diff": count_diff,
+            "trade_count_pct": count_pct,
+            "final_value_diff": value_diff,
+            "final_value_pct": value_pct,
+        }
+
+    return comparisons
+
+
+def benchmark_ml4t(
+    config: BenchmarkConfig,
+    price_data: dict,
+    signals: pd.DataFrame,
+    dates,
+    execution_mode: str = "same_bar",
+    profile_override: str | None = None,
+) -> BenchmarkResult:
+    """Benchmark ml4t.backtest with given configuration.
+
+    Args:
+        execution_mode: "same_bar" (default, matches VectorBT) or "next_bar" (matches Backtrader)
+    """
+    import polars as pl
+
+    from ml4t.backtest._validation_imports import (
+        BacktestConfig,
+        DataFeed,
+        Engine,
+        Strategy,
+    )
+    from ml4t.backtest.config import CommissionType, SlippageType
+
+    # Select profile by execution style
+    default_profile = "backtrader" if execution_mode == "next_bar" else "vectorbt"
+    profile_name = profile_override or default_profile
+    framework_name = (
+        "ml4t.backtest" if execution_mode == "same_bar" else "ml4t.backtest (backtrader-mode)"
+    )
+    if profile_override is not None:
+        framework_name = f"ml4t.backtest[{profile_name}]"
+
+    # Convert price data to Polars format using vectorized DataFrame ops.
+    price_frames: list[pd.DataFrame] = []
+    for asset_name, df in price_data.items():
+        source_frame = df.copy()
+        if profile_name in {"zipline_strict", "lean"}:
+            decimals = 3 if profile_name == "zipline_strict" else 4
+            source_frame.loc[:, ["open", "high", "low", "close"]] = source_frame[
+                ["open", "high", "low", "close"]
+            ].round(decimals)
+        asset_frame = source_frame.reset_index()
+        index_col = asset_frame.columns[0]
+        asset_frame = asset_frame.rename(columns={index_col: "timestamp"})
+        asset_frame["asset"] = asset_name
+        price_frames.append(
+            asset_frame[["timestamp", "asset", "open", "high", "low", "close", "volume"]]
+        )
+
+    prices_pd = pd.concat(price_frames, ignore_index=True)
+    prices_pd["timestamp"] = pd.to_datetime(prices_pd["timestamp"])
+    if getattr(prices_pd["timestamp"].dt, "tz", None) is not None:
+        prices_pd["timestamp"] = prices_pd["timestamp"].dt.tz_localize(None)
+    prices_pl = pl.DataFrame(
+        {
+            "timestamp": prices_pd["timestamp"].to_numpy(),
+            "asset": prices_pd["asset"].to_numpy(),
+            "open": prices_pd["open"].to_numpy(),
+            "high": prices_pd["high"].to_numpy(),
+            "low": prices_pd["low"].to_numpy(),
+            "close": prices_pd["close"].to_numpy(),
+            "volume": prices_pd["volume"].to_numpy(),
+        }
+    )
+
+    asset_names = sorted(price_data.keys())
+    target_shares = build_canonical_target_shares(config, signals, dates, asset_names)
+    target_lookup_ts = build_canonical_target_lookup(target_shares)
+    target_lookup_dt = {ts.to_pydatetime(): targets for ts, targets in target_lookup_ts.items()}
+    target_trace = build_canonical_target_trace(target_shares)
+
+    signals_pl = pl.DataFrame(
+        {
+            "timestamp": signals["timestamp"].to_numpy(),
+            "asset": signals["asset"].to_numpy(),
+            "score": signals["score"].to_numpy(),
+        }
+    )
+
+    class TopBottomStrategy(Strategy):
+        """Canonical target-based strategy adapter for ml4t."""
+
+        def __init__(
+            self,
+            target_lookup: dict[datetime, dict[str, float]],
+            stop_loss: float | None,
+            take_profit: float | None,
+            zipline_order_target_semantics: bool = False,
+        ):
+            self.target_lookup = target_lookup
+            self.stop_loss = stop_loss
+            self.take_profit = take_profit
+            self.zipline_order_target_semantics = zipline_order_target_semantics
+
+        def on_start(self, broker):
+            """Set up position rules for stop-loss and take-profit."""
+            from ml4t.backtest.risk import RuleChain, StopLoss, TakeProfit
+
+            rules = []
+            if self.stop_loss is not None:
+                rules.append(StopLoss(pct=self.stop_loss))
+            if self.take_profit is not None:
+                rules.append(TakeProfit(pct=self.take_profit))
+
+            if rules:
+                broker.set_position_rules(RuleChain(rules))
+
+        def on_data(self, timestamp, data, context, broker):
+            ts_key = pd.Timestamp(timestamp).to_pydatetime()
+            targets = self.target_lookup.get(ts_key, {})
+            active_assets = set(targets.keys())
+            active_assets.update(broker.positions.keys())
+
+            for asset_name in sorted(active_assets):
+                position = broker.get_position(asset_name)
+                current_qty = position.quantity if position else 0.0
+                target_qty = targets.get(asset_name, 0.0)
+                pending_orders = broker.get_pending_orders(asset_name)
+
+                if self.zipline_order_target_semantics:
+                    if current_qty != target_qty:
+                        if pending_orders:
+                            for pending_order in pending_orders:
+                                broker.cancel_order(pending_order.order_id)
+                        broker.submit_order(asset_name, target_qty - current_qty)
+                    continue
+
+                pending_qty = 0.0
+                for pending_order in pending_orders:
+                    pending_qty += (
+                        pending_order.quantity
+                        if pending_order.side.value == "buy"
+                        else -pending_order.quantity
+                    )
+                delta = target_qty - (current_qty + pending_qty)
+                if delta != 0.0:
+                    # Keep one effective intent per asset to avoid pending-order buildup.
+                    if pending_orders:
+                        for pending_order in pending_orders:
+                            broker.cancel_order(pending_order.order_id)
+                    broker.submit_order(asset_name, target_qty - current_qty)
+
+    def _disable_commission(cfg: BacktestConfig) -> None:
+        # Clear every direct commission field, not just type+rate. The broker
+        # auto-activates a cost model whenever any direct field (per_share /
+        # per_trade / rate) is non-zero, even when commission_type is NONE, so a
+        # partial reset could leave direct per-share or per-trade values live and
+        # silently re-enable costs, breaking parity against a zero-cost reference.
+        cfg.commission_type = CommissionType.NONE
+        cfg.commission_rate = 0.0
+        cfg.commission_per_share = 0.0
+        cfg.commission_per_trade = 0.0
+        cfg.commission_minimum = 0.0
+
+    def _disable_slippage(cfg: BacktestConfig) -> None:
+        cfg.slippage_type = SlippageType.NONE
+        cfg.slippage_rate = 0.0
+        cfg.slippage_fixed = 0.0
+        cfg.slippage_spread = 0.0
+        cfg.stop_slippage_rate = 0.0
+        cfg.slippage_spread_by_asset = {}
+
+    def build_ml4t_config(no_costs: bool) -> BacktestConfig:
+        cfg = BacktestConfig.from_preset(profile_name)
+        cfg.initial_cash = config.initial_cash
+        cfg.allow_short_selling = True
+        if no_costs:
+            _disable_commission(cfg)
+            _disable_slippage(cfg)
+        else:
+            if config.commission_pct > 0:
+                cfg.commission_type = CommissionType.PERCENTAGE
+                cfg.commission_rate = config.commission_pct
+            else:
+                _disable_commission(cfg)
+            if config.slippage_pct > 0:
+                cfg.slippage_type = SlippageType.PERCENTAGE
+                cfg.slippage_rate = config.slippage_pct
+            else:
+                _disable_slippage(cfg)
+        return cfg
+
+    # Warm-up run (smaller data)
+    n_warmup = min(1000, config.n_bars // 10)
+    warmup_prices = prices_pl.head(n_warmup * config.n_assets)
+    warmup_signals = signals_pl.filter(pl.col("timestamp") <= dates[n_warmup])
+    warmup_feed = DataFeed(prices_df=warmup_prices, signals_df=warmup_signals)
+    warmup_engine = Engine.from_config(
+        warmup_feed,
+        TopBottomStrategy(
+            target_lookup_dt,
+            config.stop_loss,
+            config.take_profit,
+            zipline_order_target_semantics=profile_name == "zipline_strict",
+        ),
+        config=build_ml4t_config(no_costs=True),
+    )
+    _ = warmup_engine.run()
+
+    # Actual benchmark
+    gc.collect()
+    tracemalloc.start()
+    start_time = time.perf_counter()
+
+    feed = DataFeed(prices_df=prices_pl, signals_df=signals_pl)
+    strategy = TopBottomStrategy(
+        target_lookup_dt,
+        config.stop_loss,
+        config.take_profit,
+        zipline_order_target_semantics=profile_name == "zipline_strict",
+    )
+
+    engine = Engine.from_config(
+        feed,
+        strategy,
+        config=build_ml4t_config(no_costs=False),
+    )
+
+    results = engine.run()
+
+    end_time = time.perf_counter()
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    # Extract validation surface. For LEAN parity we need fill-level chronology,
+    # not round-trip trade summaries.
+    fills_pl = results.to_fills_dataframe()
+    fills_df = pd.DataFrame(fills_pl.to_dict(as_series=False))
+    trades_df = None
+    if profile_name in {"backtrader_strict", "zipline_strict", "lean"}:
+        trades_df = closed_trades_from_fills(fills_df)
+    elif results.get("trades"):
+        trade_records = []
+        for t in results["trades"]:
+            trade_records.append(
+                {
+                    "timestamp": t.entry_time,
+                    "exit_time": t.exit_time,
+                    "asset": t.symbol,
+                    "side": "long" if t.quantity > 0 else "short",
+                    "quantity": abs(t.quantity),
+                    "entry_price": t.entry_price,
+                    "exit_price": t.exit_price,
+                    "pnl": t.pnl,
+                }
+            )
+        trades_df = pd.DataFrame(trade_records)
+
+    canonical_trades = canonical_trade_records(trades_df)
+    trade_count = len(canonical_trades) if canonical_trades is not None else results["num_trades"]
+
+    return BenchmarkResult(
+        framework=framework_name,
+        scenario=config.name,
+        runtime_sec=end_time - start_time,
+        num_trades=trade_count,
+        final_value=results["final_value"],
+        memory_mb=peak / 1024 / 1024,
+        fills_df=fills_df,
+        trades_df=trades_df,
+        target_trace_df=target_trace,
+    )
+
+
+def benchmark_vectorbt_pro(
+    config: BenchmarkConfig, price_data: dict, signals: pd.DataFrame, dates
+) -> BenchmarkResult:
+    """Benchmark VectorBT Pro with given configuration."""
+    try:
+        vbt = load_vectorbt_package("vectorbtpro")
+    except ImportError:
+        return BenchmarkResult(
+            framework="VectorBT Pro",
+            scenario=config.name,
+            runtime_sec=0,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error="VectorBT Pro not installed",
+        )
+
+    asset_names = sorted(price_data.keys())
+    # Prepare close prices DataFrame
+    close_df = pd.DataFrame({name: price_data[name]["close"] for name in asset_names})
+    target_shares = build_canonical_target_shares(config, signals, dates, asset_names)
+    target_trace = build_canonical_target_trace(target_shares)
+
+    gc.collect()
+    tracemalloc.start()
+    start_time = time.perf_counter()
+
+    pf = shared_run_vectorbt_orders(
+        vbt=vbt,
+        close=close_df,
+        size=target_shares,
+        size_type="targetamount",
+        init_cash=config.initial_cash,
+        cash_sharing=True,
+        fees=config.commission_pct,
+        slippage=config.slippage_pct,
+        call_seq="auto",
+    )
+
+    equity = shared_get_vectorbt_equity_curve(pf)
+    final_value = float(equity.iloc[-1])
+    fills_df = shared_extract_vectorbt_order_log(pf)
+    trades_df = shared_extract_vectorbt_trade_log(pf)
+    canonical_trades = canonical_trade_records(trades_df)
+    num_trades = len(canonical_trades) if canonical_trades is not None else 0
+
+    end_time = time.perf_counter()
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    return BenchmarkResult(
+        framework="VectorBT Pro",
+        scenario=config.name,
+        runtime_sec=end_time - start_time,
+        num_trades=num_trades,
+        final_value=float(final_value),
+        memory_mb=peak / 1024 / 1024,
+        fills_df=fills_df,
+        trades_df=trades_df,
+        target_trace_df=target_trace,
+    )
+
+
+def benchmark_vectorbt_oss(
+    config: BenchmarkConfig, price_data: dict, signals: pd.DataFrame, dates
+) -> BenchmarkResult:
+    """Benchmark VectorBT OSS with given configuration."""
+    try:
+        vbt = load_vectorbt_package("vectorbt")
+    except ImportError:
+        return BenchmarkResult(
+            framework="VectorBT OSS",
+            scenario=config.name,
+            runtime_sec=0,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error="VectorBT OSS not installed",
+        )
+
+    asset_names = sorted(price_data.keys())
+    # Prepare close prices DataFrame
+    close_df = pd.DataFrame({name: price_data[name]["close"] for name in asset_names})
+    target_shares = build_canonical_target_shares(config, signals, dates, asset_names)
+    target_trace = build_canonical_target_trace(target_shares)
+
+    gc.collect()
+    tracemalloc.start()
+    start_time = time.perf_counter()
+
+    pf = shared_run_vectorbt_orders(
+        vbt=vbt,
+        close=close_df,
+        size=target_shares,
+        size_type="targetamount",
+        init_cash=config.initial_cash,
+        cash_sharing=True,
+        lock_cash=True,
+        fees=config.commission_pct,
+        slippage=config.slippage_pct,
+        call_seq="auto",
+    )
+
+    equity = shared_get_vectorbt_equity_curve(pf)
+    final_value = float(equity.iloc[-1])
+    fills_df = shared_extract_vectorbt_order_log(pf)
+    trades_df = shared_extract_vectorbt_trade_log(pf)
+    num_trades = len(trades_df)
+
+    end_time = time.perf_counter()
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    return BenchmarkResult(
+        framework="VectorBT OSS",
+        scenario=config.name,
+        runtime_sec=end_time - start_time,
+        num_trades=num_trades,
+        final_value=float(final_value),
+        memory_mb=peak / 1024 / 1024,
+        fills_df=fills_df,
+        trades_df=trades_df,
+        target_trace_df=target_trace,
+    )
+
+
+def benchmark_zipline(
+    config: BenchmarkConfig, price_data: dict, signals: pd.DataFrame, dates
+) -> BenchmarkResult:
+    """Benchmark Zipline with given configuration.
+
+    Creates a multi-asset bundle with all test data and runs a proper
+    top-N/bottom-N ranking strategy.
+    """
+    try:
+        zipline_modules = load_zipline_modules()
+    except ImportError as e:
+        return BenchmarkResult(
+            framework="Zipline",
+            scenario=config.name,
+            runtime_sec=0,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error=f"Zipline not installed: {e}",
+        )
+
+    # Zipline only supports daily data in bundles
+    if config.frequency == "1min":
+        return BenchmarkResult(
+            framework="Zipline",
+            scenario=config.name,
+            runtime_sec=0,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error="Zipline bundles only support daily data",
+        )
+
+    asset_names = sorted(price_data.keys())
+    target_shares = build_canonical_target_shares(
+        config, signals, pd.DatetimeIndex(dates), asset_names
+    )
+    target_trace = build_canonical_target_trace(target_shares)
+    target_lookup_raw = build_canonical_target_lookup(target_shares)
+    gc.collect()
+    tracemalloc.start()
+    start_time = time.perf_counter()
+
+    try:
+        run_result = shared_run_zipline_target_shares(
+            modules=zipline_modules,
+            config=config,
+            price_data=price_data,
+            dates=pd.DatetimeIndex(dates),
+            target_lookup_raw=target_lookup_raw,
+            logger=_log,
+        )
+        end_time = time.perf_counter()
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        return BenchmarkResult(
+            framework="Zipline",
+            scenario=config.name,
+            runtime_sec=end_time - start_time,
+            num_trades=run_result.num_trades,
+            final_value=run_result.final_value,
+            memory_mb=peak / 1024 / 1024,
+            fills_df=(
+                None
+                if run_result.transactions_df is None
+                else pd.DataFrame(canonical_fill_records(run_result.transactions_df) or [])
+            ),
+            trades_df=run_result.trades_df,
+            positions_df=run_result.positions_df,
+            transactions_df=run_result.transactions_df,
+            target_trace_df=target_trace,
+            setup_time_sec=run_result.setup_time_sec,
+        )
+    except Exception as e:
+        tracemalloc.stop()
+        import traceback
+
+        try:
+            tb_text = traceback.format_exc()
+        except Exception:
+            tb_text = "<traceback unavailable>"
+
+        return BenchmarkResult(
+            framework="Zipline",
+            scenario=config.name,
+            runtime_sec=0,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error=f"{e}\n{tb_text}",
+        )
+
+
+def benchmark_backtrader(
+    config: BenchmarkConfig, price_data: dict, signals: pd.DataFrame, dates
+) -> BenchmarkResult:
+    """Benchmark Backtrader with given configuration."""
+    try:
+        bt = load_backtrader_package()
+    except ImportError:
+        return BenchmarkResult(
+            framework="Backtrader",
+            scenario=config.name,
+            runtime_sec=0,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error="Backtrader not installed",
+        )
+
+    asset_names = sorted(price_data.keys())
+    target_shares = build_canonical_target_shares(
+        config, signals, pd.DatetimeIndex(dates), asset_names
+    )
+    target_trace = build_canonical_target_trace(target_shares)
+    target_lookup_raw = build_canonical_target_lookup(target_shares)
+    target_lookup = {ts.strftime("%Y-%m-%d"): targets for ts, targets in target_lookup_raw.items()}
+
+    gc.collect()
+    tracemalloc.start()
+    start_time = time.perf_counter()
+
+    run_result = shared_run_backtrader_target_shares(
+        bt=bt,
+        price_data=price_data,
+        target_lookup=target_lookup,
+        initial_cash=config.initial_cash,
+        commission_pct=config.commission_pct,
+    )
+
+    end_time = time.perf_counter()
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    return BenchmarkResult(
+        framework="Backtrader",
+        scenario=config.name,
+        runtime_sec=end_time - start_time,
+        num_trades=run_result.num_trades,
+        final_value=run_result.final_value,
+        memory_mb=peak / 1024 / 1024,
+        fills_df=(
+            None
+            if run_result.transactions_df is None
+            else pd.DataFrame(canonical_fill_records(run_result.transactions_df) or [])
+        ),
+        trades_df=run_result.trades_df,
+        positions_df=run_result.positions_df,
+        transactions_df=run_result.transactions_df,
+        target_trace_df=target_trace,
+    )
+
+
+def _parse_money_like(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float, np.floating)):
+        return float(value)
+    if isinstance(value, dict):
+        for key in ("total", "amount", "value", "raw", "free", "locked"):
+            if key in value:
+                parsed = _parse_money_like(value[key])
+                if parsed is not None:
+                    return parsed
+        return None
+    text = str(value).replace(",", "").strip()
+    if not text:
+        return None
+    token = text.split()[0]
+    try:
+        return float(token)
+    except ValueError:
+        return None
+
+
+def benchmark_nautilus(
+    config: BenchmarkConfig, price_data: dict, signals: pd.DataFrame, dates
+) -> BenchmarkResult:
+    """Benchmark Nautilus Trader with canonical target-share strategy."""
+    if config.frequency != "D":
+        return BenchmarkResult(
+            framework="Nautilus Trader",
+            scenario=config.name,
+            runtime_sec=0,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error="Nautilus adapter currently supports daily scenarios only",
+        )
+
+    try:
+        from nautilus_trader.backtest.engine import BacktestEngine
+        from nautilus_trader.config import BacktestEngineConfig, LoggingConfig, RiskEngineConfig
+        from nautilus_trader.core.datetime import dt_to_unix_nanos, unix_nanos_to_dt
+        from nautilus_trader.model.currencies import USD
+        from nautilus_trader.model.data import Bar, BarType
+        from nautilus_trader.model.enums import AccountType, OmsType, OrderSide, TimeInForce
+        from nautilus_trader.model.identifiers import TraderId, Venue
+        from nautilus_trader.model.objects import Money, Quantity
+        from nautilus_trader.test_kit.providers import TestInstrumentProvider
+        from nautilus_trader.trading.strategy import Strategy
+    except ImportError:
+        return BenchmarkResult(
+            framework="Nautilus Trader",
+            scenario=config.name,
+            runtime_sec=0,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error="Nautilus Trader not installed",
+        )
+
+    asset_names = sorted(price_data.keys())
+    progress_every_assets = max(1, int(os.getenv("ML4T_NAUTILUS_PROGRESS_EVERY_ASSETS", "25")))
+    progress_every_bars = max(0, int(os.getenv("ML4T_NAUTILUS_PROGRESS_EVERY_BARS", "50000")))
+    processed_bars = {"count": 0}
+
+    target_shares = build_canonical_target_shares(
+        config, signals, pd.DatetimeIndex(dates), asset_names
+    )
+    target_trace = build_canonical_target_trace(target_shares)
+    target_lookup = build_canonical_target_lookup(target_shares)
+    target_lookup_str = {ts.strftime("%Y-%m-%d"): targets for ts, targets in target_lookup.items()}
+
+    class TargetSharesStrategy(Strategy):
+        def __init__(
+            self,
+            instruments: dict[str, object],
+            bar_types: dict[str, BarType],
+            targets_by_day: dict[str, dict[str, float]],
+        ):
+            super().__init__()
+            self._instruments = instruments
+            self._bar_types = bar_types
+            self._targets_by_day = targets_by_day
+            self._last_rebalance_day: str | None = None
+
+        @staticmethod
+        def _qty_to_float(value: object) -> float:
+            if value is None:
+                return 0.0
+            for cast in (float,):
+                try:
+                    return cast(value)
+                except Exception:
+                    continue
+            return 0.0
+
+        def on_start(self) -> None:
+            for bar_type in self._bar_types.values():
+                self.subscribe_bars(bar_type)
+
+        def on_bar(self, bar: Bar) -> None:
+            day = unix_nanos_to_dt(bar.ts_event).date().isoformat()
+            processed_bars["count"] += 1
+            if progress_every_bars > 0 and processed_bars["count"] % progress_every_bars == 0:
+                _log(f"  [nautilus] processed {processed_bars['count']:,} bars (day={day})")
+            if day == self._last_rebalance_day:
+                return
+            self._last_rebalance_day = day
+
+            targets = self._targets_by_day.get(day, {})
+            active_assets = set(targets.keys())
+            for asset_name, instrument in self._instruments.items():
+                current = self._qty_to_float(self.portfolio.net_position(instrument.id))
+                if current != 0.0:
+                    active_assets.add(asset_name)
+
+            for asset_name in sorted(active_assets):
+                instrument = self._instruments.get(asset_name)
+                if instrument is None:
+                    continue
+                current_qty = self._qty_to_float(self.portfolio.net_position(instrument.id))
+                target_qty = float(targets.get(asset_name, 0.0))
+                delta = int(round(target_qty - current_qty))
+                if delta == 0:
+                    continue
+                order = self.order_factory.market(
+                    instrument_id=instrument.id,
+                    order_side=OrderSide.BUY if delta > 0 else OrderSide.SELL,
+                    quantity=instrument.make_qty(abs(delta)),
+                    time_in_force=TimeInForce.GTC,
+                )
+                self.submit_order(order)
+
+    engine = BacktestEngine(
+        config=BacktestEngineConfig(
+            trader_id=TraderId("BACKTESTER-NT"),
+            logging=LoggingConfig(log_level="ERROR"),
+            risk_engine=RiskEngineConfig(bypass=True),
+        ),
+    )
+    venue = Venue("XNAS")
+    engine.add_venue(
+        venue=venue,
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        base_currency=USD,
+        starting_balances=[Money(float(config.initial_cash), USD)],
+    )
+
+    instruments: dict[str, object] = {}
+    bar_types: dict[str, BarType] = {}
+
+    try:
+        total_assets = len(asset_names)
+        for idx, asset_name in enumerate(asset_names, start=1):
+            instrument = TestInstrumentProvider.equity(symbol=asset_name, venue="XNAS")
+            instruments[asset_name] = instrument
+            engine.add_instrument(instrument)
+
+            bar_type = BarType.from_str(f"{instrument.id}-1-DAY-LAST-EXTERNAL")
+            bar_types[asset_name] = bar_type
+
+            bars: list[Bar] = []
+            for ts, row in price_data[asset_name].sort_index().iterrows():
+                ts_utc = pd.Timestamp(ts)
+                ts_utc = (
+                    ts_utc.tz_localize("UTC") if ts_utc.tz is None else ts_utc.tz_convert("UTC")
+                )
+                ts_ns = dt_to_unix_nanos(ts_utc.to_pydatetime())
+                bars.append(
+                    Bar(
+                        bar_type=bar_type,
+                        open=instrument.make_price(float(row["open"])),
+                        high=instrument.make_price(float(row["high"])),
+                        low=instrument.make_price(float(row["low"])),
+                        close=instrument.make_price(float(row["close"])),
+                        volume=Quantity.from_int(max(1, int(round(float(row["volume"]))))),
+                        ts_event=ts_ns,
+                        ts_init=ts_ns,
+                    )
+                )
+            # Avoid repeated full-stream sort per instrument; sort once after all loads.
+            engine.add_data(bars, sort=False, validate=False)
+            if idx % progress_every_assets == 0 or idx == total_assets:
+                _log(f"  [nautilus] loaded data for {idx}/{total_assets} assets")
+
+        engine.sort_data()
+        _log("  [nautilus] data streams sorted")
+
+        strategy = TargetSharesStrategy(
+            instruments=instruments,
+            bar_types=bar_types,
+            targets_by_day=target_lookup_str,
+        )
+        engine.add_strategy(strategy)
+
+        gc.collect()
+        tracemalloc.start()
+        start_time = time.perf_counter()
+        engine.run()
+        end_time = time.perf_counter()
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        fills_report = engine.trader.generate_order_fills_report()
+        account_report = engine.trader.generate_account_report(venue)
+        fills_df = fills_report.copy() if isinstance(fills_report, pd.DataFrame) else pd.DataFrame()
+        account_df = (
+            account_report.copy() if isinstance(account_report, pd.DataFrame) else pd.DataFrame()
+        )
+
+        final_value = float(config.initial_cash)
+        if not account_df.empty:
+            for col in ("total", "balance_total", "equity", "net_value", "free"):
+                if col in account_df.columns:
+                    parsed = _parse_money_like(account_df.iloc[-1][col])
+                    if parsed is not None:
+                        final_value = parsed
+                        break
+
+        trades_df = None
+        if not fills_df.empty:
+            trades_df = fills_df.reset_index()
+            if "instrument_id" in trades_df.columns:
+                trades_df["asset"] = trades_df["instrument_id"].astype(str).str.split(".").str[0]
+            if "side" in trades_df.columns:
+                trades_df["side"] = trades_df["side"].astype(str).str.lower()
+
+        return BenchmarkResult(
+            framework="Nautilus Trader",
+            scenario=config.name,
+            runtime_sec=end_time - start_time,
+            num_trades=int(len(fills_df)),
+            final_value=final_value,
+            memory_mb=peak / 1024 / 1024,
+            fills_df=fills_df,
+            trades_df=trades_df,
+            target_trace_df=target_trace,
+        )
+    except Exception as e:
+        return BenchmarkResult(
+            framework="Nautilus Trader",
+            scenario=config.name,
+            runtime_sec=0,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error=str(e),
+            target_trace_df=target_trace,
+        )
+    finally:
+        with suppress(Exception):
+            engine.dispose()
+
+
+def _parse_lean_int(value: object) -> int:
+    return shared_parse_lean_int(value)
+
+
+def _parse_lean_float(value: object) -> float:
+    return shared_parse_lean_float(value)
+
+
+def _encode_lean_ticker(idx: int) -> str:
+    return encode_sequential_ticker(idx)
+
+
+def _load_lean_symbol_map(output_dir: Path) -> dict[str, str]:
+    return shared_load_lean_symbol_map(output_dir)
+
+
+def _read_lean_csv(path: Path, parse_dates: list[str] | None = None) -> pd.DataFrame | None:
+    return shared_read_lean_csv(path, parse_dates=parse_dates)
+
+
+def _load_lean_artifacts(
+    output_dir: Path,
+) -> tuple[int, float, pd.DataFrame | None, pd.DataFrame | None, pd.DataFrame | None]:
+    return shared_load_lean_artifacts(output_dir)
+
+
+def benchmark_lean(
+    config: BenchmarkConfig, price_data: dict, signals: pd.DataFrame, dates
+) -> BenchmarkResult:
+    """Benchmark LEAN CLI with canonical target-share strategy."""
+    if config.frequency != "D":
+        return BenchmarkResult(
+            framework="LEAN CLI",
+            scenario=config.name,
+            runtime_sec=0,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error="LEAN adapter currently supports daily scenarios only",
+        )
+
+    lean_workspace = PROJECT_ROOT / "validation" / "lean" / "workspace"
+    lean_config = lean_workspace / "lean.json"
+    if not lean_config.exists():
+        return BenchmarkResult(
+            framework="LEAN CLI",
+            scenario=config.name,
+            runtime_sec=0,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error=f"LEAN config not found: {lean_config}",
+        )
+    lean_target = load_framework_manifest().targets["lean"]
+    if lean_target.artifact is None:
+        return BenchmarkResult(
+            framework="LEAN CLI",
+            scenario=config.name,
+            runtime_sec=0,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error="Frozen LEAN target is missing an engine image",
+        )
+
+    try:
+        lean_cmd = resolve_lean_command()
+    except FileNotFoundError as exc:
+        return BenchmarkResult(
+            framework="LEAN CLI",
+            scenario=config.name,
+            runtime_sec=0,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error=str(exc),
+        )
+
+    asset_names = sorted(price_data.keys())
+    asset_to_ticker = build_sequential_ticker_map(asset_names)
+    tickers = [asset_to_ticker[asset_name] for asset_name in asset_names]
+    ticker_to_asset = {ticker: asset for asset, ticker in asset_to_ticker.items()}
+
+    if config.lean_order_type not in {"market", "market_on_open"}:
+        return BenchmarkResult(
+            framework="LEAN CLI",
+            scenario=config.name,
+            runtime_sec=0,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error=f"Unsupported lean_order_type: {config.lean_order_type}",
+        )
+    if config.lean_account_type not in {"default", "cash", "margin"}:
+        return BenchmarkResult(
+            framework="LEAN CLI",
+            scenario=config.name,
+            runtime_sec=0,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error=f"Unsupported lean_account_type: {config.lean_account_type}",
+        )
+    lean_order_call = (
+        "self.market_on_open_order(symbol, delta)"
+        if config.lean_order_type == "market_on_open"
+        else "self.market_order(symbol, delta)"
+    )
+    force_zero_fee = (
+        config.lean_force_zero_fee
+        if config.lean_force_zero_fee is not None
+        else config.commission_pct == 0.0
+    )
+    force_zero_slippage = (
+        config.lean_force_zero_slippage
+        if config.lean_force_zero_slippage is not None
+        else config.slippage_pct == 0.0
+    )
+    lean_account_stmt = ""
+    if config.lean_account_type == "cash":
+        lean_account_stmt = "self.set_brokerage_model(BrokerageName.DEFAULT, AccountType.CASH)"
+    elif config.lean_account_type == "margin":
+        lean_account_stmt = "self.set_brokerage_model(BrokerageName.DEFAULT, AccountType.MARGIN)"
+    leverage_stmt = (
+        f"security.set_leverage({float(config.lean_security_leverage)})"
+        if config.lean_security_leverage is not None
+        else ""
+    )
+    zero_fee_stmt = "security.set_fee_model(ConstantFeeModel(0))" if force_zero_fee else ""
+    zero_slippage_stmt = (
+        "security.set_slippage_model(ConstantSlippageModel(0))" if force_zero_slippage else ""
+    )
+
+    target_shares = build_canonical_target_shares(
+        config, signals, pd.DatetimeIndex(dates), asset_names
+    )
+    target_trace = build_canonical_target_trace(target_shares)
+    target_shares_lean = target_shares.rename(columns=asset_to_ticker)
+
+    project_dir = lean_workspace / "ml4t_benchmark"
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "backtests").mkdir(parents=True, exist_ok=True)
+    for artifact_name in ("ml4t_daily_equity.csv", "ml4t_order_events.csv"):
+        artifact_path = project_dir / artifact_name
+        if artifact_path.exists():
+            artifact_path.unlink()
+
+    config_json = {
+        "algorithm-language": "Python",
+        "parameters": {},
+        "description": "ml4t canonical target-share benchmark",
+    }
+    (project_dir / "config.json").write_text(json.dumps(config_json, indent=4), encoding="utf-8")
+    (project_dir / "ml4t_symbol_map.json").write_text(
+        json.dumps(ticker_to_asset, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    symbols_path = project_dir / "symbols.csv"
+    symbols_path.write_text("\n".join(tickers) + "\n", encoding="utf-8")
+
+    targets_long = target_shares_lean.stack().reset_index()
+    targets_long.columns = ["timestamp", "ticker", "target"]
+    targets_long = targets_long[targets_long["target"] != 0.0]
+    targets_long["timestamp"] = pd.to_datetime(targets_long["timestamp"]).dt.strftime("%Y-%m-%d")
+    targets_path = project_dir / "targets.csv"
+    targets_long.to_csv(targets_path, index=False)
+
+    first_date = pd.Timestamp(dates[0]).date()
+    last_date = pd.Timestamp(dates[-1]).date()
+    following_sessions = _get_nyse_sessions(
+        pd.Timestamp(last_date) + pd.Timedelta(days=1),
+        pd.Timestamp(last_date) + pd.Timedelta(days=10),
+    )
+    if len(following_sessions) == 0:
+        raise RuntimeError(f"Could not resolve the LEAN settlement session after {last_date}")
+    lean_end_date = pd.Timestamp(following_sessions[0]).date()
+    main_code = f"""# region imports
+from AlgorithmImports import *
+# endregion
+
+import csv
+from pathlib import Path
+
+
+class Ml4tBenchmark(QCAlgorithm):
+    def initialize(self):
+        self.set_start_date({first_date.year}, {first_date.month}, {first_date.day})
+        self.set_end_date({lean_end_date.year}, {lean_end_date.month}, {lean_end_date.day})
+        self.set_cash({float(config.initial_cash)})
+        {lean_account_stmt}
+        self._targets = {{}}
+        base_path = Path(__file__).resolve().parent
+        self._equity_path = base_path / "ml4t_daily_equity.csv"
+        self._order_events_path = base_path / "ml4t_order_events.csv"
+        self._initialize_artifact_files()
+
+        with (base_path / "targets.csv").open(newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                key = row["timestamp"]
+                if key not in self._targets:
+                    self._targets[key] = {{}}
+                self._targets[key][row["ticker"]] = float(row["target"])
+
+        self._symbols = {{}}
+        for line in (base_path / "symbols.csv").read_text(encoding="utf-8").splitlines():
+            ticker = line.strip()
+            if not ticker:
+                continue
+            security = self.add_equity(ticker, Resolution.DAILY)
+            {leverage_stmt}
+            {zero_fee_stmt}
+            {zero_slippage_stmt}
+            self._symbols[ticker] = security.symbol
+        if self._symbols:
+            first_ticker = sorted(self._symbols.keys())[0]
+            self.set_benchmark(self._symbols[first_ticker])
+
+    def _initialize_artifact_files(self):
+        with self._equity_path.open("w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["timestamp", "equity", "cash", "total_fees", "holdings_value"])
+        with self._order_events_path.open("w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "timestamp",
+                    "symbol",
+                    "status",
+                    "direction",
+                    "fill_quantity",
+                    "fill_price",
+                    "fee",
+                    "message",
+                    "order_id",
+                ]
+            )
+
+    def _append_csv_row(self, path: Path, row: list[object]) -> None:
+        with path.open("a", newline="") as f:
+            csv.writer(f).writerow(row)
+
+    def on_data(self, data: Slice):
+        key = self.time.strftime("%Y-%m-%d")
+        targets = self._targets.get(key)
+        if targets is None:
+            return
+
+        active = set(targets.keys())
+        for ticker, symbol in self._symbols.items():
+            if self.portfolio[symbol].quantity != 0:
+                active.add(ticker)
+
+        bars = data.bars
+        for ticker in sorted(active):
+            symbol = self._symbols[ticker]
+            if bars is None or symbol not in bars:
+                continue
+            target_qty = targets.get(ticker, 0.0)
+            current_qty = self.portfolio[symbol].quantity
+            delta = int(round(target_qty - current_qty))
+            if delta != 0:
+                {lean_order_call}
+
+        self._append_csv_row(
+            self._equity_path,
+            [
+                key,
+                float(self.portfolio.total_portfolio_value),
+                float(self.portfolio.cash),
+                float(self.portfolio.total_fees),
+                float(self.portfolio.total_holdings_value),
+            ],
+        )
+
+    def on_order_event(self, order_event: OrderEvent):
+        fee_amount = 0.0
+        if order_event.order_fee and order_event.order_fee.value is not None:
+            fee_amount = float(order_event.order_fee.value.amount)
+
+        message = str(order_event.message or "").replace("\\n", " ").strip()
+        symbol = order_event.symbol.value if order_event.symbol is not None else ""
+        self._append_csv_row(
+            self._order_events_path,
+            [
+                self.time.strftime("%Y-%m-%d %H:%M:%S"),
+                symbol,
+                str(order_event.status),
+                str(order_event.direction),
+                float(order_event.fill_quantity),
+                float(order_event.fill_price),
+                fee_amount,
+                message,
+                int(order_event.order_id),
+            ],
+        )
+"""
+    (project_dir / "main.py").write_text(main_code, encoding="utf-8")
+
+    data_root = lean_workspace / "data" / "equity" / "usa"
+    (data_root / "map_files").mkdir(parents=True, exist_ok=True)
+    (data_root / "factor_files").mkdir(parents=True, exist_ok=True)
+    (data_root / "daily").mkdir(parents=True, exist_ok=True)
+
+    env = make_lean_env()
+    try:
+        observed_cli = check_lean_cli(lean_cmd, PROJECT_ROOT, env)
+        expected_cli = f"lean {lean_target.cli_version}"
+        if observed_cli != expected_cli:
+            raise RuntimeError(f"LEAN CLI differs: {observed_cli} != {expected_cli}")
+    except RuntimeError as exc:
+        return BenchmarkResult(
+            framework="LEAN CLI",
+            scenario=config.name,
+            runtime_sec=0,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error=str(exc),
+        )
+
+    close_edge_sum = 0.0
+    for asset_name in asset_names:
+        asset_close = price_data[asset_name]["close"]
+        if len(asset_close) > 0:
+            close_edge_sum += float(asset_close.iloc[0]) + float(asset_close.iloc[-1])
+    lean_data_sig = hashlib.md5(
+        (
+            f"assets={','.join(asset_names)}|start={pd.Timestamp(dates[0]).date()}|"
+            f"end={pd.Timestamp(dates[-1]).date()}|edges={close_edge_sum:.10f}"
+        ).encode()
+    ).hexdigest()
+    manifest_path = data_root / "ml4t_manifest.json"
+
+    prep_start = time.perf_counter()
+    cache_hit = export_lean_daily_data(
+        data_root=data_root,
+        prices_by_asset=price_data,
+        asset_to_ticker=asset_to_ticker,
+        manifest_path=manifest_path,
+        signature_payload={
+            "signature": lean_data_sig,
+            "num_assets": len(asset_names),
+            "start": str(pd.Timestamp(dates[0]).date()),
+            "end": str(pd.Timestamp(dates[-1]).date()),
+        },
+    )
+    prep_elapsed = time.perf_counter() - prep_start
+    if cache_hit:
+        _log(f"  LEAN data export: cache hit ({len(asset_names)} assets)")
+    else:
+        _log(f"  LEAN data export: {prep_elapsed:.2f}s ({len(asset_names)} assets)")
+
+    output_dir = project_dir / "backtests" / f"{config.n_assets}_{config.n_bars}_{int(time.time())}"
+    try:
+        runtime_sec = run_lean_backtest(
+            lean_cmd=lean_cmd,
+            cwd=PROJECT_ROOT,
+            project_dir=project_dir,
+            lean_config=lean_config,
+            output_dir=output_dir,
+            image=lean_target.artifact,
+            timeout=1800,
+            env=env,
+        )
+    except RuntimeError as exc:
+        return BenchmarkResult(
+            framework="LEAN CLI",
+            scenario=config.name,
+            runtime_sec=0,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error=str(exc),
+            target_trace_df=target_trace,
+        )
+
+    copy_lean_artifacts(
+        project_dir,
+        output_dir,
+        ["ml4t_daily_equity.csv", "ml4t_order_events.csv", "ml4t_symbol_map.json"],
+    )
+
+    try:
+        num_trades, final_value, trades_df, equity_df, order_events_df = _load_lean_artifacts(
+            output_dir
+        )
+    except FileNotFoundError as exc:
+        return BenchmarkResult(
+            framework="LEAN CLI",
+            scenario=config.name,
+            runtime_sec=runtime_sec,
+            num_trades=0,
+            final_value=0,
+            memory_mb=0,
+            error=str(exc),
+            target_trace_df=target_trace,
+        )
+
+    fills_df = trades_df
+    trades_df = closed_trades_from_fills(fills_df)
+    num_trades = 0 if trades_df is None else len(trades_df)
+
+    return BenchmarkResult(
+        framework="LEAN CLI",
+        scenario=config.name,
+        runtime_sec=runtime_sec,
+        num_trades=num_trades,
+        final_value=final_value,
+        memory_mb=0.0,
+        fills_df=fills_df,
+        trades_df=trades_df,
+        equity_df=equity_df,
+        order_events_df=order_events_df,
+        target_trace_df=target_trace,
+    )
+
+
+def run_scenario(
+    scenario_name: str,
+    frameworks: list[str],
+    data_source: str = "synthetic",
+    real_data_path: Path = DEFAULT_REAL_DATA_PATH,
+    cache_mode: str = "auto",
+) -> list[BenchmarkResult]:
+    """Run a benchmark scenario across specified frameworks."""
+    config = SCENARIOS[scenario_name]
+    _log(f"\n{'=' * 70}")
+    _log(f"Scenario: {config.name}")
+    _log(f"  Bars: {config.n_bars:,} | Assets: {config.n_assets} | Freq: {config.frequency}")
+    _log(f"  Long top {config.top_n}, Short bottom {config.bottom_n}")
+    if config.stop_loss:
+        _log(f"  Stop-loss: {config.stop_loss * 100:.1f}%")
+    if config.take_profit:
+        _log(f"  Take-profit: {config.take_profit * 100:.1f}%")
+    if config.commission_pct > 0:
+        _log(f"  Commission: {config.commission_pct * 100:.2f}%")
+    if config.slippage_pct > 0:
+        _log(f"  Slippage: {config.slippage_pct * 100:.2f}%")
+    _log(f"{'=' * 70}")
+
+    _log("\nGenerating data...")
+    if data_source == "real":
+        price_data, signals, dates = load_real_benchmark_data(
+            config,
+            real_data_path,
+            cache_mode=cache_mode,
+        )
+        _log(f"  Source: real parquet ({real_data_path})")
+    else:
+        price_data, signals, dates = generate_benchmark_data(config)
+        _log("  Source: synthetic generator")
+    _log(f"  Generated {len(price_data)} assets with {len(dates):,} bars each")
+    _log(f"  Date range: {pd.Timestamp(dates[0]).date()} -> {pd.Timestamp(dates[-1]).date()}")
+
+    results = []
+
+    for framework in frameworks:
+        _log(f"\nRunning {framework}...")
+        try:
+            if framework == "ml4t":
+                result = benchmark_ml4t(
+                    config, price_data, signals, dates, execution_mode="same_bar"
+                )
+            elif framework == "ml4t-backtrader":
+                # ML4T with Backtrader-compatible settings (next-bar execution)
+                result = benchmark_ml4t(
+                    config, price_data, signals, dates, execution_mode="next_bar"
+                )
+            elif framework == "ml4t-vbt-strict":
+                result = benchmark_ml4t(
+                    config,
+                    price_data,
+                    signals,
+                    dates,
+                    execution_mode="same_bar",
+                    profile_override="vectorbt_strict",
+                )
+            elif framework == "ml4t-backtrader-strict":
+                result = benchmark_ml4t(
+                    config,
+                    price_data,
+                    signals,
+                    dates,
+                    execution_mode="next_bar",
+                    profile_override="backtrader_strict",
+                )
+            elif framework == "ml4t-zipline-strict":
+                result = benchmark_ml4t(
+                    config,
+                    price_data,
+                    signals,
+                    dates,
+                    execution_mode="next_bar",
+                    profile_override="zipline_strict",
+                )
+            elif framework == "ml4t-lean":
+                result = benchmark_ml4t(
+                    config,
+                    price_data,
+                    signals,
+                    dates,
+                    execution_mode="next_bar",
+                    profile_override="lean",
+                )
+            elif framework == "vbt-pro":
+                result = benchmark_vectorbt_pro(config, price_data, signals, dates)
+            elif framework == "vbt-oss":
+                result = benchmark_vectorbt_oss(config, price_data, signals, dates)
+            elif framework == "zipline":
+                result = benchmark_zipline(config, price_data, signals, dates)
+            elif framework == "backtrader":
+                result = benchmark_backtrader(config, price_data, signals, dates)
+            elif framework == "nautilus":
+                result = benchmark_nautilus(config, price_data, signals, dates)
+            elif framework == "lean":
+                result = benchmark_lean(config, price_data, signals, dates)
+            else:
+                result = BenchmarkResult(
+                    framework=framework,
+                    scenario=config.name,
+                    runtime_sec=0,
+                    num_trades=0,
+                    final_value=0,
+                    memory_mb=0,
+                    error=f"Unknown framework: {framework}",
+                )
+
+            # Add realized data_points to result for metrics (can differ from config on bounded calendars)
+            result.data_points = len(dates) * len(price_data)
+            results.append(result)
+
+            if result.error:
+                _log(f"  ERROR: {result.error}")
+            else:
+                _log(f"  Runtime: {result.runtime_sec:.3f}s")
+                _log(f"  Trades: {result.num_trades:,}")
+                _log(f"  Final value: ${result.final_value:,.2f}")
+                _log(f"  Memory: {result.memory_mb:.1f} MB")
+                if result.bars_per_second > 0:
+                    _log(f"  Speed: {result.bars_per_second:,.0f} bars/sec")
+
+        except Exception as e:
+            _log(f"  EXCEPTION: {e}")
+            import traceback
+
+            _log(traceback.format_exc())
+            results.append(
+                BenchmarkResult(
+                    framework=framework,
+                    scenario=config.name,
+                    runtime_sec=0,
+                    num_trades=0,
+                    final_value=0,
+                    memory_mb=0,
+                    error=str(e),
+                )
+            )
+
+    return results
+
+
+def print_summary(all_results: list[BenchmarkResult]):
+    """Print summary comparison table."""
+    _log("\n" + "=" * 80)
+    _log("SUMMARY")
+    _log("=" * 80)
+
+    # Group by scenario
+    scenarios = {}
+    for r in all_results:
+        if r.scenario not in scenarios:
+            scenarios[r.scenario] = {}
+        scenarios[r.scenario][r.framework] = r
+
+    _log(f"{'Scenario':<30} {'Framework':<15} {'Runtime':<12} {'Trades':<10} {'Memory':<10}")
+    _log("-" * 80)
+
+    for scenario, frameworks in scenarios.items():
+        first = True
+        for framework, result in frameworks.items():
+            scenario_col = scenario if first else ""
+            first = False
+
+            if result.error:
+                _log(f"{scenario_col:<30} {framework:<15} {'ERROR':<12} {'-':<10} {'-':<10}")
+            else:
+                runtime_str = f"{result.runtime_sec:.3f}s"
+                if result.runtime_sec > 60:
+                    runtime_str = f"{result.runtime_sec / 60:.1f}m"
+                _log(
+                    f"{scenario_col:<30} {framework:<15} {runtime_str:<12} "
+                    f"{result.num_trades:<10} {result.memory_mb:.0f} MB"
+                )
+
+    _log("=" * 80)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Benchmark suite for backtesting frameworks")
+    parser.add_argument(
+        "--framework",
+        choices=[
+            "ml4t",
+            "ml4t-backtrader",
+            "ml4t-vbt-strict",
+            "ml4t-backtrader-strict",
+            "ml4t-zipline-strict",
+            "ml4t-lean",
+            "vbt-pro",
+            "vbt-oss",
+            "backtrader",
+            "nautilus",
+            "zipline",
+            "lean",
+            "all",
+        ],
+        default="ml4t",
+        help="Framework to benchmark (ml4t-backtrader uses next-bar execution to match Backtrader)",
+    )
+    parser.add_argument(
+        "--scenario",
+        choices=list(SCENARIOS.keys()) + ["all"],
+        default="baseline",
+        help="Scenario to run",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Run all scenarios",
+    )
+    parser.add_argument(
+        "--data-source",
+        choices=["synthetic", "real"],
+        default="synthetic",
+        help="Price data source for benchmark scenarios",
+    )
+    parser.add_argument(
+        "--real-data-path",
+        type=str,
+        default=str(DEFAULT_REAL_DATA_PATH),
+        help="Path to real-data parquet file (used with --data-source real)",
+    )
+    parser.add_argument(
+        "--cache-mode",
+        choices=["auto", "off", "refresh"],
+        default="auto",
+        help="Cache behavior for real-data preprocessing",
+    )
+    parser.add_argument(
+        "--save-trades",
+        action="store_true",
+        help="Save trade logs to CSV for validation",
+    )
+    parser.add_argument(
+        "--output-json",
+        type=str,
+        metavar="PATH",
+        help="Write JSON report to specified path",
+    )
+    parser.add_argument(
+        "--output-markdown",
+        type=str,
+        metavar="PATH",
+        help="Write Markdown report to specified path",
+    )
+    args = parser.parse_args()
+
+    # Determine frameworks
+    frameworks = ["ml4t", "vbt-pro", "backtrader"] if args.framework == "all" else [args.framework]
+
+    # Determine scenarios
+    if args.all or args.scenario == "all":
+        scenario_names = list(SCENARIOS.keys())
+    else:
+        scenario_names = [args.scenario]
+
+    _log("=" * 70)
+    _log("Backtesting Framework Benchmark Suite")
+    _log("=" * 70)
+    _log(f"Frameworks: {', '.join(frameworks)}")
+    _log(f"Scenarios: {', '.join(scenario_names)}")
+
+    all_results = []
+    output_dir = PROJECT_ROOT / "validation" / "trade_logs"
+
+    for scenario_name in scenario_names:
+        results = run_scenario(
+            scenario_name,
+            frameworks,
+            data_source=args.data_source,
+            real_data_path=Path(args.real_data_path),
+            cache_mode=args.cache_mode,
+        )
+        all_results.extend(results)
+
+        # Save trade logs if requested
+        if args.save_trades:
+            for r in results:
+                save_trades(r, output_dir)
+
+    print_summary(all_results)
+
+    # Print trade comparison if multiple frameworks
+    if len(frameworks) > 1:
+        comparisons = compare_trades(all_results)
+        if comparisons:
+            _log("\nTRADE COMPARISON (vs ml4t.backtest baseline)")
+            _log("-" * 60)
+            for framework, comp in comparisons.items():
+                _log(f"{framework}:")
+                _log(
+                    f"  Trade count diff: {comp['trade_count_diff']:,} ({comp['trade_count_pct']:.2f}%)"
+                )
+                _log(
+                    f"  Final value diff: ${comp['final_value_diff']:,.2f} ({comp['final_value_pct']:.2f}%)"
+                )
+
+    # Generate reports if requested
+    if args.output_json:
+        generate_json_report(all_results, Path(args.output_json))
+
+    if args.output_markdown:
+        generate_markdown_report(all_results, Path(args.output_markdown))
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,320 @@
+"""Contracts for commit-bound release qualification and publication."""
+
+from __future__ import annotations
+
+import importlib.util
+import io
+import tarfile
+import zipfile
+from pathlib import Path
+from types import ModuleType
+
+import yaml
+
+_ROOT = Path(__file__).parents[2]
+_COMMIT = "1" * 40
+_REPOSITORY = "ml4t/backtest"
+
+
+def _load_release_candidate() -> ModuleType:
+    path = _ROOT / "validation" / "release_candidate.py"
+    spec = importlib.util.spec_from_file_location("ml4t_release_candidate", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_release_preflight() -> ModuleType:
+    path = _ROOT / "validation" / "release_preflight.py"
+    spec = importlib.util.spec_from_file_location("ml4t_release_preflight", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _workflow(name: str) -> dict:
+    payload = yaml.load(
+        (_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _write_distributions(directory: Path) -> None:
+    metadata = b"Metadata-Version: 2.4\nName: ml4t-backtest\nVersion: 0.1.0\n\n"
+    wheel = directory / "ml4t_backtest-0.1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("ml4t_backtest-0.1.0.dist-info/METADATA", metadata)
+    source = directory / "ml4t_backtest-0.1.0.tar.gz"
+    with tarfile.open(source, "w:gz") as archive:
+        info = tarfile.TarInfo("ml4t_backtest-0.1.0/PKG-INFO")
+        info.size = len(metadata)
+        archive.addfile(info, io.BytesIO(metadata))
+
+
+def _manifest(tmp_path: Path) -> tuple[ModuleType, dict[str, object]]:
+    candidate = _load_release_candidate()
+    _write_distributions(tmp_path)
+    gates = dict.fromkeys(candidate.REQUIRED_GATES, "success")
+    manifest = candidate.create_manifest(
+        tmp_path,
+        commit=_COMMIT,
+        repository=_REPOSITORY,
+        gates=gates,
+    )
+    return candidate, manifest
+
+
+def test_preflight_rejects_non_main_reused_and_unstable_candidates() -> None:
+    preflight = _load_release_preflight()
+
+    failures = preflight.preflight_failures(
+        version="0.2.0rc1",
+        candidate_commit=_COMMIT,
+        workflow_commit="2" * 40,
+        checkout_commit="3" * 40,
+        main_commit="4" * 40,
+        tag_exists=True,
+        release_exists=True,
+        pypi_exists=True,
+    )
+
+    assert failures == [
+        "Release version must be a stable X.Y.Z value: '0.2.0rc1'",
+        f"Candidate commit differs from workflow: {_COMMIT!r} != {'2' * 40!r}",
+        f"Candidate commit differs from checkout: {_COMMIT!r} != {'3' * 40!r}",
+        f"Candidate commit differs from origin/main: {_COMMIT!r} != {'4' * 40!r}",
+        "Git tag already exists: v0.2.0rc1",
+        "GitHub release already exists: v0.2.0rc1",
+        "PyPI version already exists: 0.2.0rc1",
+    ]
+
+
+def test_candidate_rejects_missing_and_failed_release_gates(tmp_path: Path) -> None:
+    candidate, manifest = _manifest(tmp_path)
+    gates = manifest["gates"]
+    assert isinstance(gates, dict)
+    gates.pop("security")
+    gates["coverage"] = "failure"
+
+    failures = candidate.candidate_failures(
+        manifest,
+        tmp_path,
+        expected_commit=_COMMIT,
+        expected_repository=_REPOSITORY,
+    )
+
+    assert "Candidate is missing release gates: ['security']" in failures
+    assert "Release gate did not pass: coverage=failure" in failures
+
+
+def test_candidate_rejects_stale_commit_tag_and_changed_artifact(tmp_path: Path) -> None:
+    candidate, manifest = _manifest(tmp_path)
+    wheel = next(tmp_path.glob("*.whl"))
+    wheel.write_bytes(wheel.read_bytes() + b"changed")
+
+    failures = candidate.candidate_failures(
+        manifest,
+        tmp_path,
+        expected_commit="2" * 40,
+        expected_repository=_REPOSITORY,
+        expected_tag="v0.1.1",
+    )
+
+    assert any("commit is stale" in failure for failure in failures)
+    assert any("tag does not match" in failure for failure in failures)
+    assert f"Candidate digest mismatch: {wheel.name}" in failures
+
+
+def test_candidate_rejects_a_version_other_than_the_requested_release(tmp_path: Path) -> None:
+    candidate, manifest = _manifest(tmp_path)
+
+    failures = candidate.candidate_failures(
+        manifest,
+        tmp_path,
+        expected_commit=_COMMIT,
+        expected_repository=_REPOSITORY,
+        expected_version="0.1.1",
+    )
+
+    assert failures == ["Candidate version differs: '0.1.0' != '0.1.1'"]
+    try:
+        candidate.create_manifest(
+            tmp_path,
+            commit=_COMMIT,
+            repository=_REPOSITORY,
+            gates=dict.fromkeys(candidate.REQUIRED_GATES, "success"),
+            expected_version="0.1.1",
+        )
+    except ValueError as error:
+        assert str(error) == "Candidate version differs: '0.1.0' != '0.1.1'"
+    else:
+        raise AssertionError("A mismatched release version must be rejected")
+
+
+def test_candidate_rejects_missing_and_undeclared_distributions(tmp_path: Path) -> None:
+    candidate, manifest = _manifest(tmp_path)
+    source = next(tmp_path.glob("*.tar.gz"))
+    source.unlink()
+    extra = tmp_path / "undeclared-0.1.0.tar.gz"
+    extra.write_bytes(b"not a distribution")
+
+    failures = candidate.candidate_failures(
+        manifest,
+        tmp_path,
+        expected_commit=_COMMIT,
+        expected_repository=_REPOSITORY,
+    )
+
+    assert any("distributions are missing" in failure for failure in failures)
+    assert any("undeclared distributions" in failure for failure in failures)
+
+
+def test_package_index_must_publish_only_candidate_digests(tmp_path: Path) -> None:
+    candidate, manifest = _manifest(tmp_path)
+    files = manifest["files"]
+    assert isinstance(files, dict)
+    payload = {
+        "info": {"name": "ml4t-backtest", "version": "0.1.0"},
+        "urls": [
+            {"filename": name, "digests": {"sha256": record["sha256"]}}
+            for name, record in files.items()
+        ],
+    }
+    assert candidate.index_failures(manifest, payload) == []
+
+    payload["urls"][0]["digests"]["sha256"] = "0" * 64
+    assert candidate.index_failures(manifest, payload) == [
+        f"Published digest differs from candidate: {payload['urls'][0]['filename']}"
+    ]
+
+
+def test_release_reuses_all_ci_gates_and_publishes_the_exact_candidate() -> None:
+    ci = _workflow("ci.yml")
+    release = _workflow("release.yml")
+    jobs = ci["jobs"]
+    release_jobs = release["jobs"]
+
+    assert "workflow_call" in ci["on"]
+    assert set(jobs["build"]["needs"]) == {
+        "lint",
+        "typecheck",
+        "compatibility",
+        "security",
+        "coverage",
+        "runtime",
+        "public-parity",
+        "documentation",
+    }
+    parity = jobs["public-parity"]
+    assert {entry["framework"] for entry in parity["strategy"]["matrix"]["include"]} == {
+        "vectorbt_oss",
+        "backtrader",
+        "zipline",
+    }
+    parity_commands = "\n".join(step.get("run", "") for step in parity["steps"])
+    assert "validation/build_framework_env.py" in parity_commands
+    assert "validation/native/vectorbt_behavior.py" in parity_commands
+    assert "validation/native/backtrader_behavior.py" in parity_commands
+    assert "validation/native/zipline_behavior.py" in parity_commands
+    assert "validation/run_all_correctness.py" in parity_commands
+    assert "--extra comparison" not in parity_commands
+    build_commands = "\n".join(step.get("run", "") for step in jobs["build"]["steps"])
+    assert "git rev-parse HEAD" in build_commands
+    assert "validation/release_candidate.py create" in build_commands
+    assert "validation/release_candidate.py verify" in build_commands
+    for gate in _load_release_candidate().REQUIRED_GATES:
+        assert f"--gate {gate}=" in build_commands
+
+    assert set(release["on"]) == {"workflow_dispatch"}
+    inputs = release["on"]["workflow_dispatch"]["inputs"]
+    assert set(inputs) == {"version", "candidate-commit"}
+    preflight_commands = "\n".join(
+        step.get("run", "") for step in release_jobs["preflight"]["steps"]
+    )
+    assert "validation/release_preflight.py" in preflight_commands
+    for job_name in (
+        "preflight",
+        "deploy-documentation",
+        "publish",
+        "tag-and-release",
+        "post-release",
+    ):
+        checkout = next(
+            step
+            for step in release_jobs[job_name]["steps"]
+            if step.get("uses", "").startswith("actions/checkout@")
+        )
+        assert checkout["with"]["ref"] == "${{ github.sha }}"
+
+    assert release_jobs["qualification"]["uses"] == "./.github/workflows/ci.yml"
+    assert release_jobs["qualification"]["needs"] == "preflight"
+    assert release_jobs["qualification"]["with"]["release-version"] == (
+        "${{ needs.preflight.outputs.version }}"
+    )
+    assert release_jobs["private-comparisons"]["uses"] == (
+        "./.github/workflows/private-comparisons.yml"
+    )
+    assert set(release_jobs["deploy-documentation"]["needs"]) == {
+        "preflight",
+        "ecosystem-qualification",
+        "private-comparisons",
+        "qualification",
+    }
+    assert release_jobs["deploy-documentation"]["environment"] == "documentation"
+    assert release_jobs["publish"]["needs"] == ["preflight", "deploy-documentation"]
+    assert release_jobs["publish"]["permissions"] == {
+        "contents": "read",
+        "id-token": "write",
+    }
+    publish_steps = release_jobs["publish"]["steps"]
+    publish = next(
+        step for step in publish_steps if "pypa/gh-action-pypi-publish" in step.get("uses", "")
+    )
+    assert publish["with"]["packages-dir"] == "candidate/dist/"
+    assert not ({"user", "password"} & set(publish["with"]))
+    publish_commands = "\n".join(step.get("run", "") for step in publish_steps)
+    assert "release_candidate.py verify" in publish_commands
+    assert "--expected-version" in publish_commands
+    assert release_jobs["tag-and-release"]["needs"] == ["preflight", "publish"]
+    assert release_jobs["post-release"]["needs"] == ["preflight", "tag-and-release"]
+    post_commands = "\n".join(step.get("run", "") for step in release_jobs["post-release"]["steps"])
+    assert "release_candidate.py verify-index" in post_commands
+    assert "gh release download" in post_commands
+    assert "ml4t-backtest==${{ needs.preflight.outputs.version }}" in post_commands
+    assert "--refresh-package ml4t-backtest" in post_commands
+    recovery = release_jobs["record-recovery"]
+    assert "needs.publish.result == 'success'" in recovery["if"]
+    recovery_commands = "\n".join(step.get("run", "") for step in recovery["steps"])
+    assert "Rerun only the failed jobs" in recovery_commands
+    assert "Do not rebuild or reuse this version" in recovery_commands
+
+
+def test_private_comparison_workflow_pins_and_retains_evidence() -> None:
+    workflow = _workflow("private-comparisons.yml")
+    jobs = workflow["jobs"]
+
+    assert workflow["on"]["workflow_call"]["secrets"]["VECTORBT_PRO_GH_TOKEN"]["required"]
+    pro_commands = "\n".join(step.get("run", "") for step in jobs["vectorbt-pro"]["steps"])
+    assert "gh auth setup-git" in pro_commands
+    assert "id_ed25519" not in pro_commands
+    authenticated_steps = [
+        step
+        for step in jobs["vectorbt-pro"]["steps"]
+        if step.get("env", {}).get("GH_TOKEN") == "${{ secrets.VECTORBT_PRO_GH_TOKEN }}"
+    ]
+    assert len(authenticated_steps) == 2
+    assert "validation/build_framework_env.py" in pro_commands
+    assert "validation/native/vectorbt_behavior.py" in pro_commands
+    assert "validation/run_all_correctness.py" in pro_commands
+    assert "--framework vectorbt_pro" in pro_commands
+    lean_commands = "\n".join(step.get("run", "") for step in jobs["lean"]["steps"])
+    assert "--framework lean" in lean_commands
+    assert "validation/native/lean_behavior.py" in lean_commands
+    assert "validation/run_lean_case_studies.py" in lean_commands
+    assert "lean-native.json" in str(jobs["lean"])
+    assert "lean-case-studies.json" in str(jobs["lean"])
+    assert "run_all_correctness.py" not in lean_commands

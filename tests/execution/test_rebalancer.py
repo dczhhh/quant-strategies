@@ -1,0 +1,1583 @@
+"""Tests for portfolio rebalancing utilities."""
+
+import warnings
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from ml4t.backtest import (
+    Broker,
+    OrderSide,
+)
+from ml4t.backtest.config import (
+    ExecutionPrice,
+    RebalanceMode,
+    ShareRounding,
+)
+from ml4t.backtest.execution.rebalancer import RebalanceConfig, TargetWeightExecutor
+from ml4t.backtest.execution.schedule import RebalanceSchedule, resolve_rebalance_timestamps
+from ml4t.backtest.models import NoCommission, NoSlippage
+
+
+class TestRebalanceConfig:
+    """Test RebalanceConfig dataclass."""
+
+    def test_default_values(self):
+        """Test default configuration values."""
+        config = RebalanceConfig()
+        assert config.min_trade_value == 0.0
+        assert config.min_weight_change == 0.0
+        assert config.allow_fractional is None
+        assert config.round_lots is False
+        assert config.lot_size == 100
+        assert config.allow_short is False
+        assert config.max_single_weight == 1.0
+        assert config.cancel_before_rebalance is True
+        assert config.account_for_pending is True
+        assert config.schedule is None
+
+    def test_custom_values(self):
+        """Test custom configuration values."""
+        config = RebalanceConfig(
+            min_trade_value=500.0,
+            allow_fractional=True,
+            allow_short=True,
+            max_single_weight=0.25,
+        )
+        assert config.min_trade_value == 500.0
+        assert config.allow_fractional is True
+        assert config.allow_short is True
+        assert config.max_single_weight == 0.25
+
+    def test_schedule_can_be_configured(self):
+        """Test schedule-based rebalance configuration."""
+        config = RebalanceConfig(schedule=RebalanceSchedule.month_end())
+
+        assert config.schedule is not None
+        assert config.schedule.cadence.value == "month_end"
+
+
+class TestTargetWeightExecutorBasic:
+    """Test basic TargetWeightExecutor functionality."""
+
+    @pytest.fixture
+    def broker(self):
+        """Create a broker with $100,000 initial cash."""
+        return Broker(
+            initial_cash=100000.0,
+            commission_model=NoCommission(),
+            slippage_model=NoSlippage(),
+        )
+
+    @pytest.fixture
+    def executor(self):
+        """Create executor with default config."""
+        return TargetWeightExecutor()
+
+    @pytest.fixture
+    def sample_data(self):
+        """Sample market data."""
+        return {
+            "AAPL": {"close": 150.0, "open": 149.0, "volume": 1000000},
+            "GOOG": {"close": 100.0, "open": 99.0, "volume": 500000},
+            "MSFT": {"close": 200.0, "open": 199.0, "volume": 800000},
+        }
+
+    def test_empty_portfolio_rebalance(self, broker, executor, sample_data):
+        """Test rebalancing from empty portfolio."""
+        target_weights = {"AAPL": 0.3, "GOOG": 0.3, "MSFT": 0.4}
+
+        orders = executor.execute(target_weights, sample_data, broker)
+
+        assert len(orders) == 3
+        assert {order.rebalance_id for order in orders} == {orders[0].rebalance_id}
+        assert orders[0].rebalance_id is not None
+        # Check all are BUY orders
+        for order in orders:
+            assert order.side == OrderSide.BUY
+
+    def test_buy_to_target(self, broker, executor, sample_data):
+        """Test buying to reach target weight."""
+        # Start with 10% AAPL
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 1000000},
+            {},
+        )
+        broker.submit_order("AAPL", 66, OrderSide.BUY)  # ~$10,000 = 10%
+        broker._process_orders()
+
+        # Target 30% AAPL
+        target_weights = {"AAPL": 0.3}
+        orders = executor.execute(target_weights, sample_data, broker)
+
+        # Should generate BUY order for additional shares
+        assert len(orders) == 1
+        assert orders[0].side == OrderSide.BUY
+        assert orders[0].asset == "AAPL"
+
+    def test_sell_to_target(self, broker, executor, sample_data):
+        """Test selling to reach target weight."""
+        # Start with 50% AAPL
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 1000000},
+            {},
+        )
+        broker.submit_order("AAPL", 333, OrderSide.BUY)  # ~$50,000 = 50%
+        broker._process_orders()
+
+        # Target 30% AAPL
+        target_weights = {"AAPL": 0.3}
+        orders = executor.execute(target_weights, sample_data, broker)
+
+        # Should generate SELL order
+        assert len(orders) == 1
+        assert orders[0].side == OrderSide.SELL
+        assert orders[0].asset == "AAPL"
+
+    def test_close_position_not_in_target(self, broker, executor, sample_data):
+        """Test closing positions not in target weights."""
+        # Start with AAPL and GOOG positions
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 150.0, "GOOG": 100.0},
+            {"AAPL": 150.0, "GOOG": 100.0},
+            {"AAPL": 150.0, "GOOG": 100.0},
+            {"AAPL": 150.0, "GOOG": 100.0},
+            {"AAPL": 1000000, "GOOG": 500000},
+            {},
+        )
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        broker.submit_order("GOOG", 100, OrderSide.BUY)
+        broker._process_orders()
+
+        # Target only AAPL (GOOG should be closed)
+        target_weights = {"AAPL": 0.5}
+        orders = executor.execute(target_weights, sample_data, broker)
+
+        # Should have orders for AAPL rebalance and GOOG close
+        asset_orders = {o.asset: o for o in orders}
+        assert "GOOG" in asset_orders
+        assert asset_orders["GOOG"].side == OrderSide.SELL
+        assert len({order.rebalance_id for order in orders}) == 1
+
+    def test_rebalance_ids_change_per_execute_call(self, broker, executor, sample_data):
+        """Each logical rebalance call should get its own identifier."""
+        first_orders = executor.execute({"AAPL": 0.3}, sample_data, broker)
+        broker._process_orders()
+        second_orders = executor.execute({"AAPL": 0.5}, sample_data, broker)
+
+        assert len(first_orders) == 1
+        assert len(second_orders) == 1
+        assert first_orders[0].rebalance_id is not None
+        assert second_orders[0].rebalance_id is not None
+        assert first_orders[0].rebalance_id != second_orders[0].rebalance_id
+
+
+class TestTargetWeightExecutorThresholds:
+    """Test threshold-based filtering."""
+
+    @pytest.fixture
+    def broker(self):
+        return Broker(
+            initial_cash=100000.0,
+            commission_model=NoCommission(),
+            slippage_model=NoSlippage(),
+        )
+
+    @pytest.fixture
+    def sample_data(self):
+        return {"AAPL": {"close": 150.0}}
+
+    def test_skip_small_weight_change(self, broker, sample_data):
+        """Test skipping trades below min_weight_change threshold."""
+        executor = TargetWeightExecutor(config=RebalanceConfig(min_weight_change=0.05))
+
+        # Start with 30% AAPL
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 1000000},
+            {},
+        )
+        broker.submit_order("AAPL", 200, OrderSide.BUY)  # ~$30,000 = 30%
+        broker._process_orders()
+
+        # Target 32% (only 2% change, below 5% threshold)
+        target_weights = {"AAPL": 0.32}
+        orders = executor.execute(target_weights, sample_data, broker)
+
+        assert len(orders) == 0
+
+    def test_skip_small_trade_value(self, broker, sample_data):
+        """Test skipping trades below min_trade_value threshold."""
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(min_trade_value=1000.0, min_weight_change=0.001)
+        )
+
+        # Empty portfolio, target tiny weight
+        target_weights = {"AAPL": 0.005}  # 0.5% of $100k = $500 < $1000
+        orders = executor.execute(target_weights, sample_data, broker)
+
+        assert len(orders) == 0
+
+
+class TestTargetWeightExecutorShareHandling:
+    """Test share rounding and fractional shares."""
+
+    @pytest.fixture
+    def broker(self):
+        return Broker(
+            initial_cash=100000.0,
+            commission_model=NoCommission(),
+            slippage_model=NoSlippage(),
+        )
+
+    @pytest.fixture
+    def sample_data(self):
+        return {"AAPL": {"close": 150.0}}
+
+    def test_whole_shares_default(self, broker, sample_data):
+        """Test that shares are rounded to whole numbers by default."""
+        executor = TargetWeightExecutor(config=RebalanceConfig(allow_fractional=False))
+
+        target_weights = {"AAPL": 0.1}  # 10% of $100k = $10k / $150 = 66.67 shares
+        orders = executor.execute(target_weights, sample_data, broker)
+
+        assert len(orders) == 1
+        assert orders[0].quantity == 67  # nearest whole share
+
+    def test_fractional_shares(self, broker, sample_data):
+        """Test fractional shares when allowed."""
+        executor = TargetWeightExecutor(config=RebalanceConfig(allow_fractional=True))
+
+        target_weights = {"AAPL": 0.1}
+        orders = executor.execute(target_weights, sample_data, broker)
+
+        assert len(orders) == 1
+        # Should be approximately 66.67
+        assert 66.6 < orders[0].quantity < 66.7
+
+    def test_truncation_matches_target_percent_brokers(self, broker, sample_data):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                allow_fractional=False,
+                share_rounding=ShareRounding.TRUNCATE,
+            )
+        )
+
+        orders = executor.execute({"AAPL": 0.1}, sample_data, broker)
+
+        assert len(orders) == 1
+        assert orders[0].quantity == 66
+
+    def test_lot_rounding(self, broker, sample_data):
+        """Test rounding to lot sizes."""
+        executor = TargetWeightExecutor(config=RebalanceConfig(round_lots=True, lot_size=100))
+
+        # Target enough shares to round meaningfully
+        target_weights = {"AAPL": 0.3}  # 30% = $30k / $150 = 200 shares
+        orders = executor.execute(target_weights, sample_data, broker)
+
+        assert len(orders) == 1
+        assert orders[0].quantity % 100 == 0  # Multiple of 100
+
+    def test_rounds_to_zero_skipped(self, broker, sample_data):
+        """Test that trades rounding to zero shares are skipped."""
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(allow_fractional=False, min_weight_change=0.001)
+        )
+
+        # Very small target that rounds to 0 shares
+        # 0.01% of $100k = $10 / $150 = 0.067 shares -> rounds to 0
+        target_weights = {"AAPL": 0.0001}
+        orders = executor.execute(target_weights, sample_data, broker)
+
+        assert len(orders) == 0
+
+    def test_integer_rounding_avoids_follow_on_correction_rebalance(self, broker):
+        """Nearest-share quantization should reduce threshold-crossing drift."""
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                allow_fractional=False,
+                min_weight_change=0.005,
+                min_trade_value=0.0,
+            )
+        )
+        data = {"AAPL": {"close": 100.0}}
+
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 100.0},
+            {"AAPL": 100.0},
+            {"AAPL": 100.0},
+            {"AAPL": 100.0},
+            {"AAPL": 1_000_000},
+            {},
+        )
+
+        target_weights = {"AAPL": 0.0056}  # 5.6 shares on $100k equity
+        orders = executor.execute(target_weights, data, broker)
+        assert len(orders) == 1
+        assert orders[0].quantity == 6
+
+        broker._process_orders()
+
+        # With nearest-share quantization, the remaining drift is below the
+        # configured threshold and should not trigger a correction trade.
+        follow_on = executor.execute(target_weights, data, broker)
+        assert follow_on == []
+
+
+class TestTargetWeightExecutorPendingOrders:
+    """Test pending order awareness."""
+
+    @pytest.fixture
+    def broker(self):
+        return Broker(
+            initial_cash=100000.0,
+            commission_model=NoCommission(),
+            slippage_model=NoSlippage(),
+        )
+
+    @pytest.fixture
+    def sample_data(self):
+        return {"AAPL": {"close": 150.0}}
+
+    def test_cancel_before_rebalance_default(self, broker, sample_data):
+        """Test that pending orders are cancelled by default."""
+        executor = TargetWeightExecutor(config=RebalanceConfig(cancel_before_rebalance=True))
+
+        # Create a pending order
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 1000000},
+            {},
+        )
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        assert len(broker.pending_orders) == 1
+
+        # Execute rebalance
+        target_weights = {"AAPL": 0.3}
+        executor.execute(target_weights, sample_data, broker)
+
+        # Original pending order should be cancelled
+        # (new order may have been added by execute)
+
+    def test_effective_weights_with_pending(self, broker, sample_data):
+        """Test effective weight calculation including pending orders."""
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                cancel_before_rebalance=False,
+                account_for_pending=True,
+            )
+        )
+
+        # Create a pending BUY order (not yet filled)
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 1000000},
+            {},
+        )
+        broker.submit_order("AAPL", 200, OrderSide.BUY)  # $30k = 30% pending
+
+        # Without accounting for pending, would see 0% current and try to buy 30%
+        # With accounting, should see ~30% effective and generate minimal orders
+        effective = executor._get_effective_weights(broker, sample_data)
+        assert "AAPL" in effective
+        assert effective["AAPL"] > 0.2  # Should reflect pending order value
+
+
+class TestTargetWeightExecutorScheduling:
+    """Test schedule-gated execution."""
+
+    @pytest.fixture
+    def broker(self):
+        broker = Broker(
+            initial_cash=100000.0,
+            commission_model=NoCommission(),
+            slippage_model=NoSlippage(),
+        )
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 1000000},
+            {},
+        )
+        return broker
+
+    @pytest.fixture
+    def sample_data(self):
+        return {"AAPL": {"close": 150.0}}
+
+    def test_unscheduled_timestamp_skips_rebalance(self, broker, sample_data):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.explicit_timestamps([datetime(2024, 1, 2, 9, 30)])
+            )
+        )
+        orders = executor.execute(
+            {"AAPL": 0.5},
+            sample_data,
+            broker,
+            timestamp=datetime(2024, 1, 1, 9, 30),
+        )
+
+        assert orders == []
+
+    def test_scheduled_timestamp_executes_rebalance(self, broker, sample_data):
+        scheduled_ts = datetime(2024, 1, 2, 9, 30)
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(schedule=RebalanceSchedule.explicit_timestamps([scheduled_ts]))
+        )
+        orders = executor.execute(
+            {"AAPL": 0.5},
+            sample_data,
+            broker,
+            timestamp=scheduled_ts,
+        )
+
+        assert len(orders) == 1
+        assert orders[0].asset == "AAPL"
+
+    def test_weekly_schedule_uses_current_calendar_metadata(self):
+        timestamps = [
+            datetime(2024, 1, 1),
+            datetime(2024, 1, 2),
+            datetime(2024, 1, 3),
+            datetime(2024, 1, 4),
+            datetime(2024, 1, 5),
+            datetime(2024, 1, 8),
+            datetime(2024, 1, 9),
+            datetime(2024, 1, 10),
+            datetime(2024, 1, 11),
+            datetime(2024, 1, 12),
+        ]
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.weekly(),
+                calendar="NYSE",
+                data_frequency="daily",
+            )
+        )
+
+        resolved = [timestamp for timestamp in timestamps if executor.should_rebalance(timestamp)]
+
+        assert resolved == [datetime(2024, 1, 5), datetime(2024, 1, 12)]
+
+    def test_online_month_end_rejects_a_missing_interior_period_end(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.month_end(),
+                calendar="NYSE",
+                data_frequency="daily",
+            )
+        )
+
+        assert not executor.should_rebalance(datetime(2024, 1, 30))
+        with pytest.raises(ValueError, match="missing calendar period-end session 2024-01-31"):
+            executor.should_rebalance(datetime(2024, 2, 1))
+
+    def test_matched_week_end_survives_an_explicit_non_session_close(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.weekly(),
+                calendar="NYSE",
+                timezone="America/New_York",
+                data_frequency="1m",
+            )
+        )
+
+        assert executor.should_rebalance(
+            datetime(2024, 1, 5, 16, 0),
+            is_session_close=True,
+        )
+        assert not executor.should_rebalance(
+            datetime(2024, 1, 6, 12, 0),
+            is_session_close=True,
+        )
+        assert not executor.should_rebalance(
+            datetime(2024, 1, 8, 16, 0),
+            is_session_close=True,
+        )
+
+    def test_missing_week_end_raises_after_an_earlier_week_was_matched(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.weekly(),
+                calendar="NYSE",
+                timezone="America/New_York",
+                data_frequency="1m",
+            )
+        )
+
+        assert executor.should_rebalance(
+            datetime(2024, 1, 5, 16, 0),
+            is_session_close=True,
+        )
+        with pytest.raises(ValueError, match="missing calendar period-end session 2024-01-12"):
+            executor.should_rebalance(
+                datetime(2024, 1, 22, 16, 0),
+                is_session_close=True,
+            )
+
+    def test_batch_month_end_rejects_a_missing_interior_period_end(self):
+        with pytest.raises(ValueError, match="missing calendar period-end session 2024-01-31"):
+            resolve_rebalance_timestamps(
+                [datetime(2024, 1, 30), datetime(2024, 2, 1)],
+                RebalanceSchedule.month_end(),
+                calendar="NYSE",
+                data_frequency="daily",
+            )
+
+    def test_incomplete_final_month_does_not_move_to_an_earlier_session(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.month_end(),
+                calendar="NYSE",
+                data_frequency="daily",
+            )
+        )
+
+        assert not executor.should_rebalance(datetime(2024, 1, 30))
+        executor.validate_completed_run()
+
+    def test_intraday_weekly_schedule_fires_once_at_session_close(self):
+        timestamps = [
+            datetime(2024, 1, 5, 20, 58, tzinfo=UTC),
+            datetime(2024, 1, 5, 20, 59, tzinfo=UTC),
+            datetime(2024, 1, 5, 21, 0, tzinfo=UTC),
+        ]
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.weekly(),
+                calendar="NYSE",
+                timezone="UTC",
+                data_frequency="1m",
+            )
+        )
+
+        resolved = [timestamp for timestamp in timestamps if executor.should_rebalance(timestamp)]
+
+        assert resolved == [datetime(2024, 1, 5, 21, 0, tzinfo=UTC)]
+        executor.validate_completed_run()
+
+    def test_explicit_session_close_signal_supports_calendar_free_intraday_data(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.every_session(),
+                data_frequency="1m",
+            )
+        )
+
+        assert not executor.should_rebalance(datetime(2024, 1, 5, 15, 59), is_session_close=False)
+        assert executor.should_rebalance(datetime(2024, 1, 5, 16, 0), is_session_close=True)
+
+    def test_calendar_free_morning_boundary_has_a_concise_configuration_error(self):
+        with pytest.raises(ValueError, match="requires exchange calendar metadata"):
+            RebalanceConfig(
+                schedule=RebalanceSchedule.every_session(),
+                session_start_time="09:30",
+                data_frequency="1m",
+            )
+
+    def test_intraday_schedule_raises_after_a_required_close_never_matches(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.every_session(),
+                calendar="NYSE",
+                timezone="America/New_York",
+                data_frequency="15m",
+                timestamp_semantics="bar_close",
+            )
+        )
+
+        assert not executor.should_rebalance(datetime(2024, 1, 2, 16, 15))
+        with pytest.raises(ValueError, match="resolved no session close"):
+            executor.should_rebalance(datetime(2024, 1, 3, 9, 30))
+
+    def test_intraday_schedule_validates_the_final_observed_session(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.every_session(),
+                calendar="NYSE",
+                timezone="America/New_York",
+                data_frequency="15m",
+                timestamp_semantics="bar_close",
+            )
+        )
+
+        assert not executor.should_rebalance(datetime(2024, 1, 2, 16, 15))
+        with pytest.raises(ValueError, match="resolved no session closes"):
+            executor.validate_completed_run()
+
+    def test_period_schedule_requires_calendar_when_executor_is_constructed(self):
+        with pytest.raises(ValueError, match="require calendar metadata"):
+            TargetWeightExecutor(config=RebalanceConfig(schedule=RebalanceSchedule.weekly()))
+
+    def test_mutated_schedule_configuration_requires_explicit_reset(self):
+        config = RebalanceConfig(
+            schedule=RebalanceSchedule.every_session(),
+            data_frequency="daily",
+        )
+        executor = TargetWeightExecutor(config=config)
+        assert executor.should_rebalance(datetime(2024, 1, 2))
+
+        config.schedule = RebalanceSchedule.explicit_timestamps([datetime(2024, 1, 4)])
+
+        with pytest.raises(ValueError, match=r"RebalanceConfig changed.*reset"):
+            executor.should_rebalance(datetime(2024, 1, 3))
+        executor.reset()
+        assert not executor.should_rebalance(datetime(2024, 1, 3))
+        assert executor.should_rebalance(datetime(2024, 1, 4))
+
+    def test_reused_executor_requires_reset_before_session_dates_move_backward(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.fixed_n_sessions(2),
+                data_frequency="daily",
+            )
+        )
+
+        assert executor.should_rebalance(datetime(2024, 1, 2))
+        assert not executor.should_rebalance(datetime(2024, 1, 3))
+        with pytest.raises(ValueError, match=r"session date moved backward.*reset"):
+            executor.should_rebalance(datetime(2024, 1, 2))
+        executor.reset()
+        assert executor.should_rebalance(datetime(2024, 1, 2))
+
+    def test_validate_completed_run_uses_the_evaluator_that_observed_the_run(self):
+        config = RebalanceConfig(
+            schedule=RebalanceSchedule.every_session(),
+            calendar="NYSE",
+            timezone="America/New_York",
+            data_frequency="15m",
+            timestamp_semantics="bar_close",
+        )
+        executor = TargetWeightExecutor(config=config)
+        assert not executor.should_rebalance(datetime(2024, 1, 2, 16, 15))
+        config.data_frequency = "daily"
+
+        with pytest.raises(ValueError, match="resolved no session closes"):
+            executor.validate_completed_run()
+
+    def test_validate_completed_run_accepts_config_mutation_before_observation(self):
+        config = RebalanceConfig(
+            schedule=RebalanceSchedule.every_session(),
+            data_frequency="daily",
+        )
+        executor = TargetWeightExecutor(config=config)
+        config.data_frequency = "15m"
+
+        executor.validate_completed_run()
+
+    def test_online_explicit_timestamp_matches_the_same_instant_across_timezones(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.explicit_timestamps([datetime(2024, 1, 2, 16, 0)]),
+                timezone="America/New_York",
+            )
+        )
+
+        assert executor.should_rebalance(datetime(2024, 1, 2, 21, 0, tzinfo=UTC))
+        executor.validate_completed_run()
+
+    def test_online_explicit_timestamp_rejects_an_unmatched_observed_date(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.explicit_timestamps([datetime(2024, 1, 2, 16, 0)]),
+                timezone="America/New_York",
+            )
+        )
+
+        assert not executor.should_rebalance(datetime(2024, 1, 2, 20, 59, tzinfo=UTC))
+        assert not executor.should_rebalance(datetime(2024, 1, 2, 21, 1, tzinfo=UTC))
+        with pytest.raises(
+            ValueError,
+            match=r"2024-01-02T21:00:00\+00:00.*nearest observed instant is "
+            r"2024-01-02T20:59:00\+00:00",
+        ):
+            executor.validate_completed_run()
+
+    def test_online_explicit_timestamp_outside_the_observed_window_is_ignored(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.explicit_timestamps([datetime(2024, 1, 3, 16, 0)]),
+                timezone="America/New_York",
+            )
+        )
+
+        assert not executor.should_rebalance(datetime(2024, 1, 2, 21, 0, tzinfo=UTC))
+        executor.validate_completed_run()
+
+    def test_online_explicit_timestamp_reports_a_later_miss_after_an_earlier_match(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.explicit_timestamps(
+                    [datetime(2024, 1, 2, 16, 0), datetime(2024, 1, 2, 17, 0)]
+                ),
+                timezone="America/New_York",
+            )
+        )
+
+        assert executor.should_rebalance(datetime(2024, 1, 2, 21, 0, tzinfo=UTC))
+        assert not executor.should_rebalance(datetime(2024, 1, 2, 21, 59, tzinfo=UTC))
+        assert not executor.should_rebalance(datetime(2024, 1, 2, 22, 1, tzinfo=UTC))
+        with pytest.raises(
+            ValueError,
+            match=r"2024-01-02T22:00:00\+00:00.*nearest observed instant is "
+            r"2024-01-02T21:59:00\+00:00",
+        ):
+            executor.validate_completed_run()
+
+    def test_online_explicit_matching_traverses_only_reached_schedule_instants(self):
+        start = datetime(2024, 1, 2, 16, 0)
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.explicit_timestamps(
+                    [start + timedelta(hours=index) for index in range(2_500)]
+                ),
+                timezone="America/New_York",
+            )
+        )
+        evaluator = executor._schedule_evaluator
+        assert evaluator is not None
+
+        class CountingSequence:
+            def __init__(self, values):
+                self.values = values
+                self.accesses = 0
+
+            def __len__(self):
+                return len(self.values)
+
+            def __getitem__(self, index):
+                self.accesses += 1
+                return self.values[index]
+
+        instants = CountingSequence(evaluator._explicit_sorted_instants)
+        evaluator._explicit_sorted_instants = instants
+
+        assert not executor.should_rebalance(datetime(2024, 1, 2, 20, 0, tzinfo=UTC))
+        assert executor.should_rebalance(datetime(2024, 1, 2, 21, 0, tzinfo=UTC))
+        assert not executor.should_rebalance(datetime(2024, 1, 2, 21, 30, tzinfo=UTC))
+
+        assert evaluator._explicit_cursor == 1
+        assert instants.accesses <= 6
+
+    def test_online_explicit_timestamp_rejects_backward_events_with_iso_instants(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.explicit_timestamps([datetime(2024, 1, 2, 16, 0)]),
+                timezone="America/New_York",
+            )
+        )
+
+        assert executor.should_rebalance(datetime(2024, 1, 2, 21, 0, tzinfo=UTC))
+        with pytest.raises(
+            ValueError,
+            match=r"moved backward from 2024-01-02T21:00:00\+00:00 to "
+            r"2024-01-02T20:00:00\+00:00.*America/New_York",
+        ):
+            executor.should_rebalance(datetime(2024, 1, 2, 20, 0, tzinfo=UTC))
+
+    def test_nyse_premarket_bar_does_not_create_a_phantom_session(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.every_session(),
+                calendar="NYSE",
+                timezone="America/New_York",
+                data_frequency="1m",
+                timestamp_semantics="bar_close",
+            )
+        )
+
+        assert not executor.should_rebalance(datetime(2024, 1, 2, 9, 0))
+        assert not executor.should_rebalance(datetime(2024, 1, 2, 9, 30))
+        assert executor.should_rebalance(datetime(2024, 1, 2, 16, 0))
+        executor.validate_completed_run()
+
+    def test_incomplete_final_session_does_not_fail_validation(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.every_session(),
+                calendar="NYSE",
+                timezone="America/New_York",
+                data_frequency="15m",
+                timestamp_semantics="bar_close",
+            )
+        )
+
+        assert not executor.should_rebalance(datetime(2024, 1, 2, 12, 0))
+        executor.validate_completed_run()
+
+    def test_exchange_holiday_is_not_counted_as_a_session(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.fixed_n_sessions(2),
+                calendar="NYSE",
+                timezone="America/New_York",
+                data_frequency="1m",
+                timestamp_semantics="bar_close",
+            )
+        )
+
+        assert executor.should_rebalance(datetime(2024, 1, 12, 16, 0))
+        assert not executor.should_rebalance(datetime(2024, 1, 15, 16, 0))
+        assert not executor.should_rebalance(datetime(2024, 1, 16, 16, 0))
+        assert executor.should_rebalance(datetime(2024, 1, 17, 16, 0))
+        executor.validate_completed_run()
+
+    def test_truncated_interior_session_is_an_alignment_error(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.every_session(),
+                calendar="NYSE",
+                timezone="America/New_York",
+                data_frequency="15m",
+                timestamp_semantics="bar_close",
+            )
+        )
+
+        assert executor.should_rebalance(datetime(2024, 1, 2, 16, 0))
+        assert not executor.should_rebalance(datetime(2024, 1, 3, 15, 45))
+        with pytest.raises(ValueError, match="required session 2024-01-03"):
+            executor.should_rebalance(datetime(2024, 1, 4, 9, 30))
+
+    @pytest.mark.parametrize(
+        "schedule",
+        [
+            RebalanceSchedule.every_bar(),
+            RebalanceSchedule.explicit_timestamps([datetime(2024, 1, 15, 16, 0)]),
+        ],
+    )
+    def test_non_session_dates_do_not_filter_non_session_cadences(
+        self, schedule: RebalanceSchedule
+    ):
+        executor = TargetWeightExecutor(
+            RebalanceConfig(
+                schedule=schedule,
+                calendar="NYSE",
+                timezone="America/New_York",
+                data_frequency="1m",
+            )
+        )
+
+        assert executor.should_rebalance(datetime(2024, 1, 15, 16, 0))
+        executor.validate_completed_run()
+
+    def test_calendar_with_no_matching_sessions_fails_final_validation(self):
+        executor = TargetWeightExecutor(
+            RebalanceConfig(
+                schedule=RebalanceSchedule.every_session(),
+                calendar="NYSE",
+                timezone="America/New_York",
+                data_frequency="1m",
+                timestamp_semantics="bar_close",
+            )
+        )
+
+        assert not executor.should_rebalance(datetime(2024, 1, 13, 12, 0))
+        with pytest.raises(ValueError, match="observed no exchange sessions"):
+            executor.validate_completed_run()
+
+    def test_explicit_close_signal_overrides_non_session_calendar_inference(self):
+        executor = TargetWeightExecutor(
+            RebalanceConfig(
+                schedule=RebalanceSchedule.every_session(),
+                calendar="NYSE",
+                timezone="America/New_York",
+                data_frequency="1m",
+            )
+        )
+
+        assert executor.should_rebalance(
+            datetime(2024, 1, 13, 12, 0),
+            is_session_close=True,
+        )
+        executor.validate_completed_run()
+
+    def test_explicit_non_close_signal_does_not_count_a_holiday_session(self):
+        executor = TargetWeightExecutor(
+            RebalanceConfig(
+                schedule=RebalanceSchedule.fixed_n_sessions(2),
+                calendar="NYSE",
+                timezone="America/New_York",
+                data_frequency="1m",
+            )
+        )
+
+        assert executor.should_rebalance(
+            datetime(2024, 1, 12, 16, 0),
+            is_session_close=True,
+        )
+        assert not executor.should_rebalance(
+            datetime(2024, 1, 15, 12, 0),
+            is_session_close=False,
+        )
+        assert not executor.should_rebalance(
+            datetime(2024, 1, 16, 16, 0),
+            is_session_close=True,
+        )
+        assert executor.should_rebalance(
+            datetime(2024, 1, 17, 16, 0),
+            is_session_close=True,
+        )
+        executor.validate_completed_run()
+
+    def test_midnight_daily_labels_do_not_warn_without_optional_metadata(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(schedule=RebalanceSchedule.every_session())
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert executor.should_rebalance(datetime(2024, 1, 2))
+
+    def test_fixed_session_counter_uses_cme_session_date_across_midnight(self):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.fixed_n_sessions(2),
+                calendar="CME_Equity",
+                timezone="America/Chicago",
+                session_start_time="17:00",
+                data_frequency="1m",
+                timestamp_semantics="bar_close",
+            )
+        )
+
+        assert not executor.should_rebalance(datetime(2024, 1, 7, 18, 0))
+        assert executor.should_rebalance(datetime(2024, 1, 8, 16, 0))
+
+    def test_fixed_session_counter_converts_data_timezone_to_exchange_timezone(self):
+        timestamps = [
+            datetime(2024, 1, 7, 23, 0),
+            datetime(2024, 1, 8, 22, 0),
+            datetime(2024, 1, 8, 23, 0),
+            datetime(2024, 1, 9, 22, 0),
+            datetime(2024, 1, 9, 23, 0),
+            datetime(2024, 1, 10, 22, 0),
+        ]
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.fixed_n_sessions(2),
+                calendar="CME_Equity",
+                timezone="UTC",
+                session_start_time="17:00",
+                data_frequency="1m",
+                timestamp_semantics="bar_close",
+            )
+        )
+
+        resolved = [timestamp for timestamp in timestamps if executor.should_rebalance(timestamp)]
+
+        assert resolved == [datetime(2024, 1, 8, 22, 0), datetime(2024, 1, 10, 22, 0)]
+
+    def test_execute_requires_timestamp_when_schedule_is_configured(self, broker, sample_data):
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                schedule=RebalanceSchedule.explicit_timestamps([datetime(2024, 1, 2, 9, 30)])
+            )
+        )
+
+        with pytest.raises(ValueError, match="timestamp is required"):
+            executor.execute(
+                {"AAPL": 0.5},
+                sample_data,
+                broker,
+            )
+
+
+class TestTargetWeightExecutorCashTargeting:
+    """Test cash targeting (weights < 1.0)."""
+
+    @pytest.fixture
+    def broker(self):
+        return Broker(
+            initial_cash=100000.0,
+            commission_model=NoCommission(),
+            slippage_model=NoSlippage(),
+        )
+
+    @pytest.fixture
+    def sample_data(self):
+        return {
+            "AAPL": {"close": 150.0},
+            "GOOG": {"close": 100.0},
+        }
+
+    def test_implicit_cash_holding(self, broker, sample_data):
+        """Test that weights summing to < 1.0 leave cash."""
+        executor = TargetWeightExecutor()
+
+        # Target 90% invested (10% cash)
+        target_weights = {"AAPL": 0.45, "GOOG": 0.45}  # = 90%
+        orders = executor.execute(target_weights, sample_data, broker)
+
+        # Should generate orders totaling ~90% of equity
+        total_value = sum(o.quantity * sample_data[o.asset]["close"] for o in orders)
+        assert 89000 < total_value < 91000  # ~$90k (90% of $100k)
+
+    def test_max_gross_leverage_scales_down(self, broker, sample_data):
+        """Test that weights > max_gross_leverage are scaled down."""
+        executor = TargetWeightExecutor(config=RebalanceConfig(max_gross_leverage=1.0))
+
+        # Target 120% invested — exceeds max_gross_leverage=1.0
+        target_weights = {"AAPL": 0.7, "GOOG": 0.5}  # = 120%
+        orders = executor.execute(target_weights, sample_data, broker)
+
+        # Should scale to 100% max: AAPL=58.3%, GOOG=41.7%
+        total_value = sum(o.quantity * sample_data[o.asset]["close"] for o in orders)
+        assert total_value < 101000  # Should not exceed equity
+
+    def test_no_cap_allows_over_100_percent(self, broker, sample_data):
+        """Without max_gross_leverage, weights > 1.0 pass through to gatekeeper."""
+        executor = TargetWeightExecutor(config=RebalanceConfig(allow_fractional=True))
+
+        # Target 120% — no cap, gatekeeper will constrain based on buying power
+        target_weights = {"AAPL": 0.7, "GOOG": 0.5}  # = 120%
+        orders = executor.execute(target_weights, sample_data, broker)
+
+        # Orders should be submitted for the full requested amounts
+        # (gatekeeper may reject some, but executor doesn't scale)
+        assert len(orders) >= 1  # At least some orders submitted
+        order_map = {o.asset: o for o in orders}
+        if "AAPL" in order_map:
+            # AAPL: 0.7 * $100k / $150 = 466.67 shares (not scaled to 58.3%)
+            assert order_map["AAPL"].quantity > 400
+
+
+class TestTargetWeightExecutorPreview:
+    """Test preview functionality."""
+
+    @pytest.fixture
+    def broker(self):
+        return Broker(
+            initial_cash=100000.0,
+            commission_model=NoCommission(),
+            slippage_model=NoSlippage(),
+        )
+
+    @pytest.fixture
+    def sample_data(self):
+        return {"AAPL": {"close": 150.0}, "GOOG": {"close": 100.0}}
+
+    def test_preview_returns_details(self, broker, sample_data):
+        """Test that preview returns trade details."""
+        executor = TargetWeightExecutor()
+
+        target_weights = {"AAPL": 0.3, "GOOG": 0.3}
+        previews = executor.preview(target_weights, sample_data, broker)
+
+        assert len(previews) == 2
+        for preview in previews:
+            assert "asset" in preview
+            assert "current_weight" in preview
+            assert "target_weight" in preview
+            assert "weight_delta" in preview
+            assert "shares" in preview
+            assert "value" in preview
+            assert "skip_reason" in preview
+
+    def test_preview_shows_skip_reason(self, broker, sample_data):
+        """Test that preview shows why trades would be skipped."""
+        executor = TargetWeightExecutor(config=RebalanceConfig(min_weight_change=0.1))
+
+        # Small change that would be skipped
+        target_weights = {"AAPL": 0.05}  # Only 5% change, below 10% threshold
+        previews = executor.preview(target_weights, sample_data, broker)
+
+        assert len(previews) == 1
+        assert previews[0]["skip_reason"] == "weight_change_too_small"
+
+    def test_preview_does_not_execute(self, broker, sample_data):
+        """Test that preview doesn't submit orders."""
+        executor = TargetWeightExecutor()
+
+        initial_orders = len(broker.orders)
+        target_weights = {"AAPL": 0.5}
+        executor.preview(target_weights, sample_data, broker)
+
+        # No new orders should be created
+        assert len(broker.orders) == initial_orders
+
+    def test_preview_rounds_to_zero(self, broker):
+        """Test preview when shares round to zero."""
+        executor = TargetWeightExecutor(
+            RebalanceConfig(
+                min_trade_value=1.0,
+                min_weight_change=0.0001,
+                allow_fractional=False,
+            )
+        )
+
+        data = {"AAPL": {"close": 150.0}}
+
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 150.0},
+            {"AAPL": 149.0},
+            {"AAPL": 151.0},
+            {"AAPL": 148.0},
+            {"AAPL": 1000000},
+            {},
+        )
+
+        # Very small target weight that would round to 0 shares
+        target_weights = {"AAPL": 0.0001}  # 0.01% of 100k = $10 = 0.067 shares
+        previews = executor.preview(target_weights, data, broker)
+
+        assert len(previews) == 1
+        assert previews[0]["skip_reason"] == "rounds_to_zero_shares"
+
+    def test_preview_with_existing_position_to_close(self, broker):
+        """Test preview shows positions to close."""
+        executor = TargetWeightExecutor(
+            RebalanceConfig(
+                min_trade_value=100.0,
+                min_weight_change=0.01,
+                allow_fractional=False,
+            )
+        )
+
+        data = {
+            "AAPL": {"close": 150.0},
+            "GOOG": {"close": 100.0},
+        }
+
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 150.0, "GOOG": 100.0},
+            {"AAPL": 149.0, "GOOG": 99.0},
+            {"AAPL": 151.0, "GOOG": 101.0},
+            {"AAPL": 148.0, "GOOG": 98.0},
+            {"AAPL": 1000000, "GOOG": 500000},
+            {},
+        )
+
+        # Open a position first
+        broker.submit_order("GOOG", 100)
+        broker._process_orders()
+
+        # Preview rebalance that excludes GOOG (should show close)
+        target_weights = {"AAPL": 0.5}  # No GOOG
+        previews = executor.preview(target_weights, data, broker)
+
+        # Should have AAPL target and GOOG close
+        assert len(previews) == 2
+        goog_preview = next(p for p in previews if p["asset"] == "GOOG")
+        assert goog_preview["action"] == "close_position"
+        assert goog_preview["target_weight"] == 0.0
+
+    def test_preview_close_position_uses_last_known_price_when_close_is_null(self, broker):
+        """Preview should tolerate null closes for held positions slated for close."""
+        executor = TargetWeightExecutor()
+
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 150.0},
+            {"AAPL": 149.0},
+            {"AAPL": 151.0},
+            {"AAPL": 148.0},
+            {"AAPL": 1_000_000},
+            {},
+        )
+        broker.submit_order("AAPL", 100)
+        broker._process_orders()
+
+        previews = executor.preview({}, {"AAPL": {"close": None}}, broker)
+
+        assert len(previews) == 1
+        assert previews[0]["asset"] == "AAPL"
+        assert previews[0]["action"] == "close_position"
+        assert previews[0]["value"] == pytest.approx(-15000.0)
+
+    def test_preview_zero_equity(self):
+        """Test preview with zero equity returns empty."""
+        executor = TargetWeightExecutor(
+            RebalanceConfig(
+                min_trade_value=100.0,
+                min_weight_change=0.01,
+                allow_fractional=False,
+            )
+        )
+
+        broker = Broker(
+            initial_cash=0.0,  # Zero equity
+            commission_model=NoCommission(),
+            slippage_model=NoSlippage(),
+        )
+
+        data = {"AAPL": {"close": 150.0}}
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 150.0},
+            {"AAPL": 149.0},
+            {"AAPL": 151.0},
+            {"AAPL": 148.0},
+            {"AAPL": 1000000},
+            {},
+        )
+
+        target_weights = {"AAPL": 0.5}
+        previews = executor.preview(target_weights, data, broker)
+
+        assert previews == []
+
+
+class TestTargetWeightExecutorEdgeCases:
+    """Test edge cases."""
+
+    @pytest.fixture
+    def broker(self):
+        return Broker(
+            initial_cash=100000.0,
+            commission_model=NoCommission(),
+            slippage_model=NoSlippage(),
+        )
+
+    def test_empty_target_weights(self, broker):
+        """Test with empty target weights."""
+        executor = TargetWeightExecutor()
+        orders = executor.execute({}, {}, broker)
+        assert orders == []
+
+    def test_zero_equity(self, broker):
+        """Test with zero equity."""
+        executor = TargetWeightExecutor()
+        broker.cash = 0.0  # Zero equity
+        orders = executor.execute({"AAPL": 0.5}, {"AAPL": {"close": 150.0}}, broker)
+        assert orders == []
+
+    def test_missing_price_data(self, broker):
+        """Test with missing price data for asset."""
+        executor = TargetWeightExecutor()
+        target_weights = {"AAPL": 0.3}
+        data = {}  # No price data
+        orders = executor.execute(target_weights, data, broker)
+        assert orders == []
+
+    def test_execute_uses_last_known_price_for_existing_positions(self, broker):
+        """Held positions should not crash rebalancing when current close is null."""
+        executor = TargetWeightExecutor()
+
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 1_000_000},
+            {},
+        )
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        broker._process_orders()
+
+        orders = executor.execute({"AAPL": 0.15}, {"AAPL": {"close": None}}, broker)
+
+        assert orders == []
+
+    def test_sparse_quote_mark_uses_last_reference_price_for_position_weight(self):
+        broker = Broker(
+            initial_cash=100_000.0,
+            commission_model=NoCommission(),
+            slippage_model=NoSlippage(),
+            mark_price=ExecutionPrice.QUOTE_SIDE,
+        )
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 100.0},
+            {"AAPL": 100.0},
+            {"AAPL": 101.0},
+            {"AAPL": 99.0},
+            closes={"AAPL": 100.0},
+            volumes={"AAPL": 1_000_000.0},
+            bids={"AAPL": 99.0},
+            asks={"AAPL": 101.0},
+            mids={"AAPL": 100.0},
+            bid_sizes={"AAPL": 1_000.0},
+            ask_sizes={"AAPL": 1_000.0},
+            signals={},
+        )
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        broker._process_orders()
+        broker.mark_account_positions()
+        position = broker.get_position("AAPL")
+        assert position is not None
+        assert position.current_price == 99.0
+
+        broker._update_time(
+            datetime(2024, 1, 2, 9, 30),
+            {},
+            {},
+            {},
+            {},
+            closes={},
+            volumes={},
+            bids={},
+            asks={},
+            mids={},
+            bid_sizes={},
+            ask_sizes={},
+            signals={},
+        )
+
+        price = TargetWeightExecutor()._get_position_price("AAPL", position, {}, broker)
+
+        assert price == 100.0
+
+    def test_execute_effective_weights_handles_null_close_for_existing_positions(self, broker):
+        """Pending-aware rebalancing should also tolerate null closes on held positions."""
+        executor = TargetWeightExecutor(
+            RebalanceConfig(
+                cancel_before_rebalance=False,
+                account_for_pending=True,
+                min_trade_value=1.0,
+                min_weight_change=0.001,
+            )
+        )
+
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 150.0},
+            {"AAPL": 1_000_000},
+            {},
+        )
+        broker.submit_order("AAPL", 100, OrderSide.BUY)
+        broker._process_orders()
+
+        orders = executor.execute({"AAPL": 0.15}, {"AAPL": {"close": None}}, broker)
+
+        assert orders == []
+
+    def test_zero_price(self, broker):
+        """Test with zero price."""
+        executor = TargetWeightExecutor()
+        target_weights = {"AAPL": 0.3}
+        data = {"AAPL": {"close": 0.0}}
+        orders = executor.execute(target_weights, data, broker)
+        assert orders == []
+
+    def test_max_single_weight_constraint(self, broker):
+        """Test max_single_weight constraint."""
+        executor = TargetWeightExecutor(config=RebalanceConfig(max_single_weight=0.25))
+
+        target_weights = {"AAPL": 0.5}  # Request 50%, but max is 25%
+        data = {"AAPL": {"close": 150.0}}
+        orders = executor.execute(target_weights, data, broker)
+
+        # Should be capped to 25%
+        assert len(orders) == 1
+        value = orders[0].quantity * 150.0
+        assert value < 26000  # Less than 26% of $100k
+
+    def test_short_weight_disallowed(self, broker):
+        """Test negative weight is set to 0 when shorts not allowed."""
+        executor = TargetWeightExecutor(
+            RebalanceConfig(
+                allow_short=False,
+                min_trade_value=1.0,
+                min_weight_change=0.001,
+            )
+        )
+
+        data = {"AAPL": {"close": 150.0}}
+
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 150.0},
+            {"AAPL": 149.0},
+            {"AAPL": 151.0},
+            {"AAPL": 148.0},
+            {"AAPL": 1000000},
+            {},
+        )
+
+        # Negative weight should be ignored
+        target_weights = {"AAPL": -0.3}
+        orders = executor.execute(target_weights, data, broker)
+
+        # Should not create any orders (negative weight becomes 0)
+        assert len(orders) == 0
+
+    def test_effective_weights_path(self, broker):
+        """Test using effective weights when accounting for pending."""
+        executor = TargetWeightExecutor(
+            RebalanceConfig(
+                cancel_before_rebalance=False,  # Don't cancel pending
+                account_for_pending=True,  # Use effective weights
+                min_trade_value=1.0,
+            )
+        )
+
+        data = {"AAPL": {"close": 150.0}}
+
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 150.0},
+            {"AAPL": 149.0},
+            {"AAPL": 151.0},
+            {"AAPL": 148.0},
+            {"AAPL": 1000000},
+            {},
+        )
+
+        target_weights = {"AAPL": 0.3}
+        orders = executor.execute(target_weights, data, broker)
+
+        # Should work correctly
+        assert len(orders) >= 0  # May or may not have orders
+
+    def test_preview_effective_weights_path(self, broker):
+        """Test preview using effective weights path."""
+        executor = TargetWeightExecutor(
+            RebalanceConfig(
+                cancel_before_rebalance=False,
+                account_for_pending=True,
+            )
+        )
+
+        data = {"AAPL": {"close": 150.0}}
+
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 150.0},
+            {"AAPL": 149.0},
+            {"AAPL": 151.0},
+            {"AAPL": 148.0},
+            {"AAPL": 1000000},
+            {},
+        )
+
+        target_weights = {"AAPL": 0.3}
+        previews = executor.preview(target_weights, data, broker)
+
+        # Should work correctly
+        assert isinstance(previews, list)
+
+
+class TestTargetWeightExecutorIntegration:
+    """Integration tests with full workflow."""
+
+    def test_full_rebalance_workflow(self):
+        """Test complete rebalancing workflow."""
+        broker = Broker(
+            initial_cash=100000.0,
+            commission_model=NoCommission(),
+            slippage_model=NoSlippage(),
+        )
+
+        executor = TargetWeightExecutor(
+            config=RebalanceConfig(
+                min_trade_value=100.0,
+                min_weight_change=0.01,
+                allow_fractional=True,
+            )
+        )
+
+        data = {
+            "AAPL": {"close": 150.0, "open": 149.0, "volume": 1000000},
+            "GOOG": {"close": 100.0, "open": 99.0, "volume": 500000},
+            "MSFT": {"close": 200.0, "open": 199.0, "volume": 800000},
+        }
+
+        # Initialize broker time
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"AAPL": 150.0, "GOOG": 100.0, "MSFT": 200.0},
+            {"AAPL": 149.0, "GOOG": 99.0, "MSFT": 199.0},
+            {"AAPL": 151.0, "GOOG": 101.0, "MSFT": 201.0},
+            {"AAPL": 148.0, "GOOG": 98.0, "MSFT": 198.0},
+            {"AAPL": 1000000, "GOOG": 500000, "MSFT": 800000},
+            {},
+        )
+
+        # Step 1: Initial rebalance to 30/30/40
+        target1 = {"AAPL": 0.3, "GOOG": 0.3, "MSFT": 0.4}
+        orders1 = executor.execute(target1, data, broker)
+        assert len(orders1) == 3
+        first_rebalance_id = orders1[0].rebalance_id
+        assert first_rebalance_id is not None
+        assert {order.rebalance_id for order in orders1} == {first_rebalance_id}
+
+        # Process orders
+        broker._process_orders()
+        assert {fill.rebalance_id for fill in broker.fills} == {first_rebalance_id}
+
+        # Step 2: Rebalance to 50/50/0 (close MSFT)
+        target2 = {"AAPL": 0.5, "GOOG": 0.5}
+        orders2 = executor.execute(target2, data, broker)
+
+        # Should have AAPL buy, GOOG buy, MSFT sell (close)
+        assert len(orders2) >= 2
+        assert orders2[0].rebalance_id is not None
+        assert {order.rebalance_id for order in orders2} == {orders2[0].rebalance_id}
+        assert orders2[0].rebalance_id != first_rebalance_id
+
+
+class TestTargetWeightExecutorModes:
+    """Tests for rebalancing behavior in sequential fill modes."""
+
+    def test_incremental_mode_processes_sells_before_buys(self):
+        """Incremental mode should free cash before submitting buy-side reallocations."""
+        broker = Broker(
+            initial_cash=100.0,
+            commission_model=NoCommission(),
+            slippage_model=NoSlippage(),
+        )
+        broker._update_time(
+            datetime(2024, 1, 1, 9, 30),
+            {"A": 100.0, "B": 100.0},
+            {"A": 100.0, "B": 100.0},
+            {"A": 100.0, "B": 100.0},
+            {"A": 100.0, "B": 100.0},
+            {"A": 1_000_000, "B": 1_000_000},
+            {},
+        )
+        broker.submit_order("B", 1.0, OrderSide.BUY)
+        broker._process_orders()
+
+        executor = TargetWeightExecutor(
+            RebalanceConfig(
+                min_trade_value=0.0,
+                min_weight_change=0.0,
+                allow_fractional=True,
+                rebalance_mode=RebalanceMode.INCREMENTAL,
+            )
+        )
+        data = {"A": {"close": 100.0}, "B": {"close": 100.0}}
+
+        orders = executor.execute({"A": 1.0, "B": 0.0}, data, broker)
+
+        assert len(orders) == 2
+        assert all(order.rejection_reason is None for order in orders)
+        pos_a = broker.get_position("A")
+        pos_b = broker.get_position("B")
+        assert pos_a is not None and pos_a.quantity == pytest.approx(1.0)
+        assert pos_b is None

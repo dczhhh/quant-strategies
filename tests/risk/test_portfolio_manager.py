@@ -1,0 +1,550 @@
+"""Tests for RiskManager portfolio-level risk management."""
+
+from datetime import datetime, timedelta
+
+import polars as pl
+import pytest
+
+from ml4t.backtest import BacktestConfig, BacktestResult, DataFeed, Engine, Strategy
+from ml4t.backtest.broker import Broker
+from ml4t.backtest.models import NoCommission, NoSlippage
+from ml4t.backtest.risk.portfolio.limits import (
+    GrossExposureLimit,
+    MaxDrawdownLimit,
+    MaxExposureLimit,
+    MaxPositionsLimit,
+    PortfolioState,
+)
+from ml4t.backtest.risk.portfolio.manager import RiskManager
+from ml4t.backtest.types import ExitReason, OrderSide
+
+
+def mark_prices(broker: Broker, prices: dict[str, float]) -> None:
+    broker._update_time(
+        timestamp=datetime(2024, 1, 1, 9, 30),
+        prices=prices,
+        opens=prices,
+        highs=prices,
+        lows=prices,
+        volumes=dict.fromkeys(prices, 1000000.0),
+        signals={},
+    )
+
+
+def open_long_position(broker: Broker, asset: str, quantity: float, price: float) -> None:
+    mark_prices(broker, {asset: price})
+    broker.submit_order(asset, quantity, OrderSide.BUY)
+    broker._process_orders()
+    assert broker.positions[asset].quantity == quantity
+
+
+class TestRiskManagerInitialization:
+    """Test RiskManager initialization."""
+
+    def test_default_initialization(self):
+        """Test default RiskManager creation."""
+        manager = RiskManager()
+        assert manager.limits == []
+        assert not manager.is_halted
+        assert manager.halt_reason == ""
+        assert manager.warnings == []
+
+    def test_initialize_with_limits(self):
+        """Test RiskManager with limits."""
+        limits = [MaxDrawdownLimit(max_drawdown=0.20), MaxPositionsLimit(max_positions=5)]
+        manager = RiskManager(limits=limits)
+        assert len(manager.limits) == 2
+
+    def test_initialize_method(self):
+        """Test initialize() sets tracking state."""
+        manager = RiskManager()
+        ts = datetime(2024, 1, 1, 9, 30)
+        manager.initialize(initial_equity=100000.0, timestamp=ts)
+
+        assert manager._initial_equity == 100000.0
+        assert manager._high_water_mark == 100000.0
+        assert manager._daily_start_equity == 100000.0
+        assert manager._last_date == ts.date()
+        assert not manager._halted
+        assert manager._halt_reason == ""
+
+    def test_initialize_without_timestamp(self):
+        """Test initialize() without timestamp."""
+        manager = RiskManager()
+        manager.initialize(initial_equity=50000.0)
+
+        assert manager._initial_equity == 50000.0
+        assert manager._last_date is None
+
+
+class TestRiskManagerUpdate:
+    """Test RiskManager update method."""
+
+    def test_update_high_water_mark(self):
+        """Test high water mark updates on equity increase."""
+        manager = RiskManager()
+        manager.initialize(initial_equity=100000.0)
+
+        # Equity increases
+        manager.update(equity=110000.0, positions={"AAPL": 50000.0})
+        assert manager._high_water_mark == 110000.0
+
+        # Equity decreases (no update)
+        manager.update(equity=105000.0, positions={"AAPL": 45000.0})
+        assert manager._high_water_mark == 110000.0
+
+        # Equity increases again
+        manager.update(equity=115000.0, positions={"AAPL": 55000.0})
+        assert manager._high_water_mark == 115000.0
+
+    def test_update_new_trading_day(self):
+        """Test daily P&L reset on new day."""
+        manager = RiskManager()
+        ts1 = datetime(2024, 1, 1, 9, 30)
+        ts2 = datetime(2024, 1, 2, 9, 30)
+
+        manager.initialize(initial_equity=100000.0, timestamp=ts1)
+        manager.update(equity=105000.0, positions={}, timestamp=ts1)
+
+        # New day - daily start should reset
+        manager.update(equity=105000.0, positions={}, timestamp=ts2)
+        assert manager._daily_start_equity == 105000.0
+        assert manager._last_date == ts2.date()
+
+    def test_update_checks_all_limits(self):
+        """Test that update checks all configured limits."""
+        limits = [
+            MaxDrawdownLimit(max_drawdown=0.10),
+            MaxPositionsLimit(max_positions=2),
+        ]
+        manager = RiskManager(limits=limits)
+        manager.initialize(initial_equity=100000.0)
+
+        # Trigger drawdown limit
+        with pytest.warns(UserWarning, match="action='liquidate'"):
+            results = manager.update(equity=85000.0, positions={"A": 40000.0, "B": 45000.0})
+
+        # Should detect drawdown breach
+        assert len(results) >= 1
+        assert any("drawdown" in r.reason for r in results)
+
+    def test_update_halt_action(self):
+        """Test that halt action sets halted state."""
+        limits = [MaxDrawdownLimit(max_drawdown=0.10, action="halt")]
+        manager = RiskManager(limits=limits)
+        manager.initialize(initial_equity=100000.0)
+
+        manager.update(equity=85000.0, positions={})
+
+        assert manager.is_halted
+        assert "drawdown" in manager.halt_reason
+
+    def test_update_liquidate_action(self):
+        """Test that liquidate action also sets halted state."""
+        limits = [MaxDrawdownLimit(max_drawdown=0.10)]
+        manager = RiskManager(limits=limits)
+        manager.initialize(initial_equity=100000.0)
+
+        with pytest.warns(UserWarning, match="action='liquidate'"):
+            results = manager.update(equity=85000.0, positions={"AAPL": 40000.0})
+
+        assert any(result.action == "liquidate" for result in results)
+        assert manager.is_halted
+        assert "drawdown" in manager.halt_reason
+
+    def test_update_liquidate_action_flattens_with_broker(self):
+        """Test liquidate action auto-flattens positions when broker is provided."""
+        limits = [MaxDrawdownLimit(max_drawdown=0.10)]
+        manager = RiskManager(limits=limits)
+        manager.initialize(initial_equity=100000.0)
+        broker = Broker(
+            initial_cash=100000.0,
+            commission_model=NoCommission(),
+            slippage_model=NoSlippage(),
+        )
+        open_long_position(broker, "AAPL", 100.0, 150.0)
+        mark_prices(broker, {"AAPL": 150.0})
+
+        results = manager.update(
+            equity=85000.0,
+            positions={"AAPL": 15000.0},
+            broker=broker,
+        )
+
+        assert any(result.action == "liquidate" for result in results)
+        assert manager.is_halted
+        pending = broker.get_pending_orders()
+        assert len(pending) == 1
+        assert pending[0]._exit_reason == ExitReason.RISK_LIQUIDATION
+
+    def test_update_liquidate_action_is_idempotent_with_broker(self):
+        """Persistent breaches should not queue duplicate liquidation orders."""
+        limits = [MaxDrawdownLimit(max_drawdown=0.10)]
+        manager = RiskManager(limits=limits)
+        manager.initialize(initial_equity=100000.0)
+        broker = Broker(
+            initial_cash=100000.0,
+            commission_model=NoCommission(),
+            slippage_model=NoSlippage(),
+        )
+        open_long_position(broker, "AAPL", 100.0, 150.0)
+        mark_prices(broker, {"AAPL": 150.0})
+
+        manager.update(equity=85000.0, positions={"AAPL": 15000.0}, broker=broker)
+        manager.update(equity=84000.0, positions={"AAPL": 15000.0}, broker=broker)
+
+        pending = broker.get_pending_orders()
+        assert len(pending) == 1
+        assert pending[0]._exit_reason == ExitReason.RISK_LIQUIDATION
+
+    @pytest.mark.parametrize("immediate_fill", [True, False])
+    def test_liquidation_cause_survives_fill_trade_and_artifact(
+        self,
+        immediate_fill: bool,
+        tmp_path,
+    ):
+        manager = RiskManager(limits=[MaxDrawdownLimit(max_drawdown=0.10)])
+        manager.initialize(initial_equity=100000.0)
+        broker = Broker(
+            initial_cash=100000.0,
+            commission_model=NoCommission(),
+            slippage_model=NoSlippage(),
+            immediate_fill=immediate_fill,
+        )
+        open_long_position(broker, "AAPL", 100.0, 150.0)
+
+        manager.update(equity=85000.0, positions={"AAPL": 15000.0}, broker=broker)
+        manager.update(equity=84000.0, positions={"AAPL": 15000.0}, broker=broker)
+        if not immediate_fill:
+            broker._process_orders()
+
+        liquidation_orders = [
+            order for order in broker.orders if order._exit_reason == ExitReason.RISK_LIQUIDATION
+        ]
+        assert len(liquidation_orders) == 1
+        detail = liquidation_orders[0]._risk_exit_reason
+        assert detail and "drawdown" in detail.lower()
+
+        exit_fill = broker.fills[-1]
+        exit_trade = broker.trades[-1]
+        assert broker.fills[0].exit_reason == ""
+        assert exit_fill.exit_reason == "risk_liquidation"
+        assert exit_fill.exit_reason_detail == detail
+        assert exit_trade.exit_reason == "risk_liquidation"
+        assert exit_trade.exit_reason_detail == detail
+
+        result = BacktestResult(
+            trades=broker.trades,
+            equity_curve=[],
+            fills=broker.fills,
+            metrics={},
+        )
+        result.to_parquet(tmp_path)
+        loaded = BacktestResult.from_parquet(tmp_path)
+        assert loaded.fills[-1].exit_reason == "risk_liquidation"
+        assert loaded.fills[-1].exit_reason_detail == detail
+        assert loaded.trades[-1].exit_reason == "risk_liquidation"
+        assert loaded.trades[-1].exit_reason_detail == detail
+
+    def test_update_warn_action(self):
+        """Test that warn action adds to warnings."""
+        limits = [MaxExposureLimit(max_exposure_pct=0.50, action="warn")]
+        manager = RiskManager(limits=limits)
+        manager.initialize(initial_equity=100000.0)
+
+        manager.update(equity=100000.0, positions={"AAPL": 60000.0})
+
+        assert not manager.is_halted
+        assert len(manager.warnings) >= 1
+        assert any("exposure" in w for w in manager.warnings)
+
+
+class TestRiskManagerBuildState:
+    """Test _build_state method."""
+
+    def test_build_state_basic(self):
+        """Test basic state building."""
+        manager = RiskManager()
+        manager.initialize(initial_equity=100000.0)
+        manager._high_water_mark = 110000.0
+        manager._daily_start_equity = 95000.0
+
+        state = manager._build_state(
+            equity=100000.0,
+            positions={"AAPL": 30000.0, "GOOG": -20000.0},
+            timestamp=datetime(2024, 1, 1),
+        )
+
+        assert state.equity == 100000.0
+        assert state.initial_equity == 100000.0
+        assert state.high_water_mark == 110000.0
+        assert abs(state.current_drawdown - 0.0909) < 0.001  # ~9.09%
+        assert state.num_positions == 2
+        assert state.daily_pnl == 5000.0  # 100000 - 95000
+        assert state.gross_exposure == 50000.0  # |30000| + |-20000|
+        assert state.net_exposure == 10000.0  # 30000 - 20000
+
+    def test_build_state_zero_high_water_mark(self):
+        """Test state building with zero high water mark."""
+        manager = RiskManager()
+        manager.initialize(initial_equity=0.0)
+
+        state = manager._build_state(equity=0.0, positions={}, timestamp=None)
+
+        assert state.current_drawdown == 0.0
+
+
+class TestRiskManagerPermissions:
+    """Test permission checking methods."""
+
+    def test_can_open_position_not_halted(self):
+        """Test can_open_position returns True when not halted."""
+        manager = RiskManager()
+        assert manager.can_open_position()
+
+    def test_can_open_position_halted(self):
+        """Test can_open_position returns False when halted."""
+        manager = RiskManager()
+        manager._halted = True
+        assert not manager.can_open_position()
+
+    def test_can_increase_position_not_halted(self):
+        """Test can_increase_position when not halted."""
+        manager = RiskManager()
+        allowed, reason = manager.can_increase_position("AAPL", 10000.0)
+        assert allowed
+        assert reason == ""
+
+    def test_can_increase_position_halted(self):
+        """Test can_increase_position when halted."""
+        manager = RiskManager()
+        manager._halted = True
+        manager._halt_reason = "drawdown breach"
+
+        allowed, reason = manager.can_increase_position("AAPL", 10000.0)
+        assert not allowed
+        assert reason == "drawdown breach"
+
+
+class TestRiskManagerProperties:
+    """Test property accessors."""
+
+    def test_is_halted_property(self):
+        """Test is_halted property."""
+        manager = RiskManager()
+        assert not manager.is_halted
+
+        manager._halted = True
+        assert manager.is_halted
+
+    def test_halt_reason_property(self):
+        """Test halt_reason property."""
+        manager = RiskManager()
+        assert manager.halt_reason == ""
+
+        manager._halt_reason = "test reason"
+        assert manager.halt_reason == "test reason"
+
+    def test_warnings_property(self):
+        """Test warnings property."""
+        manager = RiskManager()
+        assert manager.warnings == []
+
+        manager._warnings = ["warning1", "warning2"]
+        assert manager.warnings == ["warning1", "warning2"]
+
+    def test_current_drawdown_property(self):
+        """Test current_drawdown property."""
+        manager = RiskManager()
+        # Default returns 0.0 (both HWM and last_equity are 0)
+        assert manager.current_drawdown == 0.0
+
+        # Initialize properly to test drawdown calculation
+        manager.initialize(100000.0)
+        assert manager.current_drawdown == 0.0  # No drawdown at start
+
+        # Simulate a drawdown via update
+        manager.update(90000.0, {})  # 10% drawdown
+        assert manager.current_drawdown == 0.1  # (100000 - 90000) / 100000
+
+
+class TestRiskManagerReset:
+    """Test reset functionality."""
+
+    def test_reset_halt(self):
+        """Test reset_halt clears halt state."""
+        manager = RiskManager()
+        manager._halted = True
+        manager._halt_reason = "some reason"
+
+        manager.reset_halt()
+
+        assert not manager._halted
+        assert manager._halt_reason == ""
+
+
+class TestRiskManagerGetState:
+    """Test get_state method."""
+
+    def test_get_state(self):
+        """Test get_state returns correct PortfolioState."""
+        manager = RiskManager()
+        manager.initialize(initial_equity=100000.0)
+        manager._last_date = datetime(2024, 1, 1).date()
+
+        state = manager.get_state(equity=95000.0, positions={"AAPL": 45000.0})
+
+        assert isinstance(state, PortfolioState)
+        assert state.equity == 95000.0
+        assert state.initial_equity == 100000.0
+        assert state.num_positions == 1
+
+
+class TestRiskManagerIntegration:
+    """Integration tests for RiskManager."""
+
+    def test_drawdown_reduction_fills_once_in_complete_backtest(self):
+        class ReducingStrategy(Strategy):
+            def on_start(self, broker):
+                self.manager = RiskManager(
+                    limits=[
+                        MaxDrawdownLimit(
+                            max_drawdown=0.10,
+                            action="reduce",
+                            reduction_pct=0.5,
+                        )
+                    ]
+                )
+                self.manager.initialize(initial_equity=broker.get_account_value())
+                self.breaches = []
+
+            def on_data(self, timestamp, data, context, broker):
+                position = broker.get_position("A")
+                results = self.manager.update(
+                    equity=broker.get_account_value(),
+                    positions={"A": position.market_value} if position is not None else {},
+                    timestamp=timestamp,
+                    broker=broker,
+                )
+                self.breaches.extend(result for result in results if result.action == "reduce")
+                if timestamp == datetime(2024, 1, 1):
+                    broker.submit_order("A", 10)
+
+        dates = [datetime(2024, 1, 1) + timedelta(days=i) for i in range(5)]
+        prices = pl.DataFrame(
+            {
+                "timestamp": dates,
+                "asset": ["A"] * 5,
+                "open": [100.0, 100.0, 80.0, 80.0, 80.0],
+                "high": [100.0, 100.0, 80.0, 80.0, 80.0],
+                "low": [100.0, 100.0, 80.0, 80.0, 80.0],
+                "close": [100.0, 100.0, 80.0, 80.0, 80.0],
+                "volume": [1000] * 5,
+            }
+        )
+        strategy = ReducingStrategy()
+        result = Engine(
+            feed=DataFeed(prices_df=prices),
+            strategy=strategy,
+            config=BacktestConfig(initial_cash=1000),
+        ).run()
+
+        fills = result.to_fills_dataframe()
+        assert fills.height == 2
+        assert fills["quantity"].to_list() == [10.0, 5.0]
+        assert fills["exit_reason_detail"].to_list()[1] == (
+            "risk reduction: drawdown 20.0% >= 10.0%"
+        )
+        assert all(breach.reduction_pct == 0.5 for breach in strategy.breaches)
+        final = result.to_portfolio_state_dataframe().tail(1).row(0, named=True)
+        assert final["gross_exposure"] == 400.0
+        assert final["cash"] == 400.0
+
+    def test_new_breach_after_recovery_reduces_again(self):
+        manager = RiskManager(
+            limits=[MaxDrawdownLimit(max_drawdown=0.10, action="reduce", reduction_pct=0.5)]
+        )
+        manager.initialize(initial_equity=100000.0)
+        broker = Broker(
+            initial_cash=100000.0,
+            commission_model=NoCommission(),
+            slippage_model=NoSlippage(),
+        )
+        open_long_position(broker, "AAPL", 100.0, 150.0)
+        mark_prices(broker, {"AAPL": 150.0})
+
+        manager.update(equity=80000.0, positions={"AAPL": 15000.0}, broker=broker)
+        manager.update(equity=79000.0, positions={"AAPL": 15000.0}, broker=broker)
+        assert len(broker.get_pending_orders()) == 1
+        broker._process_orders()
+        assert broker.positions["AAPL"].quantity == 50.0
+
+        manager.update(equity=100000.0, positions={"AAPL": 7500.0}, broker=broker)
+        manager.update(equity=80000.0, positions={"AAPL": 7500.0}, broker=broker)
+        assert len(broker.get_pending_orders()) == 1
+        assert broker.get_pending_orders()[0].quantity == 25.0
+
+    def test_reduction_without_broker_does_not_change_manager_state(self):
+        manager = RiskManager(
+            limits=[MaxDrawdownLimit(max_drawdown=0.10, action="reduce", reduction_pct=0.5)]
+        )
+        manager.initialize(initial_equity=100.0)
+
+        with pytest.raises(ValueError, match="broker"):
+            manager.update(equity=80.0, positions={"A": 80.0})
+
+        assert manager.current_drawdown == 0.0
+        assert not manager.is_halted
+
+    def test_full_workflow(self):
+        """Test complete RiskManager workflow."""
+        limits = [
+            MaxDrawdownLimit(max_drawdown=0.20, warn_threshold=0.10),
+            MaxPositionsLimit(max_positions=3),
+        ]
+        manager = RiskManager(limits=limits)
+
+        # Initialize
+        ts = datetime(2024, 1, 1, 9, 30)
+        manager.initialize(initial_equity=100000.0, timestamp=ts)
+
+        # Normal update - no breaches
+        results = manager.update(equity=102000.0, positions={"AAPL": 50000.0}, timestamp=ts)
+        assert len(results) == 0
+        assert manager.can_open_position()
+
+        # Drawdown warning (12.7% from 102000 to 89000)
+        results = manager.update(equity=89000.0, positions={"AAPL": 45000.0}, timestamp=ts)
+        assert any(r.action == "warn" for r in results)
+        assert manager.can_open_position()  # Warn doesn't halt
+
+        # Drawdown breach - liquidate (21.6% from 102000 to 80000)
+        with pytest.warns(UserWarning, match="action='liquidate'"):
+            results = manager.update(equity=80000.0, positions={"AAPL": 40000.0}, timestamp=ts)
+        assert any(r.action == "liquidate" for r in results)
+        assert manager.is_halted
+        assert not manager.can_open_position()
+
+        # Reset and continue
+        manager.reset_halt()
+        assert manager.can_open_position()
+
+    def test_multiple_limit_breaches(self):
+        """Test that all breaches are reported."""
+        limits = [
+            MaxDrawdownLimit(max_drawdown=0.10),
+            MaxPositionsLimit(max_positions=2),
+            GrossExposureLimit(max_gross_exposure=1.0),
+        ]
+        manager = RiskManager(limits=limits)
+        manager.initialize(initial_equity=100000.0)
+
+        # Trigger multiple breaches
+        with pytest.warns(UserWarning, match="action='liquidate'"):
+            results = manager.update(
+                equity=80000.0,  # 20% drawdown
+                positions={"A": 50000.0, "B": 40000.0, "C": 30000.0},  # 3 positions, 150% gross
+            )
+
+        # Should detect multiple breaches
+        assert len(results) >= 2

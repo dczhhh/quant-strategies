@@ -1,0 +1,335 @@
+"""Pluggable commission and slippage models."""
+
+import math
+from copy import deepcopy
+from typing import Protocol, runtime_checkable
+
+# === Protocols ===
+
+
+@runtime_checkable
+class CommissionModel(Protocol):
+    """Return a non-negative fee for a proposed or executed fill.
+
+    Pre-trade estimates call ``calculate`` on a deep copy. Only the fill-time
+    result on the original model is charged. Stateful models can advance tiers
+    on filled executions, but must support deepcopy and avoid external effects
+    from ``calculate`` because those cannot be isolated by copying.
+    """
+
+    def calculate(self, asset: str, quantity: float, price: float) -> float: ...
+
+
+@runtime_checkable
+class SlippageModel(Protocol):
+    """Protocol for slippage/market impact calculation."""
+
+    def calculate(
+        self, asset: str, quantity: float, price: float, volume: float | None
+    ) -> float: ...
+
+
+def calculate_commission(
+    model: CommissionModel,
+    asset: str,
+    quantity: float,
+    price: float,
+) -> float:
+    value = model.calculate(asset, quantity, price)
+    return _validate_nonnegative_model_output("commission", model, value)
+
+
+def estimate_commission(
+    model: CommissionModel,
+    asset: str,
+    quantity: float,
+    price: float,
+) -> float:
+    """Estimate a fee without advancing a stateful model's execution state."""
+    try:
+        estimate_model = deepcopy(model)
+    except Exception as exc:
+        raise TypeError("commission model must support deepcopy for pre-trade estimates") from exc
+    if estimate_model is model:
+        raise TypeError("commission model deepcopy must return an independent instance")
+    return calculate_commission(estimate_model, asset, quantity, price)
+
+
+def calculate_slippage(
+    model: SlippageModel,
+    asset: str,
+    quantity: float,
+    price: float,
+    volume: float | None,
+) -> float:
+    value = model.calculate(asset, quantity, price, volume)
+    return _validate_nonnegative_model_output("slippage", model, value)
+
+
+def _validate_nonnegative_model_output(kind: str, model: object, value: float) -> float:
+    model_name = type(model).__name__
+    try:
+        numeric_value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid {kind} from {model_name}: expected a finite non-negative number, "
+            f"got {value!r}"
+        ) from exc
+    if not math.isfinite(numeric_value) or numeric_value < 0.0:
+        raise ValueError(
+            f"Invalid {kind} from {model_name}: expected a finite non-negative number, "
+            f"got {value!r}"
+        )
+    return numeric_value
+
+
+# === Commission Models ===
+
+
+class NoCommission:
+    """Zero commission."""
+
+    def calculate(self, asset: str, quantity: float, price: float) -> float:
+        return 0.0
+
+
+class PercentageCommission:
+    """Commission as percentage of trade value."""
+
+    def __init__(self, rate: float = 0.0):
+        self.rate = rate
+
+    def calculate(self, asset: str, quantity: float, price: float) -> float:
+        return abs(quantity * price * self.rate)
+
+
+class PerShareCommission:
+    """Fixed commission per share with optional minimum."""
+
+    def __init__(self, per_share: float = 0.0, minimum: float = 0.0):
+        self.per_share = per_share
+        self.minimum = minimum
+
+    def calculate(self, asset: str, quantity: float, price: float) -> float:
+        return max(abs(quantity) * self.per_share, self.minimum)
+
+
+class TieredCommission:
+    """Tiered commission based on trade value."""
+
+    def __init__(self, tiers: list[tuple[float, float]]):
+        # [(threshold, rate), ...] e.g. [(10000, 0.001), (50000, 0.0008), (inf, 0.0005)]
+        self.tiers = sorted(tiers, key=lambda x: x[0])
+
+    def calculate(self, asset: str, quantity: float, price: float) -> float:
+        value = abs(quantity * price)
+        for threshold, rate in self.tiers:
+            if value <= threshold:
+                return value * rate
+        return value * self.tiers[-1][1]
+
+
+class CombinedCommission:
+    """Combined percentage + fixed commission per trade."""
+
+    def __init__(self, percentage: float = 0.0, fixed: float = 0.0):
+        self.percentage = percentage
+        self.fixed = fixed
+
+    def calculate(self, asset: str, quantity: float, price: float) -> float:
+        value = abs(quantity * price)
+        return value * self.percentage + self.fixed
+
+
+class FuturesCommission:
+    """PySystemTrade-compatible futures commission cost calculator.
+
+    Calculates commission as the MAX of three cost components:
+    1. per_trade: Fixed cost per trade (regardless of size)
+    2. per_block: Cost per contract (block)
+    3. percentage: Percentage of notional value (qty * price * multiplier)
+
+    This matches PySystemTrade's formula:
+        total = max(per_trade, per_block * abs(qty), percentage * notional)
+
+    Note: When used without explicit multiplier (default=1.0), the per_block
+    and per_trade components work correctly. The percentage component requires
+    the actual contract multiplier for accurate notional-based commission.
+
+    Reference: sysobjects/instruments.py in PySystemTrade
+
+    Args:
+        per_trade: Fixed cost per trade in currency units (default 0.0)
+        per_block: Cost per contract/block (default 0.0)
+        percentage: Percentage of notional as decimal (e.g., 0.0001 = 1bp)
+
+    Example:
+        # Interactive Brokers ES futures: $2.25 per contract
+        comm = FuturesCommission(per_block=2.25)
+
+        # With 10 ES at $4000: max(0, 2.25*10, 0) = $22.50
+        cost = comm.calculate("ES", 10, 4000.0, multiplier=50.0)
+
+        # Percentage-based: 1bp on notional
+        comm = FuturesCommission(percentage=0.0001)
+        # 10 ES at $4000 = $2M notional, 1bp = $200
+        cost = comm.calculate("ES", 10, 4000.0, multiplier=50.0)
+    """
+
+    def __init__(
+        self,
+        per_trade: float = 0.0,
+        per_block: float = 0.0,
+        percentage: float = 0.0,
+    ):
+        self.per_trade = per_trade
+        self.per_block = per_block
+        self.percentage = percentage
+
+    def calculate(
+        self, asset: str, quantity: float, price: float, multiplier: float = 1.0
+    ) -> float:
+        """Calculate commission for a futures trade.
+
+        Args:
+            asset: Asset symbol (unused, for protocol compatibility)
+            quantity: Number of contracts (signed, will use absolute value)
+            price: Contract price
+            multiplier: Contract multiplier (point value)
+
+        Returns:
+            Commission in currency units (MAX of the three components)
+        """
+        notional = abs(quantity) * price * multiplier
+        return max(
+            self.per_trade,
+            self.per_block * abs(quantity),
+            self.percentage * notional,
+        )
+
+
+# === Slippage Models ===
+
+
+class NoSlippage:
+    """Zero slippage."""
+
+    def calculate(self, asset: str, quantity: float, price: float, volume: float | None) -> float:
+        return 0.0
+
+
+class FixedSlippage:
+    """Fixed slippage per share (per-unit price adjustment).
+
+    The amount is added to the fill price for buys and subtracted for sells.
+    For example, with amount=0.01:
+    - Buy at $100.00 fills at $100.01
+    - Sell at $100.00 fills at $99.99
+    """
+
+    def __init__(self, amount: float = 0.0):
+        self.amount = amount
+
+    def calculate(self, asset: str, quantity: float, price: float, volume: float | None) -> float:
+        # Return per-unit price adjustment (same as PercentageSlippage contract)
+        # Broker adds this to fill price: fill = base_price ± slippage
+        return self.amount
+
+
+class SpreadSlippage:
+    """Approximate bid-ask spread cost in currency units.
+
+    The model returns a per-unit price adjustment to be applied on top of the
+    configured execution price. By default, input values are treated as full
+    quoted spreads and converted to half-spread crossing cost per side.
+    """
+
+    def __init__(
+        self,
+        spread: float = 0.0,
+        asset_spreads: dict[str, float] | None = None,
+        convention: str = "full_spread",
+    ):
+        self.spread = spread
+        self.asset_spreads = asset_spreads or {}
+        self.convention = convention
+
+    def calculate(self, asset: str, quantity: float, price: float, volume: float | None) -> float:
+        spread = self.asset_spreads.get(asset, self.spread)
+        if self.convention == "full_spread":
+            return spread / 2.0
+        return spread
+
+
+class PercentageSlippage:
+    """Slippage as percentage of price (per-unit price adjustment)."""
+
+    def __init__(self, rate: float = 0.0):
+        self.rate = rate
+
+    def calculate(self, asset: str, quantity: float, price: float, volume: float | None) -> float:
+        # Return per-unit price adjustment (not total dollars)
+        # Broker adds this to fill price: fill = base_price ± slippage
+        return price * self.rate
+
+
+class VolumeShareSlippage:
+    """Slippage based on order size vs volume (market impact)."""
+
+    def __init__(self, impact_factor: float = 0.0):
+        self.impact_factor = impact_factor
+
+    def calculate(self, asset: str, quantity: float, price: float, volume: float | None) -> float:
+        if volume is None or volume == 0:
+            return 0.0
+        volume_fraction = abs(quantity) / volume
+        impact = volume_fraction * self.impact_factor
+        # Return per-unit price adjustment (not total dollars)
+        return price * impact
+
+
+class FuturesSlippage:
+    """Futures slippage cost calculator.
+
+    Calculates total slippage cost in currency units for portfolio cost
+    analysis and position sizing. Based on PySystemTrade's formula:
+        slippage = abs(qty) * price_slippage_points * multiplier
+
+    Note: This returns TOTAL cost, not per-unit price adjustment. It is
+    designed for direct cost analysis, not for use as a FillExecutor
+    slippage model (which expects per-unit returns). For fill-time
+    slippage on futures, use PercentageSlippage or FixedSlippage.
+
+    Args:
+        slippage_points: Slippage in price points per contract (default 0.0)
+
+    Example:
+        slip = FuturesSlippage(slippage_points=0.25)
+        # 2 ES contracts: 2 * 0.25 * 50 = $25 total cost
+        cost = slip.calculate("ES", 2, 4000.0, multiplier=50.0)
+    """
+
+    def __init__(self, slippage_points: float = 0.0):
+        self.slippage_points = slippage_points
+
+    def calculate(
+        self,
+        asset: str,
+        quantity: float,
+        price: float,
+        volume: float | None = None,
+        multiplier: float = 1.0,
+    ) -> float:
+        """Calculate total slippage cost for a futures trade.
+
+        Args:
+            asset: Asset symbol (unused, for signature compatibility)
+            quantity: Number of contracts (signed, uses absolute value)
+            price: Contract price (unused in this model)
+            volume: Bar volume (unused, for signature compatibility)
+            multiplier: Contract multiplier (point value)
+
+        Returns:
+            Total slippage cost in currency units
+        """
+        return abs(quantity) * self.slippage_points * multiplier
