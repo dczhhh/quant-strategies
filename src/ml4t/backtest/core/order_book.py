@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -99,6 +100,9 @@ class OrderBook:
         order._signal_price = self.market.prices.get(asset)
 
         self.orders.orders.append(order)
+
+        if broker.us_cash_account and not broker.reserve_cash_order(order):
+            return order
 
         # Immediate fill: same-bar market orders fill during submit_order()
         # instead of being queued for later _process_orders(). Each order
@@ -254,6 +258,14 @@ class OrderBook:
 
         for order in self.orders.pending:
             if order.order_id == order_id:
+                if self.broker.us_cash_account:
+                    candidate = replace(order, **kwargs)
+                    if not self.broker.reserve_cash_order(candidate, candidate.quantity):
+                        return False
+                    order.__dict__.update(candidate.__dict__)
+                    if order_id in self.orders.partial_quantities:
+                        self.orders.partial_quantities[order_id] = candidate.quantity
+                    return True
                 for key, value in kwargs.items():
                     setattr(order, key, value)
                 return True

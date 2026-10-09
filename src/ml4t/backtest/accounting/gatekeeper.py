@@ -46,6 +46,7 @@ class Gatekeeper:
         cash_buffer_pct: float = 0.0,
         settlement_reduces_buying_power: bool = True,
         multiplier_resolver: Callable[[str], float] | None = None,
+        reserved_cash_resolver: Callable[[str], float] | None = None,
     ):
         """Initialize gatekeeper with account and commission model.
 
@@ -62,8 +63,9 @@ class Gatekeeper:
         self.cash_buffer_pct = cash_buffer_pct
         self.settlement_reduces_buying_power = settlement_reduces_buying_power
         self.multiplier_resolver = multiplier_resolver or (lambda _asset: 1.0)
+        self.reserved_cash_resolver = reserved_cash_resolver or (lambda _order_id: 0.0)
 
-    def _available_cash(self) -> float:
+    def _available_cash(self, order_id: str = "") -> float:
         """Cash available for new orders after applying buffer reserve and settlement holds."""
         if getattr(
             self.account.policy, "short_cash_policy", None
@@ -77,8 +79,8 @@ class Gatekeeper:
         if self.settlement_reduces_buying_power:
             spendable -= self.account.unsettled_cash
         if self.cash_buffer_pct > 0 and spendable > 0:
-            return spendable * (1.0 - self.cash_buffer_pct)
-        return spendable
+            spendable *= 1.0 - self.cash_buffer_pct
+        return spendable - self.reserved_cash_resolver(order_id)
 
     def validate_order(self, order: Order, price: float) -> tuple[bool, str]:
         """Validate order before execution.
@@ -172,7 +174,7 @@ class Gatekeeper:
         commission = calculate_commission(self.commission_model, order.asset, order.quantity, price)
 
         # Use buffered cash (reserves cash_buffer_pct for safety margin)
-        available = self._available_cash()
+        available = self._available_cash(order.order_id)
 
         # Validate based on whether we have an existing position
         if current_qty == 0.0:

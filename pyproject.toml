@@ -169,6 +169,7 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = [
     "-ra",
+    "-m", "not upstream_evidence",
     "--strict-markers",
     "--ignore=tests/private",  # Exclude private/commercial dependency tests
     "--ignore=tests/validation",  # Exclude optional cross-framework validation tests
@@ -177,6 +178,7 @@ addopts = [
     "--cov-report=html",
 ]
 markers = [
+    "upstream_evidence: source-bound publication checks for archived upstream cross-framework evidence; opt in with -m upstream_evidence after revalidation",
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
     "benchmark: marks benchmark tests",

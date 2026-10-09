@@ -91,6 +91,12 @@ Auto-generated from source docstrings.
         - equity
         - get_account_value
         - get_buying_power
+        - settled_cash
+        - unsettled_cash
+        - reserved_cash
+        - reserve_cash_order
+        - validate_cash_fill
+        - settle_cash_fill
         - get_trades
         - trades
         - fills

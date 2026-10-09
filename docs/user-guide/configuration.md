@@ -124,6 +124,7 @@ separate assumption layer.
 | `initial_cash` | float | 100,000 | Starting cash balance |
 | `allow_short_selling` | bool | False | Enable short positions |
 | `allow_leverage` | bool | False | Enable margin borrowing |
+| `us_cash_account` | bool | False | Strict USD equity cash rules, dated settlement and pending-order cash reservations; enabled by `us_cash_equities` |
 | `initial_margin` | float | 0.5 | Reg T initial margin (50%) |
 | `long_maintenance_margin` | float | 0.25 | Long position maintenance |
 | `short_maintenance_margin` | float | 0.30 | Short position maintenance |
@@ -235,6 +236,12 @@ friction:
 |-----------|------|---------|-------------|
 | `settlement_delay` | int | 0 | Bars until sale proceeds are spendable (T+N) |
 | `settlement_reduces_buying_power` | bool | True | Unsettled cash reduces buying power |
+| `settlement_holidays` | tuple[str, ...] | () | Extra official US settlement closures as ISO dates; used by `us_cash_account` |
+
+The `us_cash_equities` preset uses a separate settlement calendar with the T+N
+regime effective on the actual fill date, rather than `settlement_delay` bars.
+See [the cash-account guide](../us-cash-account.md) for dated holidays, supported
+history, reservations, fractional shares and current scope.
 
 ### Order Handling
 

@@ -34,6 +34,8 @@ class FillEngine:
 
     def get_available_cash(self) -> float:
         broker = self.broker
+        if broker.us_cash_account:
+            return broker.get_buying_power()
         if (
             broker.short_cash_policy.value == "lock_notional"
             and not broker.account.policy.allow_leverage

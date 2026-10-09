@@ -27,10 +27,12 @@ def test_legacy_accepted_evidence_cannot_generate_current_claims() -> None:
         generate_parity_claims._validate_evidence(correctness, large_scale, real_strategy)
 
 
+@pytest.mark.upstream_evidence
 def test_generated_claims_are_current() -> None:
     assert generate_parity_claims.synchronize(check=True) == []
 
 
+@pytest.mark.upstream_evidence
 def test_claim_generation_rejects_hidden_valuation_dates() -> None:
     correctness = generate_parity_claims._load_json(generate_parity_claims.CORRECTNESS_EVIDENCE)
     large_scale = generate_parity_claims._load_json(generate_parity_claims.LARGE_SCALE_EVIDENCE)
@@ -44,6 +46,7 @@ def test_claim_generation_rejects_hidden_valuation_dates() -> None:
         generate_parity_claims._validate_evidence(correctness, large_scale, real_strategy)
 
 
+@pytest.mark.upstream_evidence
 def test_claim_generation_rejects_stale_real_strategy_engine_source() -> None:
     correctness = generate_parity_claims._load_json(generate_parity_claims.CORRECTNESS_EVIDENCE)
     large_scale = generate_parity_claims._load_json(generate_parity_claims.LARGE_SCALE_EVIDENCE)
@@ -56,6 +59,7 @@ def test_claim_generation_rejects_stale_real_strategy_engine_source() -> None:
         generate_parity_claims._validate_evidence(correctness, large_scale, real_strategy)
 
 
+@pytest.mark.upstream_evidence
 def test_claim_generation_rejects_stale_real_strategy_performance() -> None:
     correctness = generate_parity_claims._load_json(generate_parity_claims.CORRECTNESS_EVIDENCE)
     large_scale = generate_parity_claims._load_json(generate_parity_claims.LARGE_SCALE_EVIDENCE)
@@ -84,6 +88,7 @@ def test_every_claim_target_uses_the_same_generated_block() -> None:
     assert len(set(blocks)) == 1
 
 
+@pytest.mark.upstream_evidence
 def test_claims_publish_real_strategy_engine_timings_with_provenance() -> None:
     correctness = generate_parity_claims._load_json(generate_parity_claims.CORRECTNESS_EVIDENCE)
     large_scale = generate_parity_claims._load_json(generate_parity_claims.LARGE_SCALE_EVIDENCE)
@@ -121,6 +126,7 @@ def test_claims_publish_real_strategy_engine_timings_with_provenance() -> None:
         assert excluded in claims
 
 
+@pytest.mark.upstream_evidence
 def test_claims_pin_every_advertised_framework_and_expose_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

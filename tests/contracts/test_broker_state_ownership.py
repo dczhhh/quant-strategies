@@ -13,6 +13,7 @@ from ml4t.backtest.core.state import OrderState, RiskState
 SOURCE_ROOT = Path(__file__).parents[2] / "src" / "ml4t" / "backtest"
 BROKER_MUTABLE_COLLECTIONS = {"fills", "orders", "pending_orders", "positions", "trades"}
 FORBIDDEN_BROKER_STATE = {
+    "_cash_account_rules",  # Broker-owned service; collaborators use facade methods
     "_asset_stats",
     "_asset_bars_seen",
     "_bar_index",

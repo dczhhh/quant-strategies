@@ -5,6 +5,8 @@ delegates validation to the appropriate AccountPolicy.
 """
 
 from collections import deque
+from datetime import date
+from heapq import heappop, heappush
 
 from ..types import Position
 from .policy import AccountPolicy
@@ -44,6 +46,7 @@ class AccountState:
 
         # Settlement tracking: holds are (settle_bar, amount) pairs
         self._settlement_holds: deque[tuple[int, float]] = deque()
+        self._dated_settlement_holds: list[tuple[date, float]] = []
         self._total_held: float = 0.0
 
     @property
@@ -123,6 +126,24 @@ class AccountState:
         """Total cash held in unsettled transactions."""
         return self._total_held
 
+    @property
+    def settled_cash(self) -> float:
+        """Cash excluding receivable sale proceeds; reservations are held by orders."""
+        return self.cash - self.unsettled_cash
+
+    def add_dated_settlement_hold(self, settlement_date: date, amount: float) -> None:
+        if amount > 0:
+            heappush(self._dated_settlement_holds, (settlement_date, amount))
+            self._total_held += amount
+
+    def release_settled_on(self, current_date: date) -> None:
+        """Release matured receivables even when intermediate data bars are absent."""
+        while self._dated_settlement_holds and self._dated_settlement_holds[0][0] <= current_date:
+            _, amount = heappop(self._dated_settlement_holds)
+            self._total_held -= amount
+        if not self._dated_settlement_holds and not self._settlement_holds:
+            self._total_held = 0.0
+
     def add_settlement_hold(self, bar_index: int, delay: int, amount: float) -> None:
         """Hold cash from a sale until settlement completes.
 
@@ -147,7 +168,7 @@ class AccountState:
             _, amount = self._settlement_holds.popleft()
             self._total_held -= amount
         # Guard against floating-point drift
-        if not self._settlement_holds:
+        if not self._settlement_holds and not self._dated_settlement_holds:
             self._total_held = 0.0
 
     def __repr__(self) -> str:

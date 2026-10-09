@@ -8,6 +8,8 @@ import json
 import lzma
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).parents[2]
 _WORKSPACE = _ROOT / "validation/lean/workspace"
 _DATA = _WORKSPACE / "data/equity/usa/daily"
@@ -44,6 +46,7 @@ def _reconstruct_order_events(paths: list[Path]) -> bytes:
     return b"".join(body)
 
 
+@pytest.mark.upstream_evidence
 def test_retained_lean_case_study_evidence_is_fresh_and_complete() -> None:
     payload = json.loads(_EVIDENCE.read_text(encoding="utf-8"))
 

@@ -401,8 +401,18 @@ FAST_PROFILE = {
     },
 }
 
+US_CASH_EQUITIES_PROFILE = deepcopy(DEFAULT_PROFILE)
+US_CASH_EQUITIES_PROFILE["account"]["us_cash_account"] = True
+US_CASH_EQUITIES_PROFILE["position_sizing"]["share_type"] = "fractional"
+US_CASH_EQUITIES_PROFILE["calendar"] = {
+    "calendar": "NYSE",
+    "timezone": "America/New_York",
+    "data_frequency": "daily",
+}
+
 _PROFILES = {
     "default": DEFAULT_PROFILE,
+    "us_cash_equities": US_CASH_EQUITIES_PROFILE,
     "fast": FAST_PROFILE,
     "backtrader": BACKTRADER_PROFILE,
     "vectorbt": VECTORBT_PROFILE,

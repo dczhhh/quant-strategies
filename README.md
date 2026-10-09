@@ -2,7 +2,19 @@
 
 量化策略研究仓库，基座来自 [ml4t/backtest](https://github.com/ml4t/backtest)。
 
-当前阶段为基座移植；账户限制与具体策略将在后续接入。
+基座已移植，第一步美股现金账户限制已接入。策略尚未接入。
+
+```python
+from ml4t.backtest import BacktestConfig
+
+config = BacktestConfig.from_preset("us_cash_equities")
+config.initial_cash = 10_000
+```
+
+该配置只做多、不融资、允许小数股，只用已结算资金买入；挂单预留资金，
+卖出净款按结算日历释放。当前 T+1，并按成交日期兼容历史 T+2/T+3。
+配置默认未启用交易费用，研究回测需显式设置佣金和滑点。
+使用方式、日历边界与第一步范围见 [现金账户说明](docs/us-cash-account.md)。
 
 ## 使用本仓库源码
 
@@ -16,6 +28,7 @@ uv run pytest
 ```
 
 来源与更新方法见 [UPSTREAM.md](UPSTREAM.md)。上游 README 保留如下。
+其中跨框架对照和性能成绩属于移植提交的历史记录；新增现金账户配置未做跨框架认证。
 
 ---
 

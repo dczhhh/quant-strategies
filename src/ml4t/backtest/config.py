@@ -25,6 +25,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import asdict, dataclass, field, replace
+from datetime import date
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -535,6 +536,7 @@ class BacktestConfig:
     # === Account Type (replaces class hierarchy) ===
     allow_short_selling: bool = False  # True for margin/crypto
     allow_leverage: bool = False  # True for margin only
+    us_cash_account: bool = False  # Strict settled-cash US ordinary-equity rules
     initial_margin: float = 0.5  # Only used if allow_leverage=True (Reg T = 0.5)
     long_maintenance_margin: float = 0.25  # Reg T standard for longs
     short_maintenance_margin: float = 0.30  # Reg T standard for shorts (higher!)
@@ -677,6 +679,35 @@ class BacktestConfig:
 
     def _execution_validation_errors(self) -> list[str]:
         errors: list[str] = []
+        if self.us_cash_account:
+            forbidden = (
+                "allow_short_selling",
+                "allow_leverage",
+                "skip_cash_validation",
+                "next_bar_submission_precheck",
+                "next_bar_queue_shadow_validation",
+                "buying_power_reservation",
+            )
+            for name in forbidden:
+                if getattr(self, name):
+                    errors.append(f"us_cash_account requires {name}=False")
+            if not self.reject_on_insufficient_cash or not self.settlement_reduces_buying_power:
+                errors.append(
+                    "us_cash_account requires cash rejection and settlement buying-power checks"
+                )
+            if self.settlement_delay != 0:
+                errors.append("us_cash_account uses dated settlement; settlement_delay must be 0")
+            if self.fixed_margin_schedule or self.margin_pct_schedule:
+                errors.append("us_cash_account does not support derivative margin schedules")
+            if not math.isfinite(self.initial_cash) or self.initial_cash < 0:
+                errors.append("us_cash_account initial_cash must be finite and >= 0")
+            if not math.isfinite(self.cash_buffer_pct) or not 0 <= self.cash_buffer_pct < 1:
+                errors.append("us_cash_account cash_buffer_pct must be in [0, 1)")
+            for value in self.settlement_holidays:
+                try:
+                    date.fromisoformat(value)
+                except (TypeError, ValueError):
+                    errors.append(f"Invalid settlement holiday: {value!r}; expected ISO date")
         cost_fields = (
             "commission_rate",
             "commission_per_share",
@@ -760,6 +791,7 @@ class BacktestConfig:
     # === Settlement ===
     settlement_delay: int = 0  # Bars until sale proceeds are spendable (T+0 default)
     settlement_reduces_buying_power: bool = True  # Unsettled cash reduces buying power
+    settlement_holidays: tuple[str, ...] = ()  # Extra US settlement closures (ISO dates)
 
     # === Order Handling ===
     reject_on_insufficient_cash: bool = True
@@ -911,6 +943,7 @@ class BacktestConfig:
             "account": {
                 "allow_short_selling": self.allow_short_selling,
                 "allow_leverage": self.allow_leverage,
+                "us_cash_account": self.us_cash_account,
                 "initial_margin": self.initial_margin,
                 "long_maintenance_margin": self.long_maintenance_margin,
                 "short_maintenance_margin": self.short_maintenance_margin,
@@ -959,6 +992,7 @@ class BacktestConfig:
             "settlement": {
                 "delay": self.settlement_delay,
                 "reduces_buying_power": self.settlement_reduces_buying_power,
+                "holidays": list(self.settlement_holidays),
             },
             "orders": {
                 "reject_on_insufficient_cash": self.reject_on_insufficient_cash,
@@ -1029,6 +1063,7 @@ class BacktestConfig:
                 "account": {
                     "allow_short_selling",
                     "allow_leverage",
+                    "us_cash_account",
                     "initial_margin",
                     "long_maintenance_margin",
                     "short_maintenance_margin",
@@ -1058,7 +1093,7 @@ class BacktestConfig:
                     "stop_rate",
                 },
                 "cash": {"initial", "buffer_pct"},
-                "settlement": {"delay", "reduces_buying_power"},
+                "settlement": {"delay", "reduces_buying_power", "holidays"},
                 "orders": {
                     "reject_on_insufficient_cash",
                     "skip_cash_validation",
@@ -1155,6 +1190,7 @@ class BacktestConfig:
             # Account
             allow_short_selling=allow_short_selling,
             allow_leverage=allow_leverage,
+            us_cash_account=acct_cfg.get("us_cash_account", False),
             initial_margin=acct_cfg.get("initial_margin", 0.5),
             long_maintenance_margin=acct_cfg.get("long_maintenance_margin", 0.25),
             short_maintenance_margin=acct_cfg.get("short_maintenance_margin", 0.30),
@@ -1208,6 +1244,7 @@ class BacktestConfig:
             # Settlement
             settlement_delay=settle_cfg.get("delay", 0),
             settlement_reduces_buying_power=settle_cfg.get("reduces_buying_power", True),
+            settlement_holidays=tuple(settle_cfg.get("holidays", ())),
             # Orders
             reject_on_insufficient_cash=order_cfg.get("reject_on_insufficient_cash", True),
             skip_cash_validation=order_cfg.get("skip_cash_validation", False),
@@ -1270,6 +1307,7 @@ class BacktestConfig:
         - "lean": Match the frozen LEAN daily US-equity comparison protocol
         - "realistic": Conservative settings for realistic simulation
         - "ibkr_us_stocks_fixed": Interactive Brokers US stocks fixed pricing
+        - "us_cash_equities": Settled-cash US stocks, long-only with fractional shares
         """
         from .profiles import get_profile_config
 
@@ -1491,7 +1529,16 @@ class BacktestConfig:
             ]
         )
 
-        if self.settlement_delay > 0:
+        if self.us_cash_account:
+            lines.extend(
+                [
+                    "",
+                    "US cash account:",
+                    "  Settlement: dated T+1/T+2/T+3",
+                    "  Pending buys reserve cash; only settled cash is spendable",
+                ]
+            )
+        elif self.settlement_delay > 0:
             lines.extend(
                 [
                     "",

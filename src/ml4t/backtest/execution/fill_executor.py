@@ -212,6 +212,18 @@ class FillExecutor:
         commission = calculate_commission(
             broker.commission_model, order.asset, fill_quantity, fill_price
         )
+        if broker.us_cash_account:
+            valid, reason = broker.validate_cash_fill(order, fill_quantity, fill_price, commission)
+            if not valid:
+                signed = fill_quantity if order.side is OrderSide.BUY else -fill_quantity
+                order.reject(
+                    reason,
+                    broker.gatekeeper.classify_rejection(
+                        self.account.get_position_quantity(order.asset) + signed
+                    ),
+                )
+                order._reserved_cash = 0.0
+                return True  # Terminal rejection; no fill/cash/position mutation
         quote_context = broker.get_quote_context(order.asset, order.side)
 
         signed_qty = fill_quantity if order.side == OrderSide.BUY else -fill_quantity
@@ -317,7 +329,9 @@ class FillExecutor:
         self._sync_account_state(order.asset, current_price=ctx.fill_price)
 
         # Settlement delay: hold sale proceeds until settlement completes
-        if broker.settlement_delay > 0 and cash_change > 0:
+        if broker.us_cash_account:
+            broker.settle_cash_fill(order, remaining_quantity, cash_change)
+        elif broker.settlement_delay > 0 and cash_change > 0:
             self.account.add_settlement_hold(
                 self.market.bar_index, broker.settlement_delay, cash_change
             )

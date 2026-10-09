@@ -5,12 +5,13 @@ from __future__ import annotations
 import copy
 from collections import deque
 from collections.abc import Callable, Mapping
-from datetime import datetime
+from datetime import date, datetime
 from math import isfinite
 from typing import TYPE_CHECKING, Any, TypedDict, Unpack
 from zoneinfo import ZoneInfo
 
 from .config import (
+    DataFrequency,
     EntryOrderPriority,
     ExecutionPrice,
     FillOrdering,
@@ -40,6 +41,7 @@ from .execution.fill_executor import FillExecutor
 from .funding import FundingEvent, FundingPayment
 from .models import CommissionModel, NoCommission, NoSlippage, SlippageModel
 from .types import (
+    AssetClass,
     AssetTradingStats,
     ContractSpec,
     ExecutionMode,
@@ -129,6 +131,11 @@ class Broker:
         late_asset_min_bars: int = 1,
         settlement_delay: int = 0,
         settlement_reduces_buying_power: bool = True,
+        us_cash_account: bool = False,
+        settlement_holidays: tuple[str, ...] = (),
+        data_frequency: DataFrequency = DataFrequency.DAILY,
+        timezone: str = "UTC",
+        timestamp_semantics: Any | None = None,
     ):
         # Runtime imports for accounting classes.
         # These are imported here rather than at module level because:
@@ -173,6 +180,38 @@ class Broker:
         self.late_asset_min_bars = late_asset_min_bars
         self.settlement_delay = settlement_delay
         self.settlement_reduces_buying_power = settlement_reduces_buying_power
+        self.us_cash_account = us_cash_account
+        if us_cash_account:
+            from .config import BacktestConfig
+
+            BacktestConfig(
+                us_cash_account=True,
+                initial_cash=initial_cash,
+                cash_buffer_pct=cash_buffer_pct,
+                allow_short_selling=allow_short_selling,
+                allow_leverage=allow_leverage,
+                skip_cash_validation=skip_cash_validation,
+                reject_on_insufficient_cash=reject_on_insufficient_cash,
+                settlement_reduces_buying_power=settlement_reduces_buying_power,
+                settlement_delay=settlement_delay,
+                settlement_holidays=settlement_holidays,
+                next_bar_submission_precheck=next_bar_submission_precheck,
+                next_bar_queue_shadow_validation=next_bar_queue_shadow_validation,
+                buying_power_reservation=buying_power_reservation,
+                fixed_margin_schedule=fixed_margin_schedule,
+                margin_pct_schedule=margin_pct_schedule,
+            )._validate_for_execution()
+            if any(
+                spec.asset_class is not AssetClass.EQUITY
+                or spec.currency != "USD"
+                or spec.multiplier != 1.0
+                or spec.margin is not None
+                or spec.margin_pct is not None
+                for spec in (contract_specs or {}).values()
+            ):
+                raise ValueError(
+                    "us_cash_account requires USD equities without derivative contract specs"
+                )
         self._market_state = MarketState()
         self._order_state = OrderState()
         self._risk_state = RiskState()
@@ -204,6 +243,22 @@ class Broker:
         )
 
         self.account = AccountState(initial_cash=initial_cash, policy=policy)
+        from .accounting.cash import CashAccountRules
+
+        self._cash_account_rules = (
+            CashAccountRules(
+                self,
+                account=self.account,
+                market=self._market_state,
+                orders=self._order_state,
+                extra_holidays=settlement_holidays,
+                data_frequency=data_frequency,
+                timezone=timezone,
+                timestamp_semantics=timestamp_semantics,
+            )
+            if us_cash_account
+            else None
+        )
         # Derive account_type string from flags for backward compat
         if allow_leverage:
             self.account_type = "margin"
@@ -228,6 +283,11 @@ class Broker:
             cash_buffer_pct=self.cash_buffer_pct,
             settlement_reduces_buying_power=self.settlement_reduces_buying_power,
             multiplier_resolver=self.get_multiplier,
+            reserved_cash_resolver=(
+                self._cash_account_rules.reserved_cash
+                if self._cash_account_rules is not None
+                else None
+            ),
         )
 
         self._rebalance_counter = 0
@@ -437,6 +497,11 @@ class Broker:
             late_asset_min_bars=config.late_asset_min_bars,
             settlement_delay=config.settlement_delay,
             settlement_reduces_buying_power=config.settlement_reduces_buying_power,
+            us_cash_account=config.us_cash_account,
+            settlement_holidays=config.settlement_holidays,
+            data_frequency=config.data_frequency,
+            timezone=config.timezone,
+            timestamp_semantics=config.resolved_timestamp_semantics,
         )
 
     # Phase 4.1: Make cash a property delegating to account to prevent state drift
@@ -2108,7 +2173,46 @@ class Broker:
             - Cash account: max(0, cash)
             - Margin account: (NLV - maintenance_margin) / initial_margin_rate
         """
+        if self.us_cash_account:
+            return max(0.0, self.gatekeeper._available_cash())
         return self.account.buying_power
+
+    @property
+    def settled_cash(self) -> float:
+        return self.account.settled_cash
+
+    @property
+    def unsettled_cash(self) -> float:
+        return self.account.unsettled_cash
+
+    @property
+    def reserved_cash(self) -> float:
+        return self._cash_account_rules.reserved_cash() if self._cash_account_rules else 0.0
+
+    def _cash_session_date(self, timestamp: datetime) -> date:
+        assert self._cash_account_rules is not None
+        return self._cash_account_rules.session_date(timestamp)
+
+    def reserve_cash_order(self, order: Order, quantity: float | None = None) -> bool:
+        """Reserve pending order cost if strict cash-account rules are enabled."""
+        return (
+            self._cash_account_rules.reserve(order, quantity) if self._cash_account_rules else True
+        )
+
+    def validate_cash_fill(
+        self, order: Order, quantity: float, price: float, commission: float
+    ) -> tuple[bool, str]:
+        """Validate actual costs for every strict cash fill, including reducing orders."""
+        if self._cash_account_rules is None:
+            return True, ""
+        return self._cash_account_rules.validate_fill(order, quantity, price, commission)
+
+    def settle_cash_fill(self, order: Order, remaining_quantity: float, cash_change: float) -> None:
+        """Update pending cash requirements and create dated sale receivables."""
+        assert self._cash_account_rules is not None
+        self._cash_account_rules.reserve_remainder(order, remaining_quantity)
+        if order.side is OrderSide.SELL and cash_change > 0:
+            self._cash_account_rules.hold_sale_proceeds(cash_change)
 
     def order_target_percent(
         self,
@@ -2461,6 +2565,11 @@ class Broker:
         # Release settled holds at bar start
         if self.settlement_delay > 0:
             self.account.release_settled(self._bar_index)
+        if self.us_cash_account:
+            current_date = self._cash_session_date(timestamp)
+            if current_date < date(1995, 6, 7):
+                raise ValueError("US cash settlement supports dates from 1995-06-07 onward")
+            self.account.release_settled_on(current_date)
 
         for asset, price in prices.items():
             if price > 0:

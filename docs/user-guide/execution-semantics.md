@@ -509,6 +509,10 @@ config = BacktestConfig(
 
 ## Settlement
 
+This repository also provides `BacktestConfig.from_preset("us_cash_equities")` for
+strict US settled-cash trading. It uses dated T+1/T+2/T+3 settlement and pending-order
+cash reservations instead of bar delays. See [the cash-account guide](../us-cash-account.md).
+
 The `settlement_delay` parameter delays when sale proceeds become spendable. The
 unit is processed bars, not calendar or business days:
 

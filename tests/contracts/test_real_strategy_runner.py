@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import polars as pl
+import pytest
 
 
 def _load_runner():
@@ -361,6 +362,7 @@ def test_real_strategy_benchmark_interval_is_deterministic() -> None:
     assert first[0] <= 5.5 <= first[1]
 
 
+@pytest.mark.upstream_evidence
 def test_real_strategy_performance_evidence_fails_stale_source() -> None:
     """An engine source that is neither measured-under nor certified is refused."""
     benchmark = _load_benchmark()
@@ -377,6 +379,7 @@ def test_real_strategy_performance_evidence_fails_stale_source() -> None:
     assert any("neither the source these" in failure for failure in failures)
 
 
+@pytest.mark.upstream_evidence
 def test_certification_alone_publishes_a_later_engine_source() -> None:
     """Timings measured under one source publish for a certified later one."""
     benchmark = _load_benchmark()
@@ -400,6 +403,7 @@ def test_certification_alone_publishes_a_later_engine_source() -> None:
     assert benchmark.report_failures(report, correctness) == []
 
 
+@pytest.mark.upstream_evidence
 def test_malformed_certification_is_refused() -> None:
     """A certification missing its evidence cannot publish anything."""
     benchmark = _load_benchmark()
