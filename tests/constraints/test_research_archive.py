@@ -3,6 +3,7 @@
 import json
 from dataclasses import FrozenInstanceError, asdict, replace
 from datetime import datetime, timedelta
+from urllib.parse import urlencode
 
 import pytest
 from test_research_data_contracts import identity
@@ -16,6 +17,8 @@ from quant_constraints.research.data.archive import (
     write_once,
 )
 from quant_constraints.research.data.archive_contracts import (
+    ADAPTER_VERSION,
+    LEGACY_ADAPTER_VERSION,
     AccessDeclaration,
     ArchiveError,
     ArchiveFile,
@@ -34,6 +37,10 @@ from quant_constraints.research.data.massive import (
     request_url,
 )
 from quant_constraints.research.data.normalize import normalize_identities
+from quant_constraints.research.data.pagination import (
+    PAGINATION_VERSION,
+    pagination_contract,
+)
 
 
 def stamp(value="2024-06-07T13:30:00+00:00"):
@@ -276,8 +283,8 @@ def test_native_download_requires_credential_and_private_permission(tmp_path, mo
 def test_pagination_retry_resume_idempotence_and_offline_replay(tmp_path):
     request, identities = source_request(), normalize_identities([identity()])
     cursor = request_url(request).split("?")[0] + "?cursor=page-2"
-    first = page([row(stamp() + timedelta(minutes=2))], next_url=cursor)
-    second = page([row(stamp() + timedelta(minutes=1)), row()])
+    first = page([row()], next_url=cursor)
+    second = page([row(stamp() + timedelta(minutes=1)), row(stamp() + timedelta(minutes=2))])
     transport = Transport([HTTPResponse(429, b"{}"), first, TimeoutError("synthetic timeout")])
     waits = []
     client = adapter(transport, retries=1, sleeper=waits.append)
@@ -300,7 +307,7 @@ def test_pagination_retry_resume_idempotence_and_offline_replay(tmp_path):
     bars = tuple(iter_raw_bars(load_archive(dataset.directory)))
     assert [bar.bar_start_at for bar in bars] == [stamp() + timedelta(minutes=i) for i in range(3)]
     assert len({bar.source.source_partition_id for bar in bars}) == 2
-    assert bars[0].source.record_id.startswith("1:")
+    assert bars[0].source.record_id.startswith("0:")
     assert all(
         bar.available_at == bar.source.ingested_at and bar.available_at.year == 2026 for bar in bars
     )
@@ -391,10 +398,6 @@ def test_credentials_never_reach_archive_or_error_messages(tmp_path):
 @pytest.mark.parametrize(
     "change,code",
     [
-        ({"t": True}, "DATA_INVALID"),
-        ({"t": 1.2}, "DATA_INVALID"),
-        ({"t": int(stamp().timestamp() * 1000) + 1}, "DATA_INVALID"),
-        ({"t": 10**30}, "DATA_INVALID"),
         ({"h": 90}, "INVALID_OHLCV"),
         ({"v": -1}, "INVALID_VALUE"),
     ],
@@ -408,14 +411,21 @@ def test_bad_bars_reject_normalization_without_losing_originals(tmp_path, change
     assert not list(store.root.glob("normalized/*"))
 
 
+@pytest.mark.parametrize("t", [True, 1.2, int(stamp().timestamp() * 1000) + 1, 10**30])
+def test_bad_timestamp_rejects_acquisition_before_archive(tmp_path, t):
+    with pytest.raises(ArchiveError, match="DATA_INVALID"):
+        archive(tmp_path, payload=page([row(t=t)]))
+    assert not list(tmp_path.glob("archives/source/*"))
+
+
 def test_duplicate_bars_across_pages_are_not_legitimized_by_new_partition(tmp_path):
     request = source_request()
     cursor = request_url(request).split("?")[0] + "?cursor=2"
     client = adapter(Transport([page(next_url=cursor), page()]))
     store = ArchiveStore(tmp_path)
-    source = client.acquire_and_archive(request, store, normalize_identities([identity()]))
     with pytest.raises(ArchiveError, match="DUPLICATE_BAR"):
-        normalize_archived_snapshot(source, store)
+        client.acquire_and_archive(request, store, normalize_identities([identity()]))
+    assert not list(store.root.glob("source/*"))
 
 
 @pytest.mark.parametrize(
@@ -506,7 +516,7 @@ def test_full_and_early_close_sessions(tmp_path, date_start, date_end, count):
     store, source = archive(
         tmp_path,
         request=request,
-        payload=page([row(start + timedelta(minutes=i)) for i in reversed(range(count))]),
+        payload=page([row(start + timedelta(minutes=i)) for i in range(count)]),
     )
     data = normalize_archived_snapshot(source, store)
     assert len(tuple(iter_raw_bars(data))) == count
@@ -833,14 +843,11 @@ def test_archive_request_and_receipt_cannot_claim_different_sources(tmp_path):
     assert len(list(store.root.glob("source/*"))) == 1
 
 
-def test_outside_rows_are_disclosed_and_incomplete_bars_reject(tmp_path):
+def test_outside_rows_reject_acquisition_and_incomplete_bars_reject(tmp_path):
     request = source_request()
-    store, source = archive(
-        tmp_path / "outside", payload=page([row(stamp() - timedelta(minutes=1)), row()])
-    )
-    data = normalize_archived_snapshot(source, store)
-    assert json.loads(data.read("archive-report.json"))["outside_request"] == 1
-    assert len(tuple(iter_raw_bars(data))) == 1
+    with pytest.raises(ArchiveError, match="DATA_INVALID"):
+        archive(tmp_path / "outside", payload=page([row(stamp() - timedelta(minutes=1)), row()]))
+    assert not list(tmp_path.glob("outside/archives/source/*"))
     with pytest.raises(ArchiveError):
         source_request(frequency="1d", session_filter="all_source_sessions")
     client = adapter(Transport([page()]), clock=lambda: request.start_at)
@@ -1153,12 +1160,13 @@ def test_legacy_standalone_archives_replay_but_cannot_satisfy_a_bound_completed_
     store, source = archive(tmp_path)
     inputs = []
     for item in source.manifest.files:
-        if item.role == "acquisition_session":
+        if item.role in {"acquisition_session", "pagination_contract"}:
             continue
         content = source.read(item.path)
         if item.role == "receipt":
             receipt = json.loads(content)
             receipt.pop("schema_version")
+            receipt.pop("pagination_version")
             for attempt in receipt["attempts"]:
                 attempt.pop("ordinal")
             for retry in receipt["retry_responses"]:
@@ -1172,7 +1180,7 @@ def test_legacy_standalone_archives_replay_but_cannot_satisfy_a_bound_completed_
         inputs=tuple(inputs),
         acquired_start_at=source.manifest.acquired_start_at,
         acquired_end_at=source.manifest.acquired_end_at,
-        adapter_version=source.manifest.adapter_version,
+        adapter_version=LEGACY_ADAPTER_VERSION,
         writer_version=source.manifest.writer_version,
     )
     assert audit_archive(load_archive(legacy.directory))["market_data_verified"] is False
@@ -1189,3 +1197,436 @@ def test_legacy_standalone_archives_replay_but_cannot_satisfy_a_bound_completed_
             source.manifest.request, store, normalize_identities([identity()])
         )
     assert transport.calls == []
+
+
+def continuation(request, *, first=None, last=None, query="cursor=opaque-2"):
+    endpoint = request_url(request).split("?")[0]
+    prefix, base_first, base_last = endpoint.rsplit("/", 2)
+    return f"{prefix}/{base_first if first is None else first}/{base_last if last is None else last}?{query}"
+
+
+@pytest.mark.parametrize(
+    "form", ["same_cursor", "advanced_cursor", "explicit", "cursor_and_explicit"]
+)
+def test_documented_pagination_shapes_bind_request_and_replay(tmp_path, form):
+    request = source_request()
+    first = (
+        None if form == "same_cursor" else int((stamp() + timedelta(minutes=1)).timestamp() * 1000)
+    )
+    query = "cursor=opaque-2"
+    if form in {"explicit", "cursor_and_explicit"}:
+        query = urlencode({"adjusted": "false", "sort": "asc", "limit": request.page_limit})
+        if form == "cursor_and_explicit":
+            query += "&cursor=opaque-2"
+    next_url = continuation(request, first=first, query=query)
+    # A missing trade minute is valid: request progression is bounded but bars need not be contiguous.
+    transport = Transport([page(next_url=next_url), page([row(stamp() + timedelta(minutes=2))])])
+    store = ArchiveStore(tmp_path)
+    source = adapter(transport).acquire_and_archive(
+        request, store, normalize_identities([identity()])
+    )
+    assert transport.calls[1][0] == next_url
+    assert source.manifest.adapter_version == ADAPTER_VERSION
+    assert source.read("pagination.json") == pagination_contract(request)
+    assert (
+        json.loads(source.read("pages/0001.receipt.json"))["pagination_version"]
+        == PAGINATION_VERSION
+    )
+    dataset = normalize_archived_snapshot(load_archive(source.directory), store)
+    bars = tuple(iter_raw_bars(dataset))
+    assert [b.bar_start_at for b in bars] == [stamp(), stamp() + timedelta(minutes=2)]
+    report = json.loads(dataset.read("archive-report.json"))
+    assert report["partitions"][0]["missing_rth_windows"] == [
+        {"at": (stamp() + timedelta(minutes=1)).isoformat(), "reason": "unknown"}
+    ]
+    assert report["market_data_verified"] is False
+
+
+@pytest.mark.parametrize("date_boundary", [False, True])
+def test_daily_cursor_progression_uses_new_york_midnight_through_dst(tmp_path, date_boundary):
+    start = stamp("2024-03-08T05:00:00+00:00")
+    request = source_request(
+        start_at=start,
+        end_at=stamp("2024-03-12T04:00:00+00:00"),
+        frequency="1d",
+        session_filter="all_source_sessions",
+    )
+    next_url = continuation(
+        request,
+        first="2024-03-09"
+        if date_boundary
+        else int((start + timedelta(days=1)).timestamp() * 1000),
+        last="2024-03-11" if date_boundary else None,
+    )
+    client = adapter(
+        Transport(
+            [page([row(start)], next_url=next_url), page([row(stamp("2024-03-11T04:00:00+00:00"))])]
+        )
+    )
+    store = ArchiveStore(tmp_path)
+    source = client.acquire_and_archive(request, store, normalize_identities([identity()]))
+    assert len(tuple(iter_raw_bars(normalize_archived_snapshot(source, store)))) == 2
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "from_before",
+        "from_after",
+        "from_unaligned",
+        "to_after",
+        "to_shortened",
+        "reversed",
+        "date_expands_window",
+        "bad_date",
+        "extra_path",
+        "multiplier",
+        "timespan",
+        "ticker",
+        "adjusted_true",
+        "sort_desc",
+        "limit_changed",
+        "limit_excessive",
+        "duplicate_adjusted",
+        "duplicate_same",
+        "duplicate_cursor",
+        "unknown_query",
+        "blank_cursor",
+        "missing_raw",
+        "missing_sort",
+        "missing_limit",
+        "invalid_escape",
+        "control_url",
+        "encoded_range",
+        "noncanonical_query",
+    ],
+)
+def test_incompatible_next_url_rejects_before_following_or_publishing(tmp_path, damage):
+    request = source_request()
+    start = int(request.start_at.timestamp() * 1000)
+    end = int(request.end_at.timestamp() * 1000) - 1
+    query = {"adjusted": "false", "sort": "asc", "limit": str(request.page_limit)}
+    first, last = start, end
+    if damage == "from_before":
+        first -= 60000
+    elif damage == "from_after":
+        first = end + 1
+    elif damage == "from_unaligned":
+        first += 1
+    elif damage == "to_after":
+        last += 60000
+    elif damage == "to_shortened":
+        last -= 60000
+    elif damage == "reversed":
+        first, last = end, start
+    elif damage == "date_expands_window":
+        last = "2024-06-07"
+    elif damage == "bad_date":
+        first = "2024-99-99"
+    elif damage == "adjusted_true":
+        query["adjusted"] = "true"
+    elif damage == "sort_desc":
+        query["sort"] = "desc"
+    elif damage == "limit_changed":
+        query["limit"] = "100"
+    elif damage == "limit_excessive":
+        query["limit"] = "50001"
+    elif damage == "unknown_query":
+        query["unadjusted"] = "true"
+    elif damage == "blank_cursor":
+        query["cursor"] = ""
+    elif damage == "missing_raw":
+        query.pop("adjusted")
+    elif damage == "missing_sort":
+        query.pop("sort")
+    elif damage == "missing_limit":
+        query.pop("limit")
+    url = continuation(request, first=first, last=last, query=urlencode(query))
+    if damage == "extra_path":
+        url = url.replace("?", "/suffix?")
+    elif damage == "multiplier":
+        url = url.replace("/range/1/", "/range/2/")
+    elif damage == "timespan":
+        url = url.replace("/minute/", "/day/")
+    elif damage == "ticker":
+        url = url.replace("/AAA/", "/BBB/")
+    elif damage == "duplicate_adjusted":
+        url += "&adjusted=true"
+    elif damage == "duplicate_same":
+        url += "&adjusted=false"
+    elif damage == "duplicate_cursor":
+        url += "&cursor=x&cursor=y"
+    elif damage == "invalid_escape":
+        url += "&cursor=%ZZ"
+    elif damage == "control_url":
+        url = "\n" + url
+    elif damage == "encoded_range":
+        url = url.replace(str(start), "%31" + str(start)[1:])
+    elif damage == "noncanonical_query":
+        url += "&sort"
+    transport = Transport([page(next_url=url)])
+    store = ArchiveStore(tmp_path)
+    with pytest.raises(ArchiveError, match="PAGE_INVALID"):
+        adapter(transport).acquire_and_archive(request, store, normalize_identities([identity()]))
+    assert len(transport.calls) == 1
+    assert not list(store.root.glob("source/*"))
+    assert not list(store.root.glob("sessions/**/completed.json"))
+
+
+@pytest.mark.parametrize(
+    "damage,code",
+    [
+        ("within_page_order", "TIME_ORDER"),
+        ("cross_page_order", "TIME_ORDER"),
+        ("within_page_duplicate", "DUPLICATE_BAR"),
+        ("nonadjacent_duplicate", "DUPLICATE_BAR"),
+        ("skipped_range", "PAGE_INVALID"),
+        ("range_rollback", "PAGE_INVALID"),
+        ("cursor_reuse", "PAGINATION_LOOP"),
+        ("response_adjusted", "PAGE_INVALID"),
+    ],
+)
+def test_pagination_chain_rejects_order_duplicates_and_unproven_progress(tmp_path, damage, code):
+    request = source_request()
+    t0, t1, t2 = stamp(), stamp() + timedelta(minutes=1), stamp() + timedelta(minutes=2)
+    url2 = continuation(request)
+    items = [page(next_url=url2), page([row(t1), row(t2)])]
+    if damage == "within_page_order":
+        items = [page([row(t1), row(t0)])]
+    elif damage == "within_page_duplicate":
+        items = [page([row(t0), row(t0)])]
+    elif damage == "cross_page_order":
+        items = [page([row(t1)], next_url=url2), page([row(t0)])]
+    elif damage == "nonadjacent_duplicate":
+        items = [page([row(t0), row(t1)], next_url=url2), page([row(t0)])]
+    elif damage == "skipped_range":
+        items[0] = page(next_url=continuation(request, first=int(t2.timestamp() * 1000)))
+    elif damage == "response_adjusted":
+        items[1] = page([row(t1)], adjusted=True)
+    else:
+        url2 = continuation(request, first=int(t1.timestamp() * 1000))
+        url3 = (
+            continuation(request, query="cursor=opaque-3")
+            if damage == "range_rollback"
+            else continuation(request, first=int(t2.timestamp() * 1000))
+        )
+        items = [page(next_url=url2), page([row(t1)], next_url=url3)]
+    store = ArchiveStore(tmp_path)
+    with pytest.raises(ArchiveError, match=code):
+        adapter(Transport(items)).acquire_and_archive(
+            request, store, normalize_identities([identity()])
+        )
+    assert not list(store.root.glob("source/*"))
+
+
+@pytest.mark.parametrize("cursor_explicit", [False, True])
+@pytest.mark.parametrize("native", [False, True])
+def test_licensed_opaque_cursor_is_blocked_before_followup_despite_explicit_raw(
+    tmp_path, cursor_explicit, native, monkeypatch
+):
+    request = source_request(access=access(mode="licensed_private"))
+    query = "cursor=opaque-2"
+    if cursor_explicit:
+        query += "&" + urlencode({"adjusted": "false", "sort": "asc", "limit": request.page_limit})
+    transport = Transport([page(next_url=continuation(request, query=query))])
+    if native:
+        from quant_constraints.research.data import massive
+
+        monkeypatch.setattr(massive, "http_get", transport)
+        client = MassiveAdapter(
+            api_key="synthetic-test-token",
+            clock=Clock(),
+            sleeper=lambda _: None,
+            minimum_interval=0,
+        )
+    else:
+        client = adapter(transport)
+    store = ArchiveStore(tmp_path)
+    with pytest.raises(ArchiveError, match="PAGINATION_UNVERIFIED"):
+        client.acquire_and_archive(request, store, normalize_identities([identity()]))
+    assert len(transport.calls) == 1
+    assert not list(store.root.glob("source/*"))
+
+
+@pytest.mark.parametrize(
+    "change,code",
+    [
+        ({"results": [], "resultsCount": 0, "queryCount": 1}, "PAGINATION_INCOMPLETE"),
+        (
+            {"results": [], "resultsCount": 0, "queryCount": 0, "next_url": "cursor"},
+            "PAGINATION_INCOMPLETE",
+        ),
+        ({"next_url": None}, "PAGINATION_INCOMPLETE"),
+        ({"queryCount": 0}, "PAGE_INVALID"),
+        ({"queryCount": 50001}, "PAGE_INVALID"),
+        ({"queryCount": 50000}, "PAGINATION_INCOMPLETE"),
+        ({"status": "ERROR"}, "PAGE_INVALID"),
+    ],
+)
+def test_empty_or_truncated_pages_need_documented_exhaustion(tmp_path, change, code):
+    if change.get("next_url") == "cursor":
+        change = change | {"next_url": continuation(source_request())}
+    with pytest.raises(ArchiveError, match=code):
+        archive(tmp_path, payload=page(**change))
+    assert not list(tmp_path.glob("archives/source/*"))
+
+
+@pytest.mark.parametrize(
+    "damage", ["url_chain", "receipt_next", "receipt_version", "contract", "timestamps"]
+)
+def test_offline_pagination_audit_rejects_semantic_tampering_with_rehashed_files(tmp_path, damage):
+    request = source_request()
+    next_url = continuation(request)
+    store = ArchiveStore(tmp_path / "valid")
+    source = adapter(
+        Transport([page(next_url=next_url), page([row(stamp() + timedelta(minutes=1))])])
+    ).acquire_and_archive(request, store, normalize_identities([identity()]))
+    changes = {}
+    if damage == "contract":
+        changes["pagination.json"] = canonical(
+            json.loads(source.read("pagination.json")) | {"range_policy": "unchecked"}
+        )
+    else:
+        receipt = json.loads(source.read("pages/0000.receipt.json"))
+        if damage == "receipt_next":
+            receipt["next_url"] = continuation(request, query="cursor=foreign")
+        elif damage == "receipt_version":
+            receipt.pop("pagination_version")
+        elif damage == "url_chain":
+            body = page(next_url=continuation(request, query="cursor=foreign"))
+            changes["pages/0000.json"] = body
+            receipt["next_url"] = json.loads(body)["next_url"]
+            receipt["sha256"] = digest(body)
+            receipt["attempts"][-1]["response_sha256"] = digest(body)
+        else:
+            body = page([row()])
+            changes["pages/0001.json"] = body
+            receipt = json.loads(source.read("pages/0001.receipt.json"))
+            receipt["sha256"] = digest(body)
+            receipt["attempts"][-1]["response_sha256"] = digest(body)
+        changes[
+            "pages/0001.receipt.json" if damage == "timestamps" else "pages/0000.receipt.json"
+        ] = canonical(receipt)
+    directory = repack_archive(tmp_path / "bad", source, changes)
+    with pytest.raises(ArchiveError, match="SOURCE_CONFLICT"):
+        load_archive(directory)
+
+
+def test_v1_bound_completion_requires_a_new_acquisition_not_silent_upgrade(tmp_path):
+    store, source = archive(tmp_path)
+    inputs = tuple(
+        ArchiveInput(item.path, item.role, source.read(item.path), item.source_ref)
+        for item in source.manifest.files
+        if item.role != "pagination_contract"
+    )
+    legacy = store.commit(
+        request=source.manifest.request,
+        layer="source",
+        inputs=inputs,
+        acquired_start_at=source.manifest.acquired_start_at,
+        acquired_end_at=source.manifest.acquired_end_at,
+        adapter_version=LEGACY_ADAPTER_VERSION,
+        writer_version="original_bytes_v1",
+    )
+    assert (
+        len(
+            tuple(iter_raw_bars(normalize_archived_snapshot(load_archive(legacy.directory), store)))
+        )
+        == 1
+    )
+    completed = (
+        store.root / "sessions" / source.manifest.request.request_id / "initial" / "completed.json"
+    )
+    completed.write_bytes(
+        canonical(json.loads(completed.read_bytes()) | {"revision": legacy.manifest.revision})
+    )
+    transport = Transport([])
+    with pytest.raises(ArchiveError, match="SOURCE_CONFLICT"):
+        adapter(transport).acquire_and_archive(
+            source.manifest.request, store, normalize_identities([identity()])
+        )
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_licensed_explicit_bounded_progression_is_allowed_without_cursor(
+    tmp_path, native, monkeypatch
+):
+    request = source_request(access=access(mode="licensed_private"))
+    url2 = continuation(
+        request,
+        first=int((stamp() + timedelta(minutes=1)).timestamp() * 1000),
+        query=urlencode({"adjusted": "false", "sort": "asc", "limit": request.page_limit}),
+    )
+    transport = Transport([page(next_url=url2), page([row(stamp() + timedelta(minutes=2))])])
+    if native:
+        from quant_constraints.research.data import massive
+
+        monkeypatch.setattr(massive, "http_get", transport)
+        client = MassiveAdapter(
+            api_key="synthetic-test-token",
+            clock=Clock(),
+            sleeper=lambda _: None,
+            minimum_interval=0,
+        )
+    else:
+        client = adapter(transport)
+    source = client.acquire_and_archive(
+        request, ArchiveStore(tmp_path), normalize_identities([identity()])
+    )
+    assert len(transport.calls) == 2
+    assert transport.calls[1][0] == url2
+    assert audit_archive(load_archive(source.directory))["market_data_verified"] is False
+
+
+def test_v1_offline_decoder_retains_disclosed_outside_rows_and_sorting(tmp_path):
+    store, source = archive(tmp_path)
+    body = page([row(stamp() + timedelta(minutes=1)), row(), row(stamp() - timedelta(minutes=1))])
+    receipt = json.loads(source.read("pages/0000.receipt.json"))
+    receipt["sha256"] = digest(body)
+    receipt["attempts"][-1]["response_sha256"] = digest(body)
+    inputs = tuple(
+        ArchiveInput(
+            item.path,
+            item.role,
+            body
+            if item.path == "pages/0000.json"
+            else canonical(receipt)
+            if item.role == "receipt"
+            else source.read(item.path),
+            item.source_ref,
+        )
+        for item in source.manifest.files
+        if item.role != "pagination_contract"
+    )
+    legacy = store.commit(
+        request=source.manifest.request,
+        layer="source",
+        inputs=inputs,
+        acquired_start_at=source.manifest.acquired_start_at,
+        acquired_end_at=source.manifest.acquired_end_at,
+        adapter_version=LEGACY_ADAPTER_VERSION,
+        writer_version="original_bytes_v1",
+    )
+    data = normalize_archived_snapshot(load_archive(legacy.directory), store)
+    assert json.loads(data.read("archive-report.json"))["outside_request"] == 1
+    assert [b.bar_start_at for b in iter_raw_bars(data)] == [
+        stamp(),
+        stamp() + timedelta(minutes=1),
+    ]
+    assert audit_archive(data)["market_data_verified"] is False
+
+
+@pytest.mark.parametrize(
+    "conflict", ["sort=desc", "limit=100", "adjusted=true", "adjusted=false&adjusted=true"]
+)
+def test_opaque_cursor_never_excuses_explicit_query_conflicts(tmp_path, conflict):
+    request = source_request()
+    transport = Transport(
+        [page(next_url=continuation(request, query="cursor=opaque-2&" + conflict))]
+    )
+    store = ArchiveStore(tmp_path)
+    with pytest.raises(ArchiveError, match="PAGE_INVALID"):
+        adapter(transport).acquire_and_archive(request, store, normalize_identities([identity()]))
+    assert len(transport.calls) == 1
+    assert not list(store.root.glob("source/*"))

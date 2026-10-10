@@ -36,10 +36,32 @@ venue-specific tape or combine overlapping SIP/venue feeds. These declarations s
 The adapter implements the supplier's documented
 [custom-bar endpoint](https://massive.com/docs/rest/stocks/aggregates/custom-bars), with explicit
 `adjusted=false`, ascending order, a recorded base-aggregate limit and millisecond query endpoints.
-It sends the exclusive end minus one millisecond and records any returned bars outside the requested
-range instead of using them. The response must confirm the ticker/adjustment, counts, server request
+It sends the exclusive end minus one millisecond and rejects source bars outside their requested
+page range before publication. The response must confirm the ticker/adjustment, counts, server request
 ID and success status. A terminal page at the base limit without continuation/completeness evidence
 is conservatively rejected; use a larger valid limit or split the request.
+
+The `massive_aggregates_v2` adapter archives `pagination.json` and receipt references to
+`massive_aggregate_pagination_v1`. Acquisition, resumed pages and offline audit enforce the same
+chain: exact endpoint/ticker/multiplier/timespan, fixed inclusive end, bounded/aligned start, known
+unique query fields, unchanged explicit raw/order/base limit and increasing nonduplicate bars.
+A continuation may retain its start with a new opaque cursor or advance exactly to the previous
+bar's end. New York date boundaries and daily DST are supported; other advancement shapes remain
+unsupported. Gaps in returned trades remain `unknown`, with no manufactured bars.
+
+The [official cursor explanation](https://massive.com/blog/api-pagination-patterns) says that other
+query parameters are ignored when `cursor` is present. Missing raw/order fields are therefore not
+filled in or interpreted as inherited guarantees. Cursor-only forms are exercised with synthetic
+fixtures; **licensed opaque pagination fails `PAGINATION_UNVERIFIED` before following the URL**, even
+if explicit raw fields are supplied. Supporting it requires a separately reviewed provider binding
+and authorized raw multi-page smoke evidence, which are still unavailable. Fully explicit bounded
+continuations can proceed, while every response must declare `adjusted=false`.
+
+An empty page can terminate only with successful status/identity, zero base/results counts and no
+continuation. Null cursors, ambiguous empty pages or a terminal page at the base limit reject.
+Absence of `next_url` is the supplier's exhaustion declaration, not a market completeness proof.
+V1 frozen archives remain offline-readable without upgrading their pagination evidence; their
+completed sessions cannot be silently reused as V2. Start a new acquisition ID to reacquire.
 
 `MassiveAdapter` accepts an injected transport for offline tests. Native HTTPS requires
 `licensed_private` permission and `MASSIVE_API_KEY` from the environment; explicit constructor keys

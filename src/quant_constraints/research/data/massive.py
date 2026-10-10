@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .archive import (
@@ -36,6 +36,21 @@ from .archive_contracts import (
 )
 from .contracts import IdentityMap
 from .contracts.errors import timestamp
+from .pagination import (
+    CUSTOM_BARS_SPEC,
+    PAGINATION_VERSION,
+    PaginationChain,
+    pagination_contract,
+)
+from .pagination import (
+    checked_url as checked_url,
+)
+from .pagination import (
+    parse_page as parse_page,
+)
+from .pagination import (
+    request_url as request_url,
+)
 
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_ACQUISITION_BYTES = 64 * 1024 * 1024
@@ -71,79 +86,6 @@ def http_get(url: str, headers: dict[str, str], timeout: float) -> HTTPResponse:
             return HTTPResponse(
                 error.code, error.read(MAX_RESPONSE_BYTES + 1), tuple(error.headers.items())
             )
-
-
-def request_url(request: SourceRequest) -> str:
-    span = "minute" if request.frequency == "1m" else "day"
-    first = int(request.start_at.timestamp() * 1000)
-    last = int(request.end_at.timestamp() * 1000) - 1
-    return (
-        f"https://api.massive.com/v2/aggs/ticker/{request.symbol}/range/1/{span}/{first}/{last}?"
-        + urlencode({"adjusted": "false", "sort": "asc", "limit": request.page_limit})
-    )
-
-
-def checked_url(url: str, request: SourceRequest) -> str:
-    if not isinstance(url, str):
-        reject("PAGE_INVALID", "next_url", "Expected a provider URL")
-    try:
-        parsed = urlsplit(url)
-    except ValueError:
-        reject("PAGE_INVALID", "next_url", "Malformed provider URL")
-    span = "minute" if request.frequency == "1m" else "day"
-    prefix = f"/v2/aggs/ticker/{request.symbol}/range/1/{span}/"
-    if (
-        parsed.scheme != "https"
-        or parsed.netloc != "api.massive.com"
-        or parsed.fragment
-        or not parsed.path.startswith(prefix)
-    ):
-        reject(
-            "PAGE_INVALID", "next_url", "Pagination must stay on the requested provider endpoint"
-        )
-    query = parse_qsl(parsed.query, keep_blank_values=True)
-    if any(key.lower() in {"apikey", "api_key", "token", "access_token"} for key, _ in query):
-        reject("KEY_EXPOSURE", "next_url", "Credential-bearing pagination cannot be archived")
-    if any(key == "adjusted" and value != "false" for key, value in query):
-        reject("PAGE_INVALID", "next_url", "Pagination changed adjustment semantics")
-    return urlunsplit(parsed)
-
-
-def parse_page(body: bytes, request: SourceRequest) -> dict:
-    try:
-        page = json.loads(
-            body,
-            parse_constant=lambda _: reject("PAGE_INVALID", "response", "Nonfinite JSON constant"),
-        )
-    except (ValueError, UnicodeError):
-        reject("PAGE_INVALID", "response", "Provider response is not valid JSON")
-    if not isinstance(page, dict) or page.get("status") not in {"OK", "DELAYED"}:
-        reject(
-            "PAGE_INVALID", "status", "Provider did not acknowledge a complete successful response"
-        )
-    if page.get("ticker") != request.symbol or page.get("adjusted") is not False:
-        reject(
-            "PAGE_INVALID", "ticker", "Response ticker/adjustment declaration differs from request"
-        )
-    rows = page.get("results", [])
-    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
-        reject("PAGE_INVALID", "results", "Expected provider record objects")
-    if type(page.get("resultsCount")) is not int or page["resultsCount"] != len(rows):
-        reject("PAGE_INVALID", "resultsCount", "Response result count disagrees with records")
-    if type(page.get("queryCount")) is not int or page["queryCount"] < 0:
-        reject("PAGE_INVALID", "queryCount", "Base aggregate count is missing or invalid")
-    if not isinstance(page.get("request_id"), str) or not page["request_id"]:
-        reject("PAGE_INVALID", "request_id", "Provider request identity is missing")
-    next_url = page.get("next_url")
-    if next_url is not None:
-        checked_url(next_url, request)
-    elif page["queryCount"] >= request.page_limit:
-        reject(
-            "PAGINATION_INCOMPLETE",
-            "queryCount",
-            "Limit reached without a continuation or independent completeness evidence",
-        )
-    return page
 
 
 class MassiveAdapter:
@@ -347,6 +289,8 @@ class MassiveAdapter:
             request, acquisition_id, digest(metadata), digest(fingerprint)
         )
         write_once(session / "acquisition.json", binding)
+        paging = pagination_contract(request)
+        write_once(session / "pagination.json", paging)
         checkpoint_binding = {
             "schema_version": ACQUISITION_VERSION,
             "request_id": request.request_id,
@@ -414,8 +358,10 @@ class MassiveAdapter:
                 binding,
                 f"acquisition://{request.request_id}/{acquisition_id}",
             ),
+            ArchiveInput("pagination.json", "pagination_contract", paging, CUSTOM_BARS_SPEC),
             *evidence,
         ]
+        chain = PaginationChain(request)
         url, visited, total = request_url(request), set(), 0
         first, last = None, None
         for index in range(self._max_pages):
@@ -441,6 +387,7 @@ class MassiveAdapter:
                         reject("HASH_MISMATCH", "checkpoint", "Checkpoint response changed")
                 except (OSError, ValueError, KeyError, TypeError, IndexError):
                     reject("HASH_MISMATCH", "checkpoint", "Incomplete or invalid saved page")
+                chain.accept(url, parse_page(body, request))
             else:
                 if response_path.exists():
                     reject(
@@ -451,6 +398,7 @@ class MassiveAdapter:
                 response, attempts, bodies = self._fetch(url, request)
                 body = response.body
                 page = parse_page(body, request)
+                chain.accept(url, page)
                 safe_headers = tuple(
                     sorted(
                         (key.lower(), value)
@@ -460,6 +408,7 @@ class MassiveAdapter:
                 )
                 receipt = {
                     "schema_version": RECEIPT_VERSION,
+                    "pagination_version": PAGINATION_VERSION,
                     "url": url,
                     "sha256": digest(body),
                     "status": 200,
@@ -551,7 +500,7 @@ class MassiveAdapter:
                     canonical(checkpoint_binding | {"revision": snapshot.manifest.revision}),
                 )
                 return snapshot
-            url = checked_url(page["next_url"], request)
+            url = page["next_url"]
         reject(
             "PAGINATION_INCOMPLETE", "max_pages", "Pagination did not finish within the page bound"
         )

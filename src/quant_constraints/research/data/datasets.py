@@ -13,7 +13,14 @@ import polars as pl
 from quant_constraints.calendar import SessionCalendar
 
 from .archive import ArchivedSnapshot, ArchiveInput, ArchiveStore, audit_archive
-from .archive_contracts import ADAPTER_VERSION, canonical, digest, reject, wire
+from .archive_contracts import (
+    ADAPTER_VERSION,
+    LEGACY_ADAPTER_VERSION,
+    canonical,
+    digest,
+    reject,
+    wire,
+)
 from .contracts import RawBar
 from .massive import parse_page
 from .normalize import normalize_identities, normalize_raw_bars
@@ -30,7 +37,7 @@ def normalize_archived_snapshot(
     manifest, request = snapshot.manifest, snapshot.manifest.request
     if manifest.layer != "source":
         reject("INVALID_REQUEST", "layer", "Normalization starts from the original source layer")
-    if manifest.adapter_version != ADAPTER_VERSION:
+    if manifest.adapter_version not in {ADAPTER_VERSION, LEGACY_ADAPTER_VERSION}:
         reject("UNSUPPORTED_MANIFEST", "adapter_version", "No decoder for this adapter version")
     identities = normalize_identities(json.loads(snapshot.read("identities.json")))
     buckets: dict[str, list[dict]] = defaultdict(list)
@@ -53,7 +60,11 @@ def normalize_archived_snapshot(
     for file in manifest.files:
         if file.role != "response":
             continue
-        page = parse_page(snapshot.read(file.path), request)
+        page = parse_page(
+            snapshot.read(file.path),
+            request,
+            legacy=manifest.adapter_version == LEGACY_ADAPTER_VERSION,
+        )
         receipt_path = file.path.removesuffix(".json") + ".receipt.json"
         receipt = json.loads(snapshot.read(receipt_path))
         ingested = datetime.fromisoformat(receipt["attempts"][-1]["ended_at"])

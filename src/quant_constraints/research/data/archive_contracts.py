@@ -16,7 +16,8 @@ from .contracts.errors import timestamp
 from .normalize import NORMALIZER_VERSION
 
 ARCHIVE_VERSION = "research_archive_v1"
-ADAPTER_VERSION = "massive_aggregates_v1"
+ADAPTER_VERSION = "massive_aggregates_v2"
+LEGACY_ADAPTER_VERSION = "massive_aggregates_v1"
 ACQUISITION_VERSION = "research_acquisition_v1"
 RECEIPT_VERSION = "research_receipt_v1"
 EVIDENCE_ROLES = frozenset(
@@ -40,6 +41,7 @@ ROLES = frozenset(
         "source_definition",
         "license_terms",
         "acquisition_session",
+        "pagination_contract",
     }
 )
 

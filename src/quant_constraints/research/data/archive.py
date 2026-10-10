@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .archive_contracts import (
+    ADAPTER_VERSION,
     EVIDENCE_ROLES,
     RECEIPT_VERSION,
     RETRY_STATUSES,
@@ -22,6 +23,13 @@ from .archive_contracts import (
     evidence_fingerprint,
     parse_time,
     reject,
+)
+from .pagination import (
+    CUSTOM_BARS_SPEC,
+    PAGINATION_VERSION,
+    PaginationChain,
+    pagination_contract,
+    parse_page,
 )
 
 
@@ -189,6 +197,21 @@ def audit_archive(snapshot: ArchivedSnapshot) -> dict:
                 reject(
                     "SOURCE_CONFLICT", "acquisition", "Malformed or conflicting acquisition binding"
                 )
+        chain = None
+        if manifest.adapter_version == ADAPTER_VERSION:
+            paging = [item for item in manifest.files if item.role == "pagination_contract"]
+            if (
+                not sessions
+                or len(paging) != 1
+                or paging[0].path != "pagination.json"
+                or paging[0].source_ref != CUSTOM_BARS_SPEC
+                or safe_path(directory, paging[0].path).read_bytes()
+                != pagination_contract(manifest.request)
+            ):
+                reject(
+                    "SOURCE_CONFLICT", "pagination", "Missing or conflicting pagination contract"
+                )
+            chain = PaginationChain(manifest.request)
         bound_receipts, bound_retries = set(), set()
         previous_page_end = manifest.acquired_start_at
         for item in manifest.files:
@@ -200,6 +223,20 @@ def audit_archive(snapshot: ArchivedSnapshot) -> dict:
             bound_receipts.add(receipt_file.path)
             try:
                 receipt = json.loads(safe_path(directory, receipt_file.path).read_bytes())
+                if chain is not None:
+                    page = parse_page(
+                        safe_path(directory, item.path).read_bytes(), manifest.request
+                    )
+                    if (
+                        receipt.get("pagination_version") != PAGINATION_VERSION
+                        or receipt.get("provider_request_id") != page["request_id"]
+                        or receipt.get("next_url") != page.get("next_url")
+                        or item.path != f"pages/{len(bound_receipts) - 1:04d}.json"
+                    ):
+                        reject(
+                            "SOURCE_CONFLICT", "pagination", "Receipt differs from original page"
+                        )
+                    chain.accept(item.source_ref, page)
                 if (
                     receipt["sha256"] != item.sha256
                     or receipt["url"] != item.source_ref
@@ -303,6 +340,8 @@ def audit_archive(snapshot: ArchivedSnapshot) -> dict:
             item.path for item in manifest.files if item.role == "attempt_response"
         }:
             reject("SOURCE_CONFLICT", "receipt", "Unreferenced receipt or retry response file")
+        if chain is not None and (not bound_receipts or chain.next_url is not None):
+            reject("PAGINATION_INCOMPLETE", "pages", "Frozen pagination chain is not exhausted")
         if manifest.layer == "normalized":
             parents = [item for item in manifest.files if item.role == "source_manifest"]
             if len(parents) != 1 or parents[0].sha256 != manifest.source_manifest_sha256:
