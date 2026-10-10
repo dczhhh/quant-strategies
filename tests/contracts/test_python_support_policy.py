@@ -52,7 +52,7 @@ def test_python_315_prerelease_matrix_is_blocking_on_all_platforms() -> None:
     assert setup_step["with"]["python-version"] == "3.15"
     commands = _step_commands(prerelease)
     assert "sys.version_info[:2] == (3, 15)" in commands
-    assert "{'beta', 'candidate'}" in commands
+    assert "{'beta', 'candidate', 'final'}" in commands
     assert "uv venv --python 3.15" in commands
     assert "https://pypi.anaconda.org/scientific-python-nightly-wheels/simple" in commands
     assert '--prerelease allow --only-binary :all: "numpy>=2.6.0.dev0"' in commands
