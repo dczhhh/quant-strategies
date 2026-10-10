@@ -473,7 +473,10 @@ def test_config_invalid_values(changes):
 
 def test_sample_config_roundtrip_and_unknown_keys(tmp_path):
     config = ConstraintConfig.from_yaml("config/us_cash_concentrated.yaml")
-    assert config == ConstraintConfig()
+    assert config.macro_events_enabled
+    assert config.dividend_tax_profile == "cn_mainland_individual_treaty"
+    assert config.dividend_tax_qualification is None
+    assert {r.source_country: r.rate for r in config.dividend_tax_rules} == {"US": 0.10, "CA": 0.15}
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(asdict(config)))
     assert ConstraintConfig.from_yaml(path) == config

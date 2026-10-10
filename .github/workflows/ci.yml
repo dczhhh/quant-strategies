@@ -10,7 +10,6 @@ on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
@@ -328,8 +327,13 @@ jobs:
       - name: Build documentation with strict validation
         run: uv run mkdocs build --strict
 
+      - name: Verify pinned documentation sources and rendered copies
+        run: uv run python validation/check_documentation_sources.py --site site
+
       - name: Check rendered guide links
-        run: uv run python validation/check_documentation_links.py --site site
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: uv run python validation/check_research_documentation_links.py --site site
 
       - name: Verify rendered documentation identity
         run: >-

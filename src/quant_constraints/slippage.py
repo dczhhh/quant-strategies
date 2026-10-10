@@ -13,6 +13,7 @@ from datetime import datetime, time
 from .calendar import NY, SessionCalendar
 from .config import ConstraintConfig
 from .events import EarningsEvent, EarningsProvider
+from .macro import MacroEventGate
 from .models import MarketContext
 
 
@@ -25,6 +26,7 @@ class SlippageQuote:
     slippage_regime: str
     slippage_bps: float
     basis: tuple[str, ...]
+    macro_incremental_bps: float = 0.0
 
     @property
     def per_share(self):
@@ -50,9 +52,11 @@ class RegimeSlippage:
         calendar: SessionCalendar,
         earnings: EarningsProvider,
         context_provider: Callable[[str], MarketContext] | None = None,
+        macro: MacroEventGate | None = None,
     ):
         self.config, self.calendar, self.earnings = config, calendar, earnings
         self.context_provider = context_provider
+        self.macro = macro or MacroEventGate(config, calendar)
         self.bound: tuple[MarketContext, bool] | None = None
         self.actual_quote: SlippageQuote | None = None
         self._records: dict[str, SlippageRecord] = {}
@@ -132,8 +136,30 @@ class RegimeSlippage:
         if reservation:
             candidates.append((settings.slippage_early_close_bps, "reservation_upper_bound"))
             basis.append("reservation uses max applicable configured bps; actual fill rechecked")
+        baseline = max(value for value, _ in candidates)
+        if settings.macro_events_enabled:
+            missing, windows = self.macro.active(context.asof, pressure=True)
+            if windows or reservation or missing:
+                # Missing data never cancels a risk sell; use an auditable stress estimate.
+                candidates.append((settings.macro_slippage_bps, "macro_event"))
+                basis.append(
+                    "macro scenario bps="
+                    + str(settings.macro_slippage_bps)
+                    + "; pressure uses max, not sum; missing_calendar="
+                    + str(missing)
+                )
+                basis.extend("macro event=" + str(window.record()) for window in windows)
         bps, regime = max(candidates, key=lambda candidate: candidate[0])
-        return SlippageQuote(asset, context.asof, abs(quantity), price, regime, bps, tuple(basis))
+        return SlippageQuote(
+            asset,
+            context.asof,
+            abs(quantity),
+            price,
+            regime,
+            bps,
+            tuple(basis),
+            max(0.0, bps - baseline),
+        )
 
     @contextmanager
     def bind(self, context: MarketContext, *, actual=False):

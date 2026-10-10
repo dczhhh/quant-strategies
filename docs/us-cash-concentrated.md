@@ -76,7 +76,8 @@ Provider 的 `snapshot(security_id, asof)` 返回 `CorporateActionCoverage` 和�
 例如 100 股 × $100，除息后原价 $99：$9,900 股票加 $100 应收仍为税前 $10,000。
 付款仅把应收转现金，不再增加一次权益。`payable_date` **不会自动释放现金**；未确定
 真实到账的股息保持应收，需独立信用事件才能交易。`dividend_withholding_rate=0.0` 与
-`dividend_tax_scenario='gross_no_withholding'` 是默认税前情景，不是所有投资者的税率。
+`dividend_tax_scenario='gross_no_withholding'` 是旧构造的税前情景，不是所有投资者的税率。
+项目 YAML 使用下述显式国家税率情景。
 非零税率必须给情景命名；来源提供的本账户预扣率优先，费用按明确每股费用计算。
 
 事件键 `(security_id, event_id)`、已处理经济版本、应收/信用资格都保存在同一个
@@ -163,7 +164,7 @@ checkpoint；新格式信用读取已有数量，不扫描历史记录。缺少�
 
 项目默认 `fee_history_mode=current_snapshot_backcast`、`fee_snapshot_date='2026-10-10'`：把同一套当前经纪佣金档位和明确的第三方费用情景回套整个历史区间。这是反事实成本假设，不声称还原 2005/2015/2025 年的真实账单。每笔 `FeeBreakdown` 明示 `historical_fee_proxy=true`、快照日期、模式、版本、来源和假设。历史成交仍按其美东月份累计档位，按历史交易日期结算，快照日期不改写交易日历或结算周期。当前仅支持这份有来源的快照；更换快照须补充对应资料和实现。
 
-回套采用**正常收费、非假期监管代理**：SEC 卖出交易价值×0.0000206（[SEC 2026 生效文件](https://www.sec.gov/files/rules/other/2026/34-104909.pdf)）、TAF $0.000195/卖出股且每笔最高 $9.79（[FINRA 费率文件](https://www.finra.org/sites/default/files/2024-11/sr-finra-2024-019.pdf)）、CAT $0.000003/成交股。2026 年第四季度的 TAF 假期**不回套**全部历史交易，因此这份快照情景连 2026 年第四季度也保留正常 TAF。这些费率与场所代理都不是完整历史档案，也不做券商特定分币取整。费用敏感性可以显式传入 `IBKRProTieredUSStock(history_mode='current_snapshot_backcast', backcast_regulatory_rate=...)`，用带版本和来源的 `RegulatoryRate` 上调 SEC/TAF 等代理。
+回套采用**正常收费、非假期监管代理**：SEC 卖出交易价值×0.0000206（[SEC 2026 生效文件，固定文本副本](sources/sec-fee-2026.txt)）、TAF $0.000195/卖出股且每笔最高 $9.79（[FINRA 费率文件](https://www.finra.org/sites/default/files/2024-11/sr-finra-2024-019.pdf)）、CAT $0.000003/成交股。2026 年第四季度的 TAF 假期**不回套**全部历史交易，因此这份快照情景连 2026 年第四季度也保留正常 TAF。这些费率与场所代理都不是完整历史档案，也不做券商特定分币取整。费用敏感性可以显式传入 `IBKRProTieredUSStock(history_mode='current_snapshot_backcast', backcast_regulatory_rate=...)`，用带版本和来源的 `RegulatoryRate` 上调 SEC/TAF 等代理。
 
 `fee_history_mode=strict_historical` 则按真实成交日期选择明确监管版本，缺失覆盖立即报错。目前内置监管覆盖只到 2026 年：SEC 4 月 4 日前为零，之后按上述费率；TAF 1–9 月正常，10–12 月按已记录假期为零。其他日期需显式提供不重叠的 `regulatory_rates`。该模式只保证监管版本日期覆盖，基础佣金、场所费用和 CAT 仍是披露的快照代理，不能称为完整历史费用还原。独立构造 `IBKRProTieredUSStock()` 保持严格模式；项目工厂根据配置显式选择回套模式。传入自定义 `fee_model` 时使用该模型声明的模式和参数。
 
@@ -283,6 +284,86 @@ broker.cancel_rebalance_plan(plan.plan_id)
 所有提交/修改和最终成交分别检查。提交可 `RESIZE`；实际价格/费用使计划越界时拒绝成交并释放预约资金，不偷偷更改外部目标。结构化审计包含时间、资产、订单 ID、种类、阶段、可用结算现金、所需资金和原因。常见码包括 `outside_rth`、`entry_window`、`settled_cash`、`cash_reserve`、`short_sale`、`earnings_blackout`、`earnings_liquidity_missing`、`overweight_drift`、`industry_missing`、`rebalance_schedule`、`weight_deadband` 和 `weekly_entries`。
 
 审计还包括 `side`、申请数量、许可数量、单次实际成交量和最终状态。`submission` 是尝试，`order` 是基座订单，`execution` 是一次增量成交，`terminal` 是终止；不能把重复成交前检查当作成交。`buy_checks` 仅统计买入提交（卖出 `REBALANCE` 不计入），`earnings_buy_checks` 统计真正到达股票财报门禁的提交，财报触发率以此为分母；分别报告四种准入动作、唯一订单数、成交次数/数量、完整成交订单数和唯一财报事件数。ETF 的财报豁免不会虚增股票财报调用。DEFER 是等待而非最终成交许可。
+
+## 中国大陆个人股息税情景
+
+`ConstraintConfig()` 保留旧 `legacy` 模式；项目 YAML 显式选择
+`cn_mainland_individual_treaty`，按**派息主体的税源国**匹配版本化规则：US 10%、CA 15%。
+依据为[中美协定 Article 9](https://www.irs.gov/pub/irs-trty/china.pdf)与
+[中加协定 Article 10(2)(b)，固定文本副本](sources/ca-cn-treaty.txt)。
+副本的原始 URL、获取时间和哈希见[来源清单](sources/manifest.json)及[副本验证边界](us-cash-account.md#official-sources)，不认证现行法规或历史 PIT。
+该情景仅适用于普通 USD 股票股息、中国大陆税收居民个人、非美加税收居民、受益所有人且文书有效的显式假设；
+不能用国籍、上市交易所、SMART 执行场所或 USD 货币判断来源国，也不认定用户真实税收身份。
+
+`DividendTaxQualification` 必须显式提供居民地、`individual`、`non_us_ca_tax_resident`、
+`beneficial_owner`、`treaty_documents_valid`、有效日期、已知时间和来源。YAML 的资格为 `null`，
+确认前拒绝协定表应用。规则使用 `[effective_from, effective_to)`、`known_at`、`verified_at`、
+`source/version`；样例仅记录本次 2026-10-10 核查并在 2027-01-01 前失效待复核，
+不是为早年历史补造当时已知的证据。早期输入须提供独立 PIT 规则，否则拒绝。
+
+`CorporateAction` 增加 `tax_source_country/tax_source/tax_source_known_at` 和
+`distribution_type=ordinary_stock`。缺字段、未知国别、无有效期规则或冲突规则均拒绝。
+REIT、ETF/RIC 分配、MLP、资本返还、特殊股息、未知 ADR 分类及非 USD 仍不支持。
+同一美股市场上市的加拿大派息主体使用 CA 规则。真实历史发行人身份/来源证明归 Issue #5D。
+
+可见的账户/事件 `withholding_rate + withholding_source + withholding_known_at` 优先于情景表。
+与表不符时 `dividend_tax_conflict_policy=record_actual` 保存差异并采用实际信息；`reject` 要求对账。
+未确认协定资格者可显式选 `explicit_rules`，提供有版本/来源的法定税率情景，不能静默回退零税率。
+其他国别须显式加普通股息规则；接口字段声明仍不是外部证据认证。
+
+20 股、每股 USD 1：US 毛额20、预提2、净应收18；CA 毛额20、预提3、净应收17。
+除息锁定股数和税额，不增加 settled cash；独立信用到账仅转净应收一次，不重复扣税。
+实际 `credited_net` 的差额单独审计，不能仅凭到账差额猜测实际税或费用。
+税证据、预提金额保存在 canonical entitlement/checkpoint、records、结果与 Parquet 中；
+零股观察无权益，正股数且净额零仍有资格；旧模式 checkpoint 结构保持兼容。
+`capital_gains_tax_mode=none` 不从盈亏卖出或调仓扣资本利得税，佣金/滑点照旧。
+这只限定本回测模型，不表示境外价差收入依法免税。
+
+## 宏观事件门禁与滑点压力
+
+旧构造默认 `macro_events_enabled=false`；项目 YAML 启用，并要求 PIT 覆盖。
+给 `ConstraintController(config, earnings, macro=provider)` 提供 `MacroEventProvider.snapshot(asof)`。
+首版 `MacroEvent` 覆盖 CPI、NFP、PCE、PPI、FOMC_STATEMENT、FOMC_PRESS、ISM，包含稳定事件 ID、
+精确计划 timestamp、`scheduled_known_at`、source/revision、可选实际发布及取消/缺失标记。
+`MacroEventCoverage` 明确覆盖范围、事件集合、当时可见时间、PIT/version；空事件列表必须仍有覆盖证明。
+合成 `InMemoryMacroEventProvider` 只供应 fixture，不下载今日最终版日历回填历史。
+官方计划参考 [BLS CPI，2026-10-10 固定文本副本](sources/bls-cpi.txt)、
+[BEA](https://www.bea.gov/news/schedule)、[Fed](https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm)，
+逐事件读取精确时刻，代码不制造固定发布日或把全部发布硬编码在 08:30。
+
+| 已知计划事件 | 默认主动买入限制（与实际 RTH 求交） |
+|---|---|
+| 盘前 CPI/NFP/PCE | 开盘起60分钟，正常日09:30–10:30 |
+| 盘前 PPI | 开盘起45分钟，正常日09:30–10:15 |
+| FOMC statement | 发布前30分钟至当日收盘；14:00计划对应13:30起 |
+| FOMC press conference | 发布前60分钟至收盘；14:30计划对应13:30起 |
+| 其他 RTH 发布/ISM | 前15分钟至后30分钟 |
+
+窗口都是含起点、不含终点，重叠取并集并输出安全 `resume_at`；半日市裁剪、假期/周末事件不自动移到下一交易日。
+`macro_fomc_next_session=true` 可加下一交易日开盘首60分钟；覆盖证明随之要求上一交易日。
+未来修订/取消不可提前影响当下；晚获知突发事件仅在其真实可见/发布以后暂停，不向前回填。
+未知覆盖默认 `macro_calendar_missing` 拒绝买入；`explicit_opt_out` 是显式放弃要求且记录警告，
+已知 blackout 仍有效。日频 OHLC 拒绝精确分钟窗。DEFER 保存既有现金预约，按每个实际 bar 重审；
+现有 DAY/GTD 到期/取消会释放预约。提交、改单、部分成交剩余量和最终成交均走共同门禁。
+正常减仓、风险退出和已有 Bracket/OCO 保护继续遵守 RTH，不因宏观公布自动清仓或产生方向信号。
+盘前发布不允许盘前成交，开盘跳空采用实际可用 RTH 价格。
+
+宏观滑点 `macro_slippage_bps=10` 是压力假设，测试5/10/20三档；与2/3/5的既有档位取 max，绝不相加。
+实际压力仅在发布前15/后30分钟与 RTH 的交集；盘前发布对应开盘首30分钟，非无条件全天。
+预约采用配置上界；日历缺失的风险卖出用有记录的保守压力，不阻断合法风险退出。
+quote basis 保存事件、已知时间和窗口，`macro_incremental_bps` 为相对既有最高档的增量。
+统计 `macro_trigger_rate/macro_checks/deferred_entries` 记录真正到达门禁的检查和唯一延迟订单；
+`slippage_statistics()` 输出 `macro_slippage_cost` 增量美元成本和 `event_exposure` 实际事件压力成交次数。
+
+Engine A/B 回归重放**相同外部订单**以检查机会成本（人工价格和零执行成本，只隔离门禁，不是收益预测）：
+
+| 模式 | 收益 | 最大回撤 | 成交金额/初始NAV | 执行成本 |
+|---|---:|---:|---:|---:|
+| 宏观关闭，100买/100卖 | 0% | 1.9608% | 40% | 0 |
+| CPI启用，延至110买/100卖 | −2% | 2% | 42% | 0 |
+
+开启门禁不保证改善收益或回撤；真实敏感性/收益比较仍需经过 Issue #5 的授权历史数据验证，不能用 fixture 解除阻塞。
+PR #4 第九轮关于每 bar 全量快照的性能意见仍未关闭，本次税与宏观扩展不声称解决它。
 
 ## 验证与数据依赖
 

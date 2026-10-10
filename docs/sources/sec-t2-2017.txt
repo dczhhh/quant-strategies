@@ -1,0 +1,189 @@
+SEC T+2 settlement transition announcement
+Source: https://www.sec.gov/newsroom/press-releases/2017-68-0
+Captured (UTC): 2026-10-10T18:01:09.673363+00:00
+Reproduction: US federal government text
+
+SEC.gov | SEC Adopts T+2 Settlement Cycle for Securities Transactions
+Skip to search field
+Skip to main content
+An official website of the United States government
+Here’s how you know
+Here’s how you know
+Official websites use .gov
+A
+.gov
+website belongs to an official government organization in the United States.
+Secure .gov websites use HTTPS
+A
+lock
+(
+Lock
+A locked padlock
+)
+              or
+https://
+means you’ve safely connected to the .gov website. Share sensitive information only on official, secure websites.
+SEC homepage
+Menu
+Close
+Search SEC.gov & EDGAR
+Search
+Search Filings
+Search Filings
+Full Text Search
+Latest Filings
+Mutual Fund Search
+Variable Insurance Products Search
+SIC Codes
+CIK Lookup
+Public Dissemination Service (PDS)
+Search Assistance
+Submit Filings
+Submit Filings
+EDGAR Filer Management Portal
+EDGAR Filing Portal
+Online Forms Management Portal
+EDGAR Next
+Forms Index
+Filer Support & Resources
+Data & Research
+Data & Research
+Data Library
+Statistics & Data Visualizations
+Structured Data
+Investment Management Data
+Open Data at the SEC
+Rules, Enforcement, & Compliance
+Rules & Regulations
+Rulemaking Activity
+Submit Public Comments
+Staff Guidance
+No-Action, Interpretive, and Exemptive Letters
+Self-Regulatory Organization Rulemaking
+Public Petitions for Rulemaking
+Enforcement & Litigation
+Litigation Releases
+Administrative Proceedings
+Administrative Law Judge Orders and Initial Decisions
+Trading Suspensions
+Distributions to Harmed Investors
+Receiverships
+Compliance
+Examination Priorities
+Risk Alerts
+Compliance Outreach Program
+Proposed Rules
+What's New
+Whistleblower Program
+Featured Topics
+Featured Topics
+Crypto Task Force
+Cybersecurity
+Market Structure Analytics
+Saving and Investing for Military Personnel
+Saving and Investing for Teachers
+SEC-CFTC Harmonization Initiative
+Treasury Clearing Implementation
+About
+About
+Mission
+Commissioners
+Divisions & Offices
+Division & Office Directors
+Advisory Committees
+Budget & Performance
+Reports & Publications
+Commission Votes
+Contact the SEC
+Careers
+Submit a Tip or Complaint
+Newsroom
+|
+Investors
+Small Businesses
+Whistleblowers
+Newsroom
+|
+Investors
+Small Businesses
+Whistleblowers
+Search SEC.gov & EDGAR
+Search
+More in this Section
+Newsroom
+Press Releases
+Speeches & Statements
+Meetings & Events
+Videos
+Social Media Directory
+Podcasts
+What's New
+Newsroom
+Press Releases
+Speeches & Statements
+Meetings & Events
+Videos
+Social Media Directory
+Podcasts
+What's New
+Home
+Newsroom
+Press Releases
+SEC Adopts T+2 Settlement Cycle for Securities Transactions
+Press Release
+SEC Adopts T+2 Settlement Cycle for Securities Transactions
+For Immediate Release
+2017-68
+Washington D.C., March 22, 2017 —
+The Securities and Exchange Commission today adopted an amendment to shorten by one business day the standard settlement cycle for most broker-dealer securities transactions.  Currently, the standard settlement cycle for these transactions is three business days, known as T+3.  The amended rule shortens the settlement cycle to two business days, T+2.
+The amended rule is designed to enhance efficiency, reduce risk, and ensure a coordinated and expeditious transition by market participants to a shortened standard settlement cycle.
+“As technology improves, new products emerge, and trading volumes grow, it is increasingly obvious that the outdated T+3 settlement cycle is no longer serving the best interests of the American people,” said SEC Acting Chairman Michael Piwowar.  “The SEC remains committed to ensuring that U.S. securities regulation is reflective of modern times, and in shortening the settlement cycle by one day we aim to increase efficiency and reduce risk for market participants.”
+Broker-dealers will be required to comply with the amended rule beginning on Sept. 5, 2017.
+To assist broker-dealers, other securities professionals and the investing public in their preparation for the implementation of a T+2 settlement cycle, the Commission has established an e-mail address –
+T2settlement@sec.gov
+– for the submission of inquiries to SEC staff.
+*   *   *
+FACT SHEET
+Shortening the Trade Settlement Cycle
+SEC Open Meeting
+March 22, 2017
+The amended Rule 15c6-1(a) would prohibit a broker-dealer from effecting or entering into a contract for the purchase or sale of a security that provides for payment of funds and delivery of securities later than T+2, unless otherwise expressly agreed to by the parties at the time of the transaction.  As stated in the rule, the T+2 requirement would not apply to certain categories of securities, such as exempted securities.
+Generally, this change would mean that when an investor buys a security, the brokerage firm must receive payment from the investor no later than two business days after the trade is executed.  When an investor sells a security, the investor must deliver to the brokerage firm the investor’s security no later than two business days after the sale.  For example, if an investor sells shares of a particular stock on Monday, the transaction would settle on Wednesday.
+The amended rule would apply the T+2 settlement cycle to the same securities transactions currently covered by the T+3 settlement cycle.  These include transactions for stocks, bonds, municipal securities, exchange-traded funds, certain mutual funds, and limited partnerships that trade on an exchange.
+The compliance date for the amendment to Rule 15c6-1(a) is Sept. 5, 2017, which is consistent with the target implementation date set by the Industry Steering Committee.
+###
+Last Reviewed or Updated:
+March 24, 2017
+Return to top
+SEC homepage
+About the SEC
+Budget & Performance
+Careers
+Commission Votes
+Contact
+Contracts
+Transparency
+Accessibility & Disability
+Super Intelligence
+FOIA
+Inspector General
+No FEAR Act Data
+Ombuds
+SEC Excess Personal Property Guidance
+Websites
+Investor.gov
+Related Sites
+USA.gov
+Site Information
+Plain Writing
+Privacy & Security
+Site Map
+Stay connected. Sign up for email updates.
+Your email address
+Sign Up
+X
+Facebook
+Instagram
+RSS
+YouTube
+Email Updates

@@ -4,6 +4,8 @@ validation/check_coverage.py
 validation/check_fork_evidence.py
 validation/check_documentation_examples.py
 validation/check_documentation_links.py
+validation/check_research_documentation_links.py
+validation/check_documentation_sources.py
 validation/check_documentation_identity.py
 validation/check_security.py
 validation/build_framework_env.py

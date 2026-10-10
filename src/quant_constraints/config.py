@@ -2,11 +2,14 @@
 
 import math
 from dataclasses import dataclass, fields
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
 
 import yaml
+
+from .dividend_tax import DividendTaxQualification, DividendTaxRule
+from .macro import MACRO_TYPES
 
 
 @dataclass(frozen=True)
@@ -80,6 +83,34 @@ class ConstraintConfig:
     )
     dividend_withholding_rate: float = 0.0
     dividend_tax_scenario: str = "gross_no_withholding"
+    dividend_tax_profile: Literal["legacy", "cn_mainland_individual_treaty", "explicit_rules"] = (
+        "legacy"
+    )
+    dividend_tax_rules: tuple[DividendTaxRule, ...] = ()
+    dividend_tax_qualification: DividendTaxQualification | None = None
+    dividend_tax_conflict_policy: Literal["record_actual", "reject"] = "record_actual"
+    unknown_dividend_tax_policy: Literal["reject"] = "reject"
+    capital_gains_tax_mode: Literal["none"] = "none"
+    macro_events_enabled: bool = False
+    macro_event_types: tuple[str, ...] = (
+        "CPI",
+        "NFP",
+        "PCE",
+        "PPI",
+        "FOMC_STATEMENT",
+        "FOMC_PRESS",
+        "ISM",
+    )
+    missing_macro_calendar: Literal["reject_new_entries", "explicit_opt_out"] = "reject_new_entries"
+    macro_major_wait_minutes: int = 60
+    macro_ppi_wait_minutes: int = 45
+    macro_fomc_statement_lead_minutes: int = 30
+    macro_fomc_press_lead_minutes: int = 60
+    macro_fomc_next_session: bool = False
+    macro_fomc_next_wait_minutes: int = 60
+    macro_pre_release_minutes: int = 15
+    macro_post_release_minutes: int = 30
+    macro_slippage_bps: float = 10.0
 
     def __post_init__(self):
         for item in fields(self):
@@ -98,6 +129,11 @@ class ConstraintConfig:
         ):
             raise ValueError("Invalid drawdown reduction fraction")
         choices = {
+            "dividend_tax_profile": {"legacy", "cn_mainland_individual_treaty", "explicit_rules"},
+            "dividend_tax_conflict_policy": {"record_actual", "reject"},
+            "unknown_dividend_tax_policy": {"reject"},
+            "capital_gains_tax_mode": {"none"},
+            "missing_macro_calendar": {"reject_new_entries", "explicit_opt_out"},
             "split_order_policy": {"adjust", "cancel"},
             "execution_data_mode": {"raw_execution"},
             "signal_data_mode": {"raw_execution", "split_adjusted_signal", "total_return_signal"},
@@ -139,6 +175,8 @@ class ConstraintConfig:
                 raise ValueError("rebalance_anchor must be an ISO date")
             date.fromisoformat(self.rebalance_anchor)
         for name in (
+            "macro_events_enabled",
+            "macro_fomc_next_session",
             "corporate_actions_enabled",
             "hold_through_earnings",
             "market_gates",
@@ -148,6 +186,13 @@ class ConstraintConfig:
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")
         for name in (
+            "macro_major_wait_minutes",
+            "macro_ppi_wait_minutes",
+            "macro_fomc_statement_lead_minutes",
+            "macro_fomc_press_lead_minutes",
+            "macro_fomc_next_wait_minutes",
+            "macro_pre_release_minutes",
+            "macro_post_release_minutes",
             "minimum_hold_sessions",
             "entry_delay_minutes",
             "entry_close_buffer_minutes",
@@ -226,6 +271,27 @@ class ConstraintConfig:
             raise ValueError("An explicit dividend tax scenario is required")
         if self.dividend_withholding_rate and self.dividend_tax_scenario == "gross_no_withholding":
             raise ValueError("Nonzero withholding requires a named investor tax scenario")
+        if not isinstance(self.dividend_tax_rules, tuple) or any(
+            not isinstance(rule, DividendTaxRule) for rule in self.dividend_tax_rules
+        ):
+            raise ValueError("dividend_tax_rules must be an immutable tuple of DividendTaxRule")
+        if self.dividend_tax_qualification is not None and not isinstance(
+            self.dividend_tax_qualification, DividendTaxQualification
+        ):
+            raise ValueError("Invalid dividend tax qualification")
+        if self.dividend_tax_profile != "legacy" and (
+            not self.dividend_tax_rules
+            or self.dividend_withholding_rate
+            or self.dividend_tax_scenario == "gross_no_withholding"
+        ):
+            raise ValueError("Country tax profiles require explicit versioned rules/scenario")
+        if (
+            not isinstance(self.macro_event_types, tuple)
+            or not self.macro_event_types
+            or len(set(self.macro_event_types)) != len(self.macro_event_types)
+            or not set(self.macro_event_types) <= MACRO_TYPES
+        ):
+            raise ValueError("Invalid macro event types")
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "ConstraintConfig":
@@ -235,4 +301,25 @@ class ConstraintConfig:
         unknown = raw.keys() - {item.name for item in fields(cls)}
         if unknown:
             raise ValueError(f"Unknown constraint settings: {sorted(unknown)}")
+
+        def typed_terms(value):
+            terms = dict(value)
+            for name in ("effective_from", "effective_to"):
+                if isinstance(terms[name], str):
+                    terms[name] = date.fromisoformat(terms[name])
+            for name in ("known_at", "verified_at"):
+                if name in terms and isinstance(terms[name], str):
+                    terms[name] = datetime.fromisoformat(terms[name])
+            return terms
+
+        if "dividend_tax_rules" in raw:
+            raw["dividend_tax_rules"] = tuple(
+                DividendTaxRule(**typed_terms(rule)) for rule in raw["dividend_tax_rules"]
+            )
+        if raw.get("dividend_tax_qualification") is not None:
+            raw["dividend_tax_qualification"] = DividendTaxQualification(
+                **typed_terms(raw["dividend_tax_qualification"])
+            )
+        if "macro_event_types" in raw:
+            raw["macro_event_types"] = tuple(raw["macro_event_types"])
         return cls(**raw)
