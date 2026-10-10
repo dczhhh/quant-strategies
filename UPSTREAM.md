@@ -18,7 +18,9 @@ Their ten source-bound publication checks are marked `upstream_evidence` and are
 excluded from the current-source research suite. CI checks the original evidence
 generator and all 27 tests in its three evidence modules on a detached worktree
 at the immutable imported commit above. A separate fork-integrity check compares
-the retained validation files and generated claim blocks with that commit.
+the retained reports, comparison runners, provenance inputs and generated claim
+blocks with that commit. The fork's packaging manifest and lint file list may
+evolve to include its additional package; this does not rewrite archived evidence.
 Running `uv run pytest -m upstream_evidence --no-cov` on modified source correctly
 refuses certification until fresh evidence exists. Functional runner, engine,
 accounting and artifact regression checks remain in the current-source suite;

@@ -17,8 +17,9 @@ CLAIM_TARGETS = (
 )
 START = b"<!-- parity-claims:start -->"
 END = b"<!-- parity-claims:end -->"
-# The lint/typecheck file list may grow as the fork adds validation tools.
-EDITABLE = {"validation/release_checks.txt", *CLAIM_TARGETS}
+# Fork packaging and lint lists may evolve; retained reports, comparison runners
+# and provenance inputs must remain byte-for-byte unchanged.
+EDITABLE = {"validation/release_checks.txt", "validation/check_artifacts.py", *CLAIM_TARGETS}
 
 
 def claim_block(content: bytes) -> bytes:
