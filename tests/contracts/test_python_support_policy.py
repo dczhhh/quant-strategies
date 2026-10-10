@@ -35,7 +35,7 @@ def test_stable_matrix_runs_every_required_check_on_all_supported_platforms() ->
     for required_command in (
         "uv sync --dev --locked",
         "import ml4t.backtest",
-        'pytest tests/ -v --tb=short --no-cov -m "not benchmark"',
+        'pytest tests/ -v --tb=short --no-cov -m "not benchmark and not upstream_evidence"',
         "ty check --python-version ${{ matrix.python-version }}",
         "uv build",
     ):
@@ -52,13 +52,16 @@ def test_python_315_prerelease_matrix_is_blocking_on_all_platforms() -> None:
     assert setup_step["with"]["python-version"] == "3.15"
     commands = _step_commands(prerelease)
     assert "sys.version_info[:2] == (3, 15)" in commands
-    assert "{'beta', 'candidate'}" in commands
+    assert "{'beta', 'candidate', 'final'}" in commands
     assert "uv venv --python 3.15" in commands
     assert "https://pypi.anaconda.org/scientific-python-nightly-wheels/simple" in commands
     assert '--prerelease allow --only-binary :all: "numpy>=2.6.0.dev0"' in commands
     assert "--no-build-isolation-package pandas" in commands
     assert "--editable . --group test" in commands
-    assert 'pytest tests/ -v --tb=short --no-cov -m "not benchmark"' in commands
+    assert (
+        'pytest tests/ -v --tb=short --no-cov -m "not benchmark and not upstream_evidence"'
+        in commands
+    )
     assert any("actions/upload-artifact" in step.get("uses", "") for step in prerelease["steps"])
     assert {"stable", "prerelease"} <= set(gate["needs"])
 
@@ -90,7 +93,7 @@ def test_minimum_dependency_matrix_proves_declared_lower_bounds() -> None:
         "--no-binary ml4t-backtest",
         "uv pip freeze > minimum-versions-${{ matrix.python-version }}.txt",
         "import ml4t.backtest",
-        'pytest tests/ -v --tb=short --no-cov -m "not benchmark"',
+        'pytest tests/ -v --tb=short --no-cov -m "not benchmark and not upstream_evidence"',
         "ty check --python-version ${{ matrix.python-version }}",
         "uv build",
     ):

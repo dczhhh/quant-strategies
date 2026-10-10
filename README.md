@@ -34,6 +34,11 @@ uv run pytest
 
 # ml4t-backtest
 
+This fork adds an opt-in [US cash concentrated-account constraint layer](docs/us-cash-concentrated.md)
+and [validated example configuration](config/us_cash_concentrated.yaml). It checks external order
+intents, sessions, earnings calendars, portfolio limits and rebalance permission; it contains no
+buy signals and leaves the upstream defaults unchanged.
+
 [![Python 3.12-3.14](https://img.shields.io/badge/python-3.12--3.14-blue.svg)](https://www.python.org/downloads/)
 [![PyPI](https://img.shields.io/pypi/v/ml4t-backtest)](https://pypi.org/project/ml4t-backtest/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)

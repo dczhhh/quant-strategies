@@ -41,7 +41,7 @@ jobs:
           '${{ matrix.python-version }}'"
 
       - name: Run the non-hardware test suite
-        run: uv run --no-sync pytest tests/ -v --tb=short --no-cov -m "not benchmark"
+        run: uv run --no-sync pytest tests/ -v --tb=short --no-cov -m "not benchmark and not upstream_evidence"
 
       - name: Type-check for Python ${{ matrix.python-version }}
         run: uv run --no-sync ty check --python-version ${{ matrix.python-version }}
@@ -95,11 +95,11 @@ jobs:
           "import sys; import numpy; import pandas; import ml4t.backtest;
           from packaging.version import Version;
           assert sys.version_info[:2] == (3, 15);
-          assert sys.version_info.releaselevel in {'beta', 'candidate'};
+          assert sys.version_info.releaselevel in {'beta', 'candidate', 'final'};
           assert Version(numpy.__version__) >= Version('2.6.0.dev0')"
 
       - name: Run the non-hardware test suite
-        run: uv run --no-sync pytest tests/ -v --tb=short --no-cov -m "not benchmark"
+        run: uv run --no-sync pytest tests/ -v --tb=short --no-cov -m "not benchmark and not upstream_evidence"
 
       - name: Record the prerelease dependency set
         run: uv pip freeze > prerelease-versions-${{ runner.os }}.txt
@@ -142,7 +142,7 @@ jobs:
         run: uv run --no-sync python -c "import ml4t.backtest"
 
       - name: Run the non-hardware test suite
-        run: uv run --no-sync pytest tests/ -v --tb=short --no-cov -m "not benchmark"
+        run: uv run --no-sync pytest tests/ -v --tb=short --no-cov -m "not benchmark and not upstream_evidence"
 
       - name: Type-check for Python ${{ matrix.python-version }}
         run: uv run --no-sync ty check --python-version ${{ matrix.python-version }}

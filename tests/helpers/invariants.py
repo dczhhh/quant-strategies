@@ -87,6 +87,18 @@ def _check_equity_terminal(
     open_trades = [t for t in result.trades if t.status == "open"]
     open_pnl = sum(t.pnl for t in open_trades)
     funding = sum(payment.cash_delta for payment in result.funding_payments)
+    income = 0.0
+    if "corporate_actions_v1" in result.metrics:
+        evidence = result.metrics["corporate_actions_v1"]
+        assert evidence["version"] == 1
+        records = evidence["records"]
+        keys = [(r["security_id"], r["event_id"]) for r in records]
+        assert len(set(keys)) == len(keys), "Corporate actions were booked more than once"
+        income = sum(record["income_delta"] for record in records)
+        assert math.isclose(income, evidence["income"], abs_tol=_ABS_TOL)
+        assert math.isclose(
+            sum(evidence["receivables"].values()), evidence["outstanding"], abs_tol=_ABS_TOL
+        )
     if "total_funding" in result.metrics:
         reported_funding = result.metrics["total_funding"]
         assert math.isclose(
@@ -97,11 +109,11 @@ def _check_equity_terminal(
     if "num_funding_events" in result.metrics:
         assert result.metrics["num_funding_events"] == len(result.funding_payments)
 
-    expected = initial_cash + realized_pnl + open_pnl + funding
+    expected = initial_cash + realized_pnl + open_pnl + funding + income
     diff = abs(expected - final_value)
 
     reported_trades = [*realized_trades, *open_trades]
-    terms = [initial_cash, *(t.pnl for t in reported_trades), funding]
+    terms = [initial_cash, *(t.pnl for t in reported_trades), funding, income]
     notionals = [abs(t.quantity) * t.exit_price * t.multiplier for t in reported_trades]
     tol = _accounting_tolerance(
         expected,

@@ -27,18 +27,27 @@ jobs:
   dependency-review:
     name: Dependency Review
     if: github.event_name == 'pull_request'
+    needs: [security]
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        if: github.repository == 'ml4t/backtest'
+      # The research fork lacks GitHub's Dependency Review feature.
+      # Its locked runtime dependency audit remains mandatory and blocks every CVE.
+      - name: Require the fork's locked dependency and source audit
+        if: github.repository != 'ml4t/backtest'
+        run: test "${{ needs.security.result }}" = "success"
 
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
@@ -70,7 +79,7 @@ jobs:
         run: xargs uv run ruff format --check src/ tests/ < validation/release_checks.txt
 
       - name: Verify parity claims match retained evidence
-        run: uv run python validation/generate_parity_claims.py --check
+        run: uv run python validation/check_fork_evidence.py
 
       - name: Verify generated release history
         run: uv run python validation/generate_changelog.py --check
@@ -112,6 +121,29 @@ jobs:
             --with "$GITHUB_WORKSPACE"/dist/*.whl \
             ty check public_api_consumer.py
 
+  archived-evidence:
+    name: Archived Upstream Evidence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "latest"
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Verify frozen evidence against its immutable source
+        run: |
+          archive="$RUNNER_TEMP/upstream-archive"
+          git worktree add --detach "$archive" c1ee19c385db3cbad225822cf845832470694f2b
+          cd "$archive"
+          uv sync --dev --locked
+          uv run python validation/generate_parity_claims.py --check
+          uv run pytest -q -o addopts='' --no-cov \
+            tests/contracts/test_lean_case_study_evidence.py \
+            tests/contracts/test_parity_claim_generation.py \
+            tests/contracts/test_real_strategy_runner.py
+
   compatibility:
     name: Compatibility
     uses: ./.github/workflows/compatibility.yml
@@ -139,7 +171,8 @@ jobs:
 
       - name: Run branch coverage suite
         run: >-
-          uv run pytest tests/ -q -m "not benchmark"
+          uv run pytest tests/ -q -m "not benchmark and not upstream_evidence"
+          --cov=quant_constraints
           --cov-branch --cov-report=term --cov-report=json:coverage.json
 
       - name: Enforce global and critical-module coverage
@@ -318,7 +351,7 @@ jobs:
     name: Build Package
     runs-on: ubuntu-latest
     needs:
-      [lint, typecheck, compatibility, security, coverage, runtime, public-parity, documentation]
+      [lint, typecheck, archived-evidence, compatibility, security, coverage, runtime, public-parity, documentation]
     env:
       RELEASE_VERSION: ${{ inputs.release-version }}
     steps:

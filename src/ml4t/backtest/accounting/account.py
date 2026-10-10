@@ -42,6 +42,9 @@ class AccountState:
         self._lock_notional_free_cash = initial_cash
         self._lock_notional_short_basis: dict[str, float] = {}
         self.positions: dict[str, Position] = {}
+        # Non-cash entitlements belong to this ledger, never to buying power.
+        # Empty for native accounts; opt-in corporate actions populate it.
+        self._receivables: dict[str, float] = {}
         self.policy = policy
 
         # Settlement tracking: holds are (settle_bar, amount) pairs
@@ -54,12 +57,21 @@ class AccountState:
         """Calculate total account equity (Net Liquidating Value).
 
         For both cash and margin accounts:
-            NLV = Cash + Σ(position.market_value)
+            NLV = Cash + non-cash receivables + Σ(position.market_value)
 
         Returns:
             Total account equity
         """
-        return self.cash + sum(p.market_value for p in self.positions.values())
+        return (
+            self.cash
+            + self._receivable_value
+            + sum(p.market_value for p in self.positions.values())
+        )
+
+    @property
+    def _receivable_value(self) -> float:
+        """Recognized non-cash income; excluded from cash and settlement holds."""
+        return sum(self._receivables.values())
 
     @property
     def buying_power(self) -> float:

@@ -41,7 +41,7 @@ jobs:
             --format json --output dependency-audit.json
           dependency_status=$?
           uvx --from "bandit==$BANDIT_VERSION" bandit \
-            -r src/ml4t/backtest --severity-level medium --confidence-level medium \
+            -r src/ml4t/backtest src/quant_constraints --severity-level medium --confidence-level medium \
             --format json --output source-security.json --quiet
           source_status=$?
           set -e

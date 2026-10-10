@@ -18,7 +18,7 @@ exclude = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/ml4t"]
+packages = ["src/ml4t", "src/quant_constraints"]
 namespaces = true
 
 [tool.hatch.build.targets.sdist]

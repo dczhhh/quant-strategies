@@ -4181,7 +4181,7 @@
       "members": {
         "from_config": {
           "kind": "method",
-          "signature": "(cls, feed: 'DataFeed', strategy: 'Strategy', config: 'BacktestConfig', *, contract_specs: 'dict[str, Any] | None' = None, market_impact_model: 'Any | None' = None, execution_limits: 'Any | None' = None, funding_df: 'pl.DataFrame | None' = None, lifecycle_version: 'LifecycleVersion | str' = <LifecycleVersion.V1: '1'>, execution_policy: 'ExecutionPolicy | None' = None, target_intent_state: 'dict[str, Any] | None' = None) -> 'Engine'"
+          "signature": "(cls, feed: 'DataFeed', strategy: 'Strategy', config: 'BacktestConfig', *, contract_specs: 'dict[str, Any] | None' = None, market_impact_model: 'Any | None' = None, execution_limits: 'Any | None' = None, funding_df: 'pl.DataFrame | None' = None, lifecycle_version: 'LifecycleVersion | str' = <LifecycleVersion.V1: '1'>, execution_policy: 'ExecutionPolicy | None' = None, target_intent_state: 'dict[str, Any] | None' = None, broker_factory: 'Callable[..., Broker] | None' = None) -> 'Engine'"
         },
         "run": {
           "kind": "method",
@@ -4194,7 +4194,7 @@
       },
       "module": "ml4t.backtest.engine",
       "qualname": "Engine",
-      "signature": "(feed: 'DataFeed', strategy: 'Strategy', config: 'BacktestConfig | None' = None, *, contract_specs: 'dict[str, Any] | None' = None, market_impact_model: 'Any | None' = None, execution_limits: 'Any | None' = None, funding_df: 'pl.DataFrame | None' = None, lifecycle_version: 'LifecycleVersion | str' = <LifecycleVersion.V1: '1'>, execution_policy: 'ExecutionPolicy | None' = None, target_intent_state: 'dict[str, Any] | None' = None)"
+      "signature": "(feed: 'DataFeed', strategy: 'Strategy', config: 'BacktestConfig | None' = None, *, contract_specs: 'dict[str, Any] | None' = None, market_impact_model: 'Any | None' = None, execution_limits: 'Any | None' = None, funding_df: 'pl.DataFrame | None' = None, lifecycle_version: 'LifecycleVersion | str' = <LifecycleVersion.V1: '1'>, execution_policy: 'ExecutionPolicy | None' = None, target_intent_state: 'dict[str, Any] | None' = None, broker_factory: 'Callable[..., Broker] | None' = None)"
     },
     "ml4t.backtest:ExecutionMode": {
       "kind": "class",

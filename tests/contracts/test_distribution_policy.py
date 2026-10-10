@@ -7,6 +7,7 @@ import tomllib
 from pathlib import Path
 from types import ModuleType
 
+import pytest
 import yaml
 
 _ROOT = Path(__file__).parents[2]
@@ -47,6 +48,61 @@ def test_manifest_comparison_rejects_unexpected_and_missing_files() -> None:
     )
     assert "wheel has unexpected files: ['secret.env']" in failures
     assert "wheel is missing files: ['py.typed']" in failures
+
+
+@pytest.mark.parametrize("change", ["clean", "missing_wheel", "missing_sdist", "extra", "internal"])
+def test_cash_extension_is_required_without_allowing_extra_distribution_files(
+    tmp_path, monkeypatch, change
+):
+    checker = _load_artifact_checker()
+    source_files = {
+        "src/ml4t/backtest/__init__.py",
+        "src/quant_constraints/__init__.py",
+        "src/quant_constraints/adapter.py",
+    }
+    for relative in source_files:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# packaged module\n")
+    monkeypatch.setattr(checker, "_ROOT", tmp_path)
+    monkeypatch.setattr(checker, "_PACKAGE", tmp_path / "src/ml4t/backtest")
+    monkeypatch.setattr(checker, "_EXTENSION", tmp_path / "src/quant_constraints")
+    monkeypatch.setattr(checker, "_TESTS", tmp_path / "tests")
+    monkeypatch.setattr(checker, "_APPROVED_TEST_DATA", ())
+    dist_info = "test.dist-info"
+    wheel_files = {path.removeprefix("src/") for path in source_files} | {
+        "ml4t/backtest/py.typed",
+        *(
+            f"{dist_info}/{suffix}"
+            for suffix in ("METADATA", "WHEEL", "RECORD", "licenses/LICENSE")
+        ),
+    }
+    sdist_files = source_files | {
+        ".gitignore",
+        "CHANGELOG.md",
+        "LICENSE",
+        "README.md",
+        "PKG-INFO",
+        "pyproject.toml",
+        "src/ml4t/backtest/py.typed",
+    }
+    if change == "missing_wheel":
+        wheel_files.remove("quant_constraints/adapter.py")
+    elif change == "missing_sdist":
+        sdist_files.remove("src/quant_constraints/adapter.py")
+    elif change == "extra":
+        wheel_files.add("unapproved_plugin.py")
+    elif change == "internal":
+        sdist_files.add("src/quant_constraints/AGENTS.md")
+    monkeypatch.setattr(checker, "_single", lambda *_args: tmp_path / "unused")
+    monkeypatch.setattr(checker, "_wheel_manifest", lambda *_args: (wheel_files, dist_info))
+    monkeypatch.setattr(checker, "_sdist_manifest", lambda *_args: sdist_files)
+    failures = checker.artifact_failures(tmp_path)
+    assert bool(failures) == (change != "clean")
+    if change.startswith("missing"):
+        assert any("missing files" in failure and "adapter.py" in failure for failure in failures)
+    elif change in {"extra", "internal"}:
+        assert any("unexpected files" in failure for failure in failures)
 
 
 def test_ci_checks_both_distribution_formats_and_reproducibility() -> None:

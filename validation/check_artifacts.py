@@ -10,6 +10,7 @@ from pathlib import Path
 
 _ROOT = Path(__file__).parents[1]
 _PACKAGE = _ROOT / "src" / "ml4t" / "backtest"
+_EXTENSION = _ROOT / "src" / "quant_constraints"
 _TESTS = _ROOT / "tests"
 _INTERNAL_NAMES = {"AGENTS.md", "CLAUDE.md"}
 _APPROVED_TEST_DATA = (
@@ -80,7 +81,8 @@ def artifact_failures(directory: Path) -> list[str]:
     wheel_files, dist_info = _wheel_manifest(wheel)
     sdist_files = _sdist_manifest(sdist)
 
-    package_files = {path.removeprefix("src/") for path in _python_files(_PACKAGE)} | {
+    source_files = _python_files(_PACKAGE) | _python_files(_EXTENSION)
+    package_files = {path.removeprefix("src/") for path in source_files} | {
         "ml4t/backtest/py.typed"
     }
     package_data = {
@@ -97,7 +99,7 @@ def artifact_failures(directory: Path) -> list[str]:
         }
     )
     expected_sdist = (
-        _python_files(_PACKAGE)
+        source_files
         | package_data
         | _python_files(_TESTS)
         | set().union(*(_data_files(path) for path in _APPROVED_TEST_DATA))

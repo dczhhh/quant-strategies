@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import warnings
+from collections.abc import Callable
 from datetime import date, datetime
 from math import ceil
 from typing import TYPE_CHECKING, Any
@@ -94,6 +95,7 @@ class Engine:
         lifecycle_version: LifecycleVersion | str = LifecycleVersion.V1,
         execution_policy: ExecutionPolicy | None = None,
         target_intent_state: dict[str, Any] | None = None,
+        broker_factory: Callable[..., Broker] | None = None,
     ):
         from .config import BacktestConfig as ConfigCls
 
@@ -113,7 +115,7 @@ class Engine:
             raise ValueError("session decisions require NEXT_BAR execution")
         self.lifecycle_version = negotiated_version
         self.execution_policy = execution_policy or default_execution_policy(self.config)
-        self.broker = Broker.from_config(
+        self.broker = (broker_factory or Broker.from_config)(
             self.config,
             contract_specs=contract_specs,
             market_impact_model=market_impact_model,
@@ -609,7 +611,7 @@ class Engine:
             gross_exposure += abs(position_value)
             net_exposure += position_value
 
-        equity = cash + net_exposure
+        equity = cash + self.broker.account._receivable_value + net_exposure
         self.equity_curve.append((timestamp, equity))
         self.portfolio_state.append(
             (timestamp, equity, cash, gross_exposure, net_exposure, len(self.broker.positions))
@@ -730,6 +732,13 @@ class Engine:
                 }
                 for invocation in self.lifecycle_dispatcher.invocations
             ]
+
+        # Versioned, opt-in accounting evidence; native result keys stay unchanged.
+        corporate_evidence = getattr(self.broker, "corporate_action_evidence", None)
+        if corporate_evidence is not None:
+            evidence = corporate_evidence()
+            if evidence is not None:
+                contract_evidence["corporate_actions_v1"] = evidence
 
         if not self.equity_curve:
             # Return empty result for no-data case
@@ -893,6 +902,7 @@ class Engine:
         lifecycle_version: LifecycleVersion | str = LifecycleVersion.V1,
         execution_policy: ExecutionPolicy | None = None,
         target_intent_state: dict[str, Any] | None = None,
+        broker_factory: Callable[..., Broker] | None = None,
     ) -> Engine:
         """Create an Engine instance from a BacktestConfig.
 
@@ -907,6 +917,8 @@ class Engine:
             market_impact_model: Market impact model for fill simulation
             execution_limits: Execution limits (max order size, etc.)
             funding_df: Timestamped funding rates or amounts for named assets
+            broker_factory: Optional opt-in broker constructor with the same arguments as
+                Broker.from_config. Defaults to the upstream Broker constructor.
 
         Returns:
             Configured Engine instance
@@ -922,6 +934,7 @@ class Engine:
             lifecycle_version=lifecycle_version,
             execution_policy=execution_policy,
             target_intent_state=target_intent_state,
+            broker_factory=broker_factory,
         )
 
 
