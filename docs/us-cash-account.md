@@ -87,12 +87,24 @@ config.settlement_holidays = ("2026-10-13",)
 ## 官方依据与验证
 
 - [SEC T+1 投资者公告](https://www.investor.gov/introduction-investing/general-resources/news-alerts/alerts-bulletins/investor-bulletins/new-t1-settlement-cycle-what-investors-need-know-investor-bulletin)：2024-05-28 起的周期。
-- [SEC 2017 T+2 变更](https://www.sec.gov/newsroom/press-releases/2017-68)：2017-09-05 的历史转换。
+- [SEC 2017 T+2 变更](https://www.sec.gov/newsroom/press-releases/2017-68-0)：2017-09-05 的历史转换。
 - [NSCC Good Friday 2026，a9732](https://www.dtcc.com/Globals/PDFs/2026/March/06/a9732)：普通股票交付／结算服务关闭。
-- [NSCC 元旦 2022，a9053](https://www.dtcc.com/Globals/PDFs/2021/September/21/a9053)：2021-12-31 正常处理。
-- [DTCC Juneteenth 2021，a9015](https://www.dtcc.com/Globals/PDFs/2021/June/17/a9015) 与 [DTC Juneteenth 2022，16811-22](https://www.dtcc.com/Globals/PDFs/2022/April/27/16811-22)。
-- [DTC 退伍军人节 2023，19155-23](https://www.dtcc.com/Globals/PDFs/2023/October/11/19155-23)：2023-11-10 可结算。
+- 历史 NSCC 元旦 2022 公告 a9053：既有回归采用2021-12-31正常处理。
+- 历史 Juneteenth 公告：DTCC 2021 a9015、DTC 2022 16811-22。
+- 历史 DTC 退伍军人节 2023 公告19155-23：既有回归采用2023-11-10可结算。
 - [OCC Sandy 2012，31464](https://infomemo.theocc.com/infomemos?date=201210&number=31464)：交易停市时 DTC／NSCC 仍正常营业。
+
+2026-10-10 扩展项目文档外链检查时，上述四份历史 DTCC 公告旧地址返回404；
+保留公告身份和旧地址供追溯，不把搜索缓存或链接存在声明当作当前官方源已核验。
+后续应从[DTCC 官方公告索引](https://www.dtcc.com/legal/important-notices)取得可复核原件，
+真实历史研究仍须补齐目标年份来源证据。此次没有改变既有结算日期规则或回归。
+
+```text
+unavailable_404: https://www.dtcc.com/Globals/PDFs/2021/September/21/a9053
+unavailable_404: https://www.dtcc.com/Globals/PDFs/2021/June/17/a9015
+unavailable_404: https://www.dtcc.com/Globals/PDFs/2022/April/27/16811-22
+unavailable_404: https://www.dtcc.com/Globals/PDFs/2023/October/11/19155-23
+```
 
 针对性行为测试：`tests/accounting/test_us_cash_account.py`；旧 bar 结算兼容测试：
 `tests/accounting/test_settlement_delay.py`。

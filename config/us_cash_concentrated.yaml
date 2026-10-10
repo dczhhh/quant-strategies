@@ -15,7 +15,42 @@ split_order_policy: adjust
 execution_data_mode: raw_execution
 signal_data_mode: split_adjusted_signal
 dividend_withholding_rate: 0.0
-dividend_tax_scenario: gross_no_withholding
+dividend_tax_scenario: cn_mainland_individual_treaty_scenario
+dividend_tax_profile: cn_mainland_individual_treaty
+# Qualification is intentionally unconfirmed. Supply PIT investor scenario evidence.
+dividend_tax_qualification: null
+unknown_dividend_tax_policy: reject
+dividend_tax_conflict_policy: record_actual
+capital_gains_tax_mode: none
+dividend_tax_rules:
+  - source_country: US
+    rate: 0.10
+    effective_from: '1987-01-01'
+    effective_to: '2027-01-01'
+    known_at: '2026-10-10T00:00:00+00:00'
+    verified_at: '2026-10-10T00:00:00+00:00'
+    source: https://www.irs.gov/pub/irs-trty/china.pdf
+    version: cn_us_article9_review_20261010
+  - source_country: CA
+    rate: 0.15
+    effective_from: '1987-01-01'
+    effective_to: '2027-01-01'
+    known_at: '2026-10-10T00:00:00+00:00'
+    verified_at: '2026-10-10T00:00:00+00:00'
+    source: https://www.canada.ca/en/department-finance/programs/tax-policy/tax-treaties/country/china-agreement-1986.html
+    version: cn_ca_article10_review_20261010
+macro_events_enabled: true
+missing_macro_calendar: reject_new_entries
+macro_event_types: [CPI, NFP, PCE, PPI, FOMC_STATEMENT, FOMC_PRESS, ISM]
+macro_major_wait_minutes: 60
+macro_ppi_wait_minutes: 45
+macro_fomc_statement_lead_minutes: 30
+macro_fomc_press_lead_minutes: 60
+macro_fomc_next_session: false
+macro_fomc_next_wait_minutes: 60
+macro_pre_release_minutes: 15
+macro_post_release_minutes: 30
+macro_slippage_bps: 10.0
 cash_reserve: 0.10
 settlement_cycle: historical
 minimum_hold_sessions: 0

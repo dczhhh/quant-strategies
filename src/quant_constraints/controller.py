@@ -14,11 +14,17 @@ from .gates import (
     SessionGate,
     reject,
 )
+from .macro import MacroEventGate, MacroEventProvider
 from .models import ALLOW, Action, Audit, Decision, Intent, Kind, MarketContext, RiskRequest, State
 
 
 class ConstraintController:
-    def __init__(self, config: ConstraintConfig, earnings: EarningsProvider):
+    def __init__(
+        self,
+        config: ConstraintConfig,
+        earnings: EarningsProvider,
+        macro: MacroEventProvider | None = None,
+    ):
         self.config = config
         self.calendar = SessionCalendar()
         self.session = SessionGate(config, self.calendar)
@@ -26,11 +32,14 @@ class ConstraintController:
         self.earnings = EarningsGate(config, self.calendar, earnings)
         self.portfolio = PortfolioGate(config, self.earnings)
         self.rebalance = RebalanceGate(config, self.calendar)
+        self.macro = MacroEventGate(config, self.calendar, macro)
         self.audit: list[Audit] = []
 
     def check(self, intent: Intent, state: State, market_context: MarketContext) -> Decision:
         context = market_context
         earnings_checked = False
+        macro_checked = False
+        macro_decision = ALLOW
         # Even an outside-session risk request must not queue a short or invalid order.
         session = self.session.check(intent, state, context)
         account = self.account.check(intent, state, context)
@@ -51,6 +60,8 @@ class ConstraintController:
         else:
             decision = ALLOW
             warning = ALLOW
+            macro_checked = self.config.macro_events_enabled
+            macro_decision = self.macro.check(intent, state, context)
             for gate in (self.earnings, self.rebalance, self.portfolio):
                 if gate is self.earnings and context.instrument == "equity":
                     earnings_checked = True
@@ -61,6 +72,13 @@ class ConstraintController:
                     warning = decision
             if decision.action is Action.ALLOW and warning.code != "allowed":
                 decision = warning
+            if (
+                macro_decision.action is not Action.ALLOW
+                and decision.action is not Action.REJECT
+                or decision.action is Action.ALLOW
+                and macro_decision.code != "allowed"
+            ):
+                decision = macro_decision
         event = self.earnings.active_event(intent.asset, context) if earnings_checked else None
         event_id = (
             str(decision.data["event_id"])
@@ -91,6 +109,8 @@ class ConstraintController:
                 ),
                 earnings_checked=earnings_checked,
                 earnings_event_id=event_id,
+                macro_checked=macro_checked,
+                macro_code=macro_decision.code if macro_checked else None,
             )
         )
         return decision
@@ -263,5 +283,20 @@ class ConstraintController:
                 f"buy_{action.value.lower()}_checks": sum(a.decision.action is action for a in buys)
                 for action in Action
             }
+        )
+        macro_buys = [
+            a
+            for a in self.audit
+            if a.macro_checked and a.phase in {"submission", "fill", "amendment"}
+        ]
+        macro_triggers = [
+            a for a in macro_buys if a.macro_code in {"macro_blackout", "macro_calendar_missing"}
+        ]
+        statistics.update(
+            macro_trigger_rate=len(macro_triggers) / len(macro_buys) if macro_buys else 0.0,
+            macro_checks=len(macro_buys) if self.config.macro_events_enabled else 0,
+            deferred_entries=len(
+                {a.order_id for a in macro_triggers if a.decision.action is Action.DEFER}
+            ),
         )
         return statistics

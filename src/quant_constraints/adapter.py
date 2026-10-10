@@ -200,6 +200,7 @@ class ConstrainedBroker(Broker):
                 controller.calendar,
                 controller.earnings.provider,
                 lambda asset: self.context_for(asset, 0, "slippage"),
+                macro=controller.macro,
             )
             self.slippage_model = self.regime_slippage
         self.constraint_frequency = config.resolved_data_frequency.value
@@ -385,6 +386,13 @@ class ConstrainedBroker(Broker):
             group["quantity"] += quote.quantity
             group["slippage_amount"] += quote.slippage_amount
         return {
+            "macro_slippage_cost": sum(
+                q.quote.quantity * q.quote.reference_price * q.quote.macro_incremental_bps / 10_000
+                for q in self.slippage_records
+            ),
+            "event_exposure": sum(
+                any("macro event=" in item for item in q.quote.basis) for q in self.slippage_records
+            ),
             "total_slippage": sum(q.quote.slippage_amount for q in self.slippage_records),
             "by_regime": regimes,
         }

@@ -132,6 +132,8 @@ class Audit:
     slippage_bps: float | None = None
     slippage_amount: float = 0.0
     slippage_basis: tuple[str, ...] = ()
+    macro_checked: bool = False
+    macro_code: str | None = None
 
 
 @dataclass(frozen=True)
