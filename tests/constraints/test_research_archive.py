@@ -766,16 +766,40 @@ def test_http_transport_disables_redirects_and_preserves_http_errors(monkeypatch
         is None
     )
 
+    error_body = io.BytesIO(b"limited")
+
     class ErrorOpener:
         def open(self, req, timeout):
-            raise HTTPError(
-                req.full_url, 429, "rate limited", {"Retry-After": "3"}, io.BytesIO(b"limited")
-            )
+            raise HTTPError(req.full_url, 429, "rate limited", {"Retry-After": "3"}, error_body)
 
     monkeypatch.setattr(massive, "build_opener", lambda _: ErrorOpener())
-    assert massive.http_get(request_url(source_request()), {}, 5).status == 429
+    error_response = massive.http_get(request_url(source_request()), {}, 5)
+    assert error_response == HTTPResponse(429, b"limited", (("Retry-After", "3"),))
+    assert error_body.closed
     with pytest.raises(ArchiveError):
         massive.http_get("file:///etc/passwd", {}, 5)
+
+
+def test_http_error_body_is_closed_when_read_fails(monkeypatch):
+    import io
+    from urllib.error import HTTPError
+
+    import quant_constraints.research.data.massive as massive
+
+    class UnreadableBody(io.BytesIO):
+        def read(self, bound):
+            raise OSError("interrupted response")
+
+    body = UnreadableBody(b"partial")
+
+    class ErrorOpener:
+        def open(self, req, timeout):
+            raise HTTPError(req.full_url, 503, "unavailable", {}, body)
+
+    monkeypatch.setattr(massive, "build_opener", lambda _: ErrorOpener())
+    with pytest.raises(OSError, match="interrupted response"):
+        massive.http_get(request_url(source_request()), {}, 5)
+    assert body.closed
 
 
 def test_malformed_json_and_response_byte_budget(tmp_path, monkeypatch):

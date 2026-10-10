@@ -54,9 +54,10 @@ def http_get(url: str, headers: dict[str, str], timeout: float) -> HTTPResponse:
                 tuple(response.headers.items()),
             )
     except HTTPError as error:
-        return HTTPResponse(
-            error.code, error.read(MAX_RESPONSE_BYTES + 1), tuple(error.headers.items())
-        )
+        with error:
+            return HTTPResponse(
+                error.code, error.read(MAX_RESPONSE_BYTES + 1), tuple(error.headers.items())
+            )
 
 
 def request_url(request: SourceRequest) -> str:
