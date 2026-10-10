@@ -2,6 +2,7 @@
 
 import math
 from dataclasses import dataclass, fields
+from datetime import date
 from pathlib import Path
 from typing import Literal
 
@@ -17,6 +18,11 @@ class ConstraintConfig:
     entry_close_buffer_minutes: int = 30
     earnings_blackout_sessions: int = 2
     hold_through_earnings: bool = False
+    missing_earnings: Literal["reject", "allow"] = "reject"
+    missing_earnings_position: Literal["liquidate", "hold"] = "liquidate"
+    missing_liquidity: Literal["reject", "defer"] = "reject"
+    missing_market: Literal["reject", "defer"] = "reject"
+    missing_price: Literal["error", "defer"] = "error"
     liquidation_close_buffer_minutes: int = 30
     post_earnings_wait_minutes: int = 60
     post_earnings_sessions: int = 1
@@ -31,7 +37,10 @@ class ConstraintConfig:
     industry_cap: float = 0.40
     unknown_industry: Literal["reject", "warn"] = "reject"
     drift_reduction: Literal["next_session", "rebalance", "disabled"] = "next_session"
-    rebalance_mode: Literal["every_n_trading_days", "monthly"] = "every_n_trading_days"
+    rebalance_mode: Literal["every_n_trading_days", "monthly", "semi_monthly"] = (
+        "every_n_trading_days"
+    )
+    rebalance_anchor: str | None = None
     rebalance_n: int = 10
     monthly_session: Literal["first", "last"] = "first"
     weight_change_threshold: float = 0.03
@@ -64,8 +73,13 @@ class ConstraintConfig:
             "settlement_cycle": {"historical", "T+1", "T+2"},
             "unknown_industry": {"reject", "warn"},
             "drift_reduction": {"next_session", "rebalance", "disabled"},
-            "rebalance_mode": {"every_n_trading_days", "monthly"},
+            "rebalance_mode": {"every_n_trading_days", "monthly", "semi_monthly"},
             "monthly_session": {"first", "last"},
+            "missing_earnings": {"reject", "allow"},
+            "missing_earnings_position": {"liquidate", "hold"},
+            "missing_liquidity": {"reject", "defer"},
+            "missing_market": {"reject", "defer"},
+            "missing_price": {"error", "defer"},
         }
         for name, allowed in choices.items():
             if not isinstance(getattr(self, name), str) or getattr(self, name) not in allowed:
@@ -74,6 +88,10 @@ class ConstraintConfig:
             value = getattr(self, item.name)
             if isinstance(value, float) and (not math.isfinite(value) or value < 0):
                 raise ValueError(f"Invalid {item.name}")
+        if self.rebalance_anchor is not None:
+            if not isinstance(self.rebalance_anchor, str):
+                raise ValueError("rebalance_anchor must be an ISO date")
+            date.fromisoformat(self.rebalance_anchor)
         for name in ("hold_through_earnings", "market_gates"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")

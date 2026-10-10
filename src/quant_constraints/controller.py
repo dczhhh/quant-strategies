@@ -47,10 +47,15 @@ class ConstraintController:
             )
         else:
             decision = ALLOW
+            warning = ALLOW
             for gate in (self.earnings, self.rebalance, self.portfolio):
                 decision = gate.check(intent, state, context)
                 if decision.action is not Action.ALLOW:
                     break
+                if decision.code != "allowed":
+                    warning = decision
+            if decision.action is Action.ALLOW and warning.code != "allowed":
+                decision = warning
         self.audit.append(
             Audit(
                 context.asof,
@@ -77,12 +82,15 @@ class ConstraintController:
                     coverage is None
                     or coverage.missing
                     or coverage.covered_until < context.asof + timedelta(days=1)
-                ):
+                ) and self.config.missing_earnings_position == "liquidate":
                     reason, quantity = "earnings_coverage_missing_exit", holding.quantity
                 for event in events:
                     _, affected, deadline = self.earnings.sessions(event)
                     end = self.calendar.shift(affected, self.config.post_earnings_sessions - 1)
-                    if context.asof >= deadline and day <= end:
+                    was_exposed = (
+                        holding.opened_at is None or holding.opened_at < event.announcement_at
+                    )
+                    if was_exposed and context.asof >= deadline and day <= end:
                         reason, quantity = "earnings_predefined_exit", holding.quantity
                         bounds = self.calendar.bounds(deadline)
                         if bounds and context.asof >= bounds[1]:
@@ -108,7 +116,7 @@ class ConstraintController:
                                 )
                             )
             value = holding.quantity * holding.price
-            if value > self.config.max_weight * state.equity + 1e-10:
+            if not state.missing_marks and value > self.config.max_weight * state.equity + 1e-10:
                 self.audit.append(
                     Audit(
                         context.asof,
@@ -133,7 +141,11 @@ class ConstraintController:
                         "overweight_predefined_reduction",
                         (value - self.config.max_weight * state.equity) / holding.price,
                     )
-            if self.config.market_gates and state.drawdown >= self.config.drawdown_reduce:
+            if (
+                not state.missing_marks
+                and self.config.market_gates
+                and state.drawdown >= self.config.drawdown_reduce
+            ):
                 fraction = self.config.drawdown_reduction_fraction
                 if fraction is None:
                     self.audit.append(

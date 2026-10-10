@@ -50,6 +50,7 @@ class State:
     anchor: datetime | None = None
     drawdown: float = 0.0
     pending_sectors: dict[str, str | None] = field(default_factory=dict)
+    missing_marks: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)

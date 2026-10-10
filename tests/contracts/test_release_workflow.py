@@ -202,6 +202,7 @@ def test_release_reuses_all_ci_gates_and_publishes_the_exact_candidate() -> None
     assert set(jobs["build"]["needs"]) == {
         "lint",
         "typecheck",
+        "archived-evidence",
         "compatibility",
         "security",
         "coverage",

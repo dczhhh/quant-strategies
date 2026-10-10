@@ -1,7 +1,7 @@
 """Composable admission gates. Each check is read-only."""
 
 import math
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 
 from .calendar import NY, SessionCalendar
 from .config import ConstraintConfig
@@ -69,6 +69,12 @@ class AccountConstraint:
             return reject(
                 "risk_buy_not_allowed" if intent.kind is Kind.RISK else "intent_direction"
             )
+        if intent.quantity > 0 and state.missing_marks:
+            return Decision(
+                Action.DEFER,
+                "portfolio_marks_missing",
+                data={"assets": sorted(state.missing_marks)},
+            )
         holding = state.holdings.get(intent.asset)
         quantity = holding.quantity if holding else 0.0
         if intent.quantity < 0:
@@ -105,7 +111,16 @@ class RebalanceGate:
                 if self.config.monthly_session == "first"
                 else (following.month != day.month)
             )
-        anchor = (state.anchor or asof).astimezone(NY).date()
+        if self.config.rebalance_mode == "semi_monthly":
+            first = self.calendar.on_or_after(day.replace(day=1))
+            second = self.calendar.on_or_after(day.replace(day=16))
+            return day in {first, second}
+        if self.config.rebalance_anchor:
+            anchor = self.calendar.on_or_after(date.fromisoformat(self.config.rebalance_anchor))
+        elif state.anchor:
+            anchor = self.calendar.on_or_after(state.anchor.astimezone(NY).date())
+        else:
+            raise ValueError("every_n_trading_days requires an explicit or observed anchor")
         distance = self.calendar.distance(anchor, day)
         return distance >= 0 and distance % self.config.rebalance_n == 0
 
@@ -185,8 +200,17 @@ class EarningsGate:
         day = context.asof.astimezone(NY).date()
         lookahead = self.calendar.shift(day, self.config.earnings_blackout_sessions)
         horizon = datetime.combine(lookahead, time.max, NY)
+        warning = ALLOW
         if coverage is None or coverage.missing or coverage.covered_until < horizon:
-            return reject("earnings_coverage_missing", "Historical schedule coverage is required")
+            if self.config.missing_earnings == "reject":
+                return reject(
+                    "earnings_coverage_missing", "Historical schedule coverage is required"
+                )
+            warning = Decision(
+                Action.ALLOW,
+                "earnings_coverage_unverified",
+                "Explicit opt-out: earnings schedule was not verified",
+            )
         for event in events:
             event_day, affected, _ = self.sessions(event)
             start = self.calendar.shift(event_day, -self.config.earnings_blackout_sessions)
@@ -210,7 +234,11 @@ class EarningsGate:
                 or context.liquidity_available_at is None
                 or context.liquidity_available_at > context.asof
             ):
-                return reject("earnings_liquidity_missing", event_id=event.event_id)
+                return Decision(
+                    Action.DEFER if self.config.missing_liquidity == "defer" else Action.REJECT,
+                    "earnings_liquidity_missing",
+                    data={"event_id": event.event_id},
+                )
             assert (
                 context.spread is not None
                 and context.rvol is not None
@@ -222,7 +250,7 @@ class EarningsGate:
                 or context.volume <= 0
             ):
                 return reject("earnings_liquidity", event_id=event.event_id)
-        return ALLOW
+        return warning
 
 
 class PortfolioGate:
@@ -241,7 +269,10 @@ class PortfolioGate:
                 or context.vix_available_at is None
                 or context.vix_available_at > context.asof
             ):
-                return cap, reject("market_data_missing")
+                return cap, Decision(
+                    Action.DEFER if self.config.missing_market == "defer" else Action.REJECT,
+                    "market_data_missing",
+                )
             if (
                 context.vix >= self.config.vix_block_at
                 or state.drawdown >= self.config.drawdown_block

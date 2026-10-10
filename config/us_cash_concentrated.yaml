@@ -5,6 +5,11 @@ entry_delay_minutes: 30
 entry_close_buffer_minutes: 30
 earnings_blackout_sessions: 2
 hold_through_earnings: false
+missing_earnings: reject
+missing_earnings_position: liquidate
+missing_liquidity: reject
+missing_market: reject
+missing_price: error
 liquidation_close_buffer_minutes: 30
 post_earnings_wait_minutes: 60
 post_earnings_sessions: 1
@@ -20,6 +25,7 @@ industry_cap: 0.40
 unknown_industry: reject
 drift_reduction: next_session
 rebalance_mode: every_n_trading_days
+rebalance_anchor: null
 rebalance_n: 10
 monthly_session: first
 weight_change_threshold: 0.03

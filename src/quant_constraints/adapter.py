@@ -1,5 +1,6 @@
 """Opt-in backtest adapter; core cash, position and order state remain canonical."""
 
+import math
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
@@ -38,6 +39,8 @@ class ConstraintFillExecutor(FillExecutor):
         intent = broker.intent_for(order)
         context = broker.context_for(order.asset, base_price, "fill")
         state = broker.constraint_state(order.order_id, phase="fill")
+        if order.asset not in self.market.opens and order.asset not in self.market.prices:
+            return False
         due = broker.deferred_until.get(order.order_id)
         if due and context.asof.astimezone(NY).date() < due:
             return False
@@ -58,11 +61,15 @@ class ConstraintFillExecutor(FillExecutor):
                 return False
             base_price = price
             order._risk_fill_price = None
+        preliminary = broker.controller.check(intent, state, context)
+        if preliminary.action is Action.DEFER:
+            return False
         broker.checking_actual_fill = True
         try:
             completed = super().execute(order, base_price)
         finally:
             broker.checking_actual_fill = False
+        broker.refresh_brackets()
         if order.status is OrderStatus.REJECTED and order.order_id in broker.fill_rejections:
             order._rejection_code = broker.fill_rejections.pop(order.order_id)
         return completed
@@ -116,6 +123,7 @@ class ConstrainedBroker(Broker):
         self.checking_actual_fill = False
         self.risk_monitor_submission = False
         self.deferred_rule_assets: set[str] = set()
+        self.bracket_children: dict[str, tuple[str, str]] = {}
         self._fill_executor = ConstraintFillExecutor(
             self,
             account=self.account,
@@ -149,16 +157,26 @@ class ConstrainedBroker(Broker):
         market, orders = self._market_state, self._order_state
         assert market.time is not None
         holdings = {}
+        missing_marks = set()
         for asset, position in self.account.positions.items():
             price = (market.opens if phase == "fill" else market.prices).get(asset)
             if price is None:
-                raise ValueError(f"Observed {phase} mark missing for held asset {asset}")
+                if self.controller.config.missing_price == "error":
+                    raise ValueError(f"Observed {phase} mark missing for held asset {asset}")
+                price = market.last_prices.get(asset, position.current_price)
+                if price is None or not math.isfinite(price) or price <= 0:
+                    raise ValueError(f"No valid historical valuation for {asset}")
+                missing_marks.add(asset)
             sector = self.context_provider(market.time, asset, phase).sector
             holdings[asset] = Holding(position.quantity, price, sector, position.entry_time)
         equity = self.cash + sum(h.quantity * h.price for h in holdings.values())
-        self.constraint_peak = max(self.constraint_peak, equity)
+        if not missing_marks:
+            self.constraint_peak = max(self.constraint_peak, equity)
         buys: dict[str, float] = {}
         sells: dict[str, float] = {}
+        protective: dict[str, tuple[str, float]] = {}
+        excluded_order = self.get_order(exclude) if exclude else None
+        excluded_group = excluded_order.parent_id if excluded_order else None
         for order in orders.pending:
             if order.status is not OrderStatus.PENDING or order.order_id == exclude:
                 continue
@@ -167,7 +185,14 @@ class ConstrainedBroker(Broker):
                 price = order._reservation_price or market.prices.get(order.asset, 0)
                 buys[order.asset] = buys.get(order.asset, 0) + quantity * price
             else:
-                sells[order.asset] = sells.get(order.asset, 0) + quantity
+                if order.parent_id in self.bracket_children:
+                    if order.parent_id != excluded_group:
+                        previous = protective.get(order.parent_id, (order.asset, 0))[1]
+                        protective[order.parent_id] = (order.asset, max(previous, quantity))
+                else:
+                    sells[order.asset] = sells.get(order.asset, 0) + quantity
+        for asset, quantity in protective.values():
+            sells[asset] = sells.get(asset, 0) + quantity
         assert self._cash_account_rules is not None
         return State(
             self.settled_cash,
@@ -180,7 +205,118 @@ class ConstrainedBroker(Broker):
             self.constraint_anchor,
             1 - equity / self.constraint_peak if self.constraint_peak > 0 else 0.0,
             {asset: self.context_provider(market.time, asset, phase).sector for asset in buys},
+            frozenset(missing_marks),
         )
+
+    def submit_bracket(
+        self,
+        asset,
+        quantity,
+        take_profit,
+        stop_loss,
+        entry_type=OrderType.MARKET,
+        entry_limit=None,
+        validate_prices=True,
+    ):
+        """Register dormant protective orders before a parent can fill; OCO shares are shared."""
+        reference = entry_limit if entry_limit is not None else self._market_state.prices.get(asset)
+        if (
+            quantity <= 0
+            or reference is None
+            or not all(
+                math.isfinite(value) and value > 0 for value in (reference, take_profit, stop_loss)
+            )
+        ):
+            raise ValueError("Cash bracket requires a long quantity and finite positive prices")
+        if validate_prices and not stop_loss < reference < take_profit:
+            raise ValueError("Long bracket requires stop_loss < entry price < take_profit")
+        immediate = self.immediate_fill
+        self.immediate_fill = False
+        try:
+            entry = self.submit_order(
+                asset, quantity, order_type=entry_type, limit_price=entry_limit
+            )
+        finally:
+            self.immediate_fill = immediate
+        if entry is None or entry.status is OrderStatus.REJECTED:
+            return None
+        children = []
+        for order_type, limit, stop, reason in (
+            (OrderType.LIMIT, take_profit, None, "bracket_take_profit"),
+            (OrderType.STOP, None, stop_loss, "bracket_stop_loss"),
+        ):
+            self._order_state.counter += 1
+            child = Order(
+                asset=asset,
+                side=OrderSide.SELL,
+                quantity=entry.quantity,
+                order_type=order_type,
+                limit_price=limit,
+                stop_price=stop,
+                parent_id=entry.order_id,
+                order_id=f"ORD-{self._order_state.counter}",
+                created_at=self._market_state.time,
+                _created_bar_index=self._market_state.bar_index,
+                _risk_exit_reason=reason,
+            )
+            self.constraint_kinds[child.order_id] = Kind.RISK
+            self._order_state.orders.append(child)
+            children.append(child)
+        tp, sl = children
+        self.bracket_children[entry.order_id] = (tp.order_id, sl.order_id)
+        if (
+            immediate
+            and self.execution_mode is ExecutionMode.SAME_BAR
+            and entry_type is OrderType.MARKET
+        ):
+            self._order_book._fill_immediately(entry)
+            if entry in self._order_state.pending:
+                self._order_state.pending.remove(entry)
+        self.refresh_brackets()
+        return entry, tp, sl
+
+    def refresh_brackets(self) -> None:
+        """Use canonical filled quantities, not a second position ledger."""
+        for parent_id, child_ids in self.bracket_children.items():
+            parent = self.get_order(parent_id)
+            children = [self.get_order(child_id) for child_id in child_ids]
+            assert parent is not None and all(child is not None for child in children)
+            tp, sl = children
+            assert tp is not None and sl is not None
+            exited = tp.filled_quantity + sl.filled_quantity
+            if exited and parent.status is OrderStatus.PENDING:
+                super().cancel_order(parent_id)
+            exposure = max(0.0, parent.filled_quantity - exited)
+            if exposure <= 1e-10:
+                if parent.status is not OrderStatus.PENDING:
+                    for child in (tp, sl):
+                        if child.status is OrderStatus.PENDING:
+                            child.status = OrderStatus.CANCELLED
+                        if child in self._order_state.pending:
+                            self._order_state.pending.remove(child)
+                continue
+            for child in (tp, sl):
+                if child.status is OrderStatus.REJECTED:
+                    raise RuntimeError(
+                        f"Bracket protection failed: {child.order_id}: {child.rejection_reason}"
+                    )
+                if child.status is OrderStatus.PENDING:
+                    child.quantity = exposure
+                    if child.order_id in self._order_state.partial_quantities:
+                        self._order_state.partial_quantities[child.order_id] = exposure
+                    if child not in self._order_state.pending:
+                        self._order_state.pending.append(child)
+
+    def cancel_order(self, order_id):
+        order = self.get_order(order_id)
+        if order and order.parent_id in self.bracket_children:
+            parent = self.get_order(order.parent_id)
+            assert parent is not None
+            if parent.filled_quantity > 0 and self.account.get_position_quantity(order.asset) > 0:
+                return False  # do not leave a live bracket without its promised protection
+        result = super().cancel_order(order_id)
+        self.refresh_brackets()
+        return result
 
     def intent_for(self, order: Order, quantity: float | None = None) -> Intent:
         signed = (quantity if quantity is not None else order.quantity) * (
@@ -287,6 +423,7 @@ class ConstrainedBroker(Broker):
         pending = tuple(self._order_state.pending)
         audit_start = len(self.controller.audit)
         result = super()._process_orders(*args, **kwargs)
+        self.refresh_brackets()
         checked = {record.order_id for record in self.controller.audit[audit_start:]}
         use_open = kwargs.get("use_open", args[0] if args else False)
         for order in pending:
@@ -370,6 +507,8 @@ class ConstrainedBroker(Broker):
         kind = constraint_kind or (
             Kind.RISK
             if _options and _options.risk_exit_reason
+            else Kind.REBALANCE
+            if _options and (_options.rebalance_id or _options.target_intent_id)
             else Kind.REDUCE
             if signed < 0
             else Kind.ADD
@@ -382,6 +521,8 @@ class ConstrainedBroker(Broker):
                     pending.asset == asset
                     and pending.status is OrderStatus.PENDING
                     and self.intent_for(pending).kind is Kind.RISK
+                    and pending.parent_id is None
+                    and pending.order_type is OrderType.MARKET
                     and signed < 0
                     and -signed <= self.account.get_position_quantity(asset)
                 ):
@@ -408,6 +549,7 @@ class ConstrainedBroker(Broker):
                 if o.asset == asset
                 and o.side is OrderSide.SELL
                 and self.intent_for(o).kind is Kind.RISK
+                and o.parent_id is None
             )
             snapshot = replace(
                 snapshot, pending_sells={**snapshot.pending_sells, asset: other_risk_sells}
@@ -436,7 +578,9 @@ class ConstrainedBroker(Broker):
         if kind is Kind.RISK:
             for pending in tuple(self._order_state.pending):
                 if pending.asset == asset and pending.side is OrderSide.SELL:
-                    self.cancel_order(pending.order_id)
+                    if pending.parent_id in self.bracket_children:
+                        super().cancel_order(pending.parent_id)
+                    super().cancel_order(pending.order_id)
         # Register before core reserve/fill callbacks so final checks retain intent kind.
         self.constraint_kinds[next_id] = kind
         if target_weight is not None:
@@ -508,6 +652,12 @@ class ConstrainedBroker(Broker):
     def _update_time(self, timestamp, prices, opens, highs=None, lows=None, *rest, **kwargs):
         aware(timestamp)
         super()._update_time(timestamp, prices, opens, highs, lows, *rest, **kwargs)
+        if (
+            hasattr(self, "controller")
+            and self.constraint_anchor is None
+            and self.controller.calendar.bounds(timestamp)
+        ):
+            self.constraint_anchor = timestamp
         if not hasattr(self, "controller") or not self.account.positions:
             return
         state = self.constraint_state(phase="fill")
