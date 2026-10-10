@@ -944,3 +944,248 @@ def test_archive_layers_cannot_be_used_interchangeably(tmp_path):
     data = normalize_archived_snapshot(source, store)
     with pytest.raises(ArchiveError, match="INVALID_REQUEST"):
         normalize_archived_snapshot(data, store)
+
+
+@pytest.mark.parametrize("replacement", ["revision_only", "whole_checkpoint"])
+@pytest.mark.parametrize(
+    "difference", ["dataset", "time", "security", "identity", "evidence", "acquisition", "page"]
+)
+def test_completed_checkpoint_cannot_reference_another_valid_archive(
+    tmp_path, replacement, difference
+):
+    import shutil
+
+    request = source_request()
+    ids = normalize_identities([identity()])
+    evidence = (
+        ArchiveInput("evidence/action.json", "corporate_actions", b"v1", "fixture://action"),
+    )
+    store = ArchiveStore(tmp_path / "A")
+    original = adapter(Transport([page()])).acquire_and_archive(
+        request, store, ids, evidence=evidence
+    )
+    other_request, other_ids, other_evidence, other_id = request, ids, evidence, "initial"
+    if difference == "dataset":
+        other_request = replace(request, dataset_id="another-dataset")
+    elif difference == "time":
+        other_request = replace(request, start_at=request.start_at + timedelta(minutes=1))
+    elif difference == "security":
+        other_request = replace(request, symbol="BBB", security_id="fixture-security-B")
+        other_ids = normalize_identities([identity(symbol="BBB", security_id="fixture-security-B")])
+    elif difference == "identity":
+        other_ids = normalize_identities(
+            [identity(source=identity()["source"] | {"record_id": "v2"})]
+        )
+    elif difference == "evidence":
+        other_evidence = (replace(evidence[0], content=b"v2"),)
+    elif difference == "acquisition":
+        other_id = "refetch"
+    payload = page(
+        [row(other_request.start_at, c=100.75 if difference == "page" else 100.5)],
+        ticker=other_request.symbol,
+    )
+    other_store = ArchiveStore(tmp_path / "B")
+    other = adapter(Transport([payload])).acquire_and_archive(
+        other_request, other_store, other_ids, acquisition_id=other_id, evidence=other_evidence
+    )
+    assert other.manifest.revision != original.manifest.revision
+    target = store.root / "source" / other.manifest.revision
+    shutil.copytree(other.directory, target)
+    assert load_archive(target).manifest == other.manifest
+    checkpoint = store.root / "sessions" / request.request_id / "initial" / "completed.json"
+    other_checkpoint = (
+        other_store.root / "sessions" / other_request.request_id / other_id / "completed.json"
+    )
+    if replacement == "revision_only":
+        changed = json.loads(checkpoint.read_bytes()) | {"revision": other.manifest.revision}
+        checkpoint.write_bytes(canonical(changed))
+    else:
+        checkpoint.write_bytes(other_checkpoint.read_bytes())
+    transport = Transport([])
+    with pytest.raises(ArchiveError, match="SOURCE_CONFLICT|HASH_MISMATCH"):
+        adapter(transport).acquire_and_archive(request, store, ids, evidence=evidence)
+    assert transport.calls == []
+    assert load_archive(original.directory).manifest == original.manifest
+    assert load_archive(target).manifest == other.manifest
+
+
+def test_completed_binding_is_canonical_and_old_unbound_checkpoints_fail_closed(tmp_path):
+    store, source = archive(tmp_path)
+    request = source.manifest.request
+    session = store.root / "sessions" / request.request_id / "initial"
+    checkpoint = json.loads((session / "completed.json").read_bytes())
+    binding = json.loads(source.read("acquisition.json"))
+    assert binding["request_id"] == request.request_id == binding["request_sha256"]
+    assert binding["identities_sha256"] == digest(source.read("identities.json"))
+    assert binding["evidence_sha256"] == digest((session / "evidence.json").read_bytes())
+    assert checkpoint["binding_sha256"] == digest(source.read("acquisition.json"))
+    transport = Transport([])
+    client = adapter(transport)
+    assert client.acquire_and_archive(request, store, normalize_identities([identity()])) == source
+    (session / "completed.json").write_bytes(canonical({"revision": source.manifest.revision}))
+    with pytest.raises(ArchiveError, match="SOURCE_CONFLICT"):
+        client.acquire_and_archive(request, store, normalize_identities([identity()]))
+    assert transport.calls == []
+
+
+def test_completed_evidence_cannot_be_replaced_or_referenced_without_its_hash(tmp_path):
+    evidence = (ArchiveInput("action.json", "corporate_actions", b"original", "fixture://action"),)
+    store, source = archive(tmp_path, evidence=evidence)
+    transport = Transport([])
+    with pytest.raises(ArchiveError, match="REVISION_CONFLICT"):
+        adapter(transport).acquire_and_archive(
+            source.manifest.request,
+            store,
+            normalize_identities([identity()]),
+            evidence=(replace(evidence[0], source_ref="fixture://changed"),),
+        )
+    assert transport.calls == []
+
+
+def repack_archive(tmp_path, source, changes):
+    """Every test mutation has valid file/manifest hashes; only semantic binding is wrong."""
+    contents = {item.path: source.read(item.path) for item in source.manifest.files} | changes
+    manifest = replace(
+        source.manifest,
+        files=tuple(
+            replace(item, sha256=digest(contents[item.path]), size_bytes=len(contents[item.path]))
+            for item in source.manifest.files
+        ),
+    )
+    directory = tmp_path / manifest.revision
+    directory.mkdir(parents=True)
+    for path, content in contents.items():
+        target = directory / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    encoded = canonical(asdict(manifest))
+    (directory / "manifest.json").write_bytes(encoded)
+    (directory / "manifest.sha256").write_text(digest(encoded) + "\n")
+    return directory
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "swapped_refs",
+        "swapped_hashes",
+        "missing_retry",
+        "duplicate_retry",
+        "wrong_file",
+        "successful_retry",
+        "nonretryable_status",
+        "boolean_status",
+        "terminal_status",
+        "orphan_retry",
+        "retryable_status_mismatch",
+        "wrong_ordinal",
+        "receipt_downgrade",
+    ],
+)
+def test_retry_evidence_must_match_attempts_even_with_valid_global_hashes(tmp_path, damage):
+    transport = Transport(
+        [HTTPResponse(429, b"rate limit"), HTTPResponse(503, b"unavailable"), page()]
+    )
+    store = ArchiveStore(tmp_path / "original")
+    source = adapter(transport, retries=2).acquire_and_archive(
+        source_request(), store, normalize_identities([identity()])
+    )
+    assert audit_archive(source)["status"] == "archive_complete"
+    receipt = json.loads(source.read("pages/0000.receipt.json"))
+    attempts, retries = receipt["attempts"], receipt["retry_responses"]
+    if damage == "swapped_refs":
+        retries.reverse()
+    elif damage == "swapped_hashes":
+        attempts[0]["response_sha256"], attempts[1]["response_sha256"] = (
+            attempts[1]["response_sha256"],
+            attempts[0]["response_sha256"],
+        )
+    elif damage == "missing_retry":
+        retries.pop()
+    elif damage == "duplicate_retry":
+        retries[1] = retries[0]
+    elif damage == "wrong_file":
+        retries[0] |= {"path": "pages/0000.json", "sha256": digest(source.read("pages/0000.json"))}
+    elif damage == "successful_retry":
+        attempts[0]["status"] = 200
+    elif damage == "nonretryable_status":
+        attempts[0]["status"] = 403
+    elif damage == "boolean_status":
+        attempts[0]["status"] = False
+    elif damage == "terminal_status":
+        attempts[-1]["status"] = 429
+    elif damage == "retryable_status_mismatch":
+        attempts[0]["status"] = 503
+    elif damage == "wrong_ordinal":
+        attempts[0]["ordinal"] = 1
+    elif damage == "receipt_downgrade":
+        receipt.pop("schema_version")
+        for attempt in attempts:
+            attempt.pop("ordinal")
+        for retry in retries:
+            retry.pop("ordinal")
+            retry.pop("status")
+    elif damage == "orphan_retry":
+        attempts.pop(0)
+        retries.pop(0)
+        for ordinal, attempt in enumerate(attempts):
+            attempt["ordinal"] = ordinal
+        retries[0] |= {"path": "pages/0000.attempt-00.bin", "ordinal": 0}
+        directory = repack_archive(
+            tmp_path / "bad",
+            source,
+            {
+                "pages/0000.receipt.json": canonical(receipt),
+                "pages/0000.attempt-00.bin": source.read("pages/0000.attempt-01.bin"),
+            },
+        )
+        with pytest.raises(ArchiveError, match="SOURCE_CONFLICT"):
+            load_archive(directory)
+        return
+    directory = repack_archive(
+        tmp_path / "bad", source, {"pages/0000.receipt.json": canonical(receipt)}
+    )
+    with pytest.raises(ArchiveError, match="SOURCE_CONFLICT"):
+        load_archive(directory)
+
+
+def test_legacy_standalone_archives_replay_but_cannot_satisfy_a_bound_completed_session(tmp_path):
+    store, source = archive(tmp_path)
+    inputs = []
+    for item in source.manifest.files:
+        if item.role == "acquisition_session":
+            continue
+        content = source.read(item.path)
+        if item.role == "receipt":
+            receipt = json.loads(content)
+            receipt.pop("schema_version")
+            for attempt in receipt["attempts"]:
+                attempt.pop("ordinal")
+            for retry in receipt["retry_responses"]:
+                retry.pop("ordinal")
+                retry.pop("status")
+            content = canonical(receipt)
+        inputs.append(ArchiveInput(item.path, item.role, content, item.source_ref))
+    legacy = store.commit(
+        request=source.manifest.request,
+        layer="source",
+        inputs=tuple(inputs),
+        acquired_start_at=source.manifest.acquired_start_at,
+        acquired_end_at=source.manifest.acquired_end_at,
+        adapter_version=source.manifest.adapter_version,
+        writer_version=source.manifest.writer_version,
+    )
+    assert audit_archive(load_archive(legacy.directory))["market_data_verified"] is False
+    assert len(tuple(iter_raw_bars(normalize_archived_snapshot(legacy, store)))) == 1
+    checkpoint = (
+        store.root / "sessions" / source.manifest.request.request_id / "initial" / "completed.json"
+    )
+    checkpoint.write_bytes(
+        canonical(json.loads(checkpoint.read_bytes()) | {"revision": legacy.manifest.revision})
+    )
+    transport = Transport([])
+    with pytest.raises(ArchiveError, match="SOURCE_CONFLICT"):
+        adapter(transport).acquire_and_archive(
+            source.manifest.request, store, normalize_identities([identity()])
+        )
+    assert transport.calls == []

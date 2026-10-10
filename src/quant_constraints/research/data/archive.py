@@ -10,11 +10,16 @@ from datetime import datetime
 from pathlib import Path
 
 from .archive_contracts import (
+    EVIDENCE_ROLES,
+    RECEIPT_VERSION,
+    RETRY_STATUSES,
     ArchiveFile,
     ArchiveManifest,
     SourceRequest,
+    acquisition_binding,
     canonical,
     digest,
+    evidence_fingerprint,
     parse_time,
     reject,
 )
@@ -152,22 +157,95 @@ def audit_archive(snapshot: ArchivedSnapshot) -> dict:
         ):
             reject("SOURCE_CONFLICT", "request", "Archived request differs from manifest request")
         indexed = {item.path: item for item in manifest.files}
+        sessions = [item for item in manifest.files if item.role == "acquisition_session"]
+        if sessions:
+            try:
+                if len(sessions) != 1 or sessions[0].path != "acquisition.json":
+                    reject(
+                        "SOURCE_CONFLICT",
+                        "acquisition",
+                        "One canonical acquisition binding required",
+                    )
+                binding = safe_path(directory, sessions[0].path).read_bytes()
+                acquisition_id = json.loads(binding)["acquisition_id"]
+                identity_file = next(item for item in manifest.files if item.role == "identities")
+                if (
+                    binding
+                    != acquisition_binding(
+                        manifest.request,
+                        acquisition_id,
+                        identity_file.sha256,
+                        digest(evidence_fingerprint(manifest.files)),
+                    )
+                    or sessions[0].source_ref
+                    != f"acquisition://{manifest.request.request_id}/{acquisition_id}"
+                ):
+                    reject(
+                        "SOURCE_CONFLICT",
+                        "acquisition",
+                        "Acquisition binding disagrees with source files",
+                    )
+            except (ValueError, KeyError, TypeError):
+                reject(
+                    "SOURCE_CONFLICT", "acquisition", "Malformed or conflicting acquisition binding"
+                )
+        bound_receipts, bound_retries = set(), set()
+        previous_page_end = manifest.acquired_start_at
         for item in manifest.files:
             if item.role != "response":
                 continue
             receipt_file = indexed.get(item.path.removesuffix(".json") + ".receipt.json")
             if receipt_file is None or receipt_file.role != "receipt":
                 reject("SOURCE_CONFLICT", "receipt", "An original response has no bound receipt")
+            bound_receipts.add(receipt_file.path)
             try:
                 receipt = json.loads(safe_path(directory, receipt_file.path).read_bytes())
                 if (
                     receipt["sha256"] != item.sha256
                     or receipt["url"] != item.source_ref
+                    or receipt_file.source_ref != item.source_ref
+                    or type(receipt["status"]) is not int
                     or receipt["status"] != 200
                 ):
                     reject("SOURCE_CONFLICT", "receipt", "Receipt disagrees with original response")
-                previous = manifest.acquired_start_at
-                for attempt in receipt["attempts"]:
+                attempts, retries = receipt["attempts"], receipt["retry_responses"]
+                receipt_version = receipt.get("schema_version")
+                if receipt_version not in {None, RECEIPT_VERSION} or (
+                    sessions and receipt_version != RECEIPT_VERSION
+                ):
+                    reject(
+                        "SOURCE_CONFLICT",
+                        "receipt",
+                        "Unsupported or downgraded acquisition receipt",
+                    )
+                if (
+                    not isinstance(attempts, list)
+                    or not isinstance(retries, list)
+                    or not 1 <= len(attempts) <= 9
+                    or len(attempts) != len(retries) + 1
+                ):
+                    reject(
+                        "SOURCE_CONFLICT",
+                        "receipt",
+                        "Attempts and retry files must correspond one to one",
+                    )
+                previous = previous_page_end
+                for ordinal, attempt in enumerate(attempts):
+                    fields = {"status", "started_at", "ended_at", "response_sha256"}
+                    if receipt_version:
+                        fields.add("ordinal")
+                    if (
+                        not isinstance(attempt, dict)
+                        or set(attempt) != fields
+                        or type(attempt["status"]) is not int
+                        or (
+                            receipt_version
+                            and (
+                                type(attempt["ordinal"]) is not int or attempt["ordinal"] != ordinal
+                            )
+                        )
+                    ):
+                        reject("SOURCE_CONFLICT", "receipt", "Malformed attempt record")
                     start, end = parse_time(attempt["started_at"]), parse_time(attempt["ended_at"])
                     if not previous <= start <= end <= manifest.acquired_end_at:
                         reject(
@@ -176,30 +254,55 @@ def audit_archive(snapshot: ArchivedSnapshot) -> dict:
                             "Receipt clocks escape acquisition coverage",
                         )
                     previous = end
-                if (
-                    not receipt["attempts"]
-                    or receipt["attempts"][-1]["status"] != 200
-                    or receipt["attempts"][-1]["response_sha256"] != item.sha256
-                ):
+                    if ordinal < len(retries):
+                        retry = retries[ordinal]
+                        path = item.path.removesuffix(".json") + f".attempt-{ordinal:02d}.bin"
+                        file = indexed.get(path)
+                        retry_fields = {"path", "sha256"} | (
+                            {"ordinal", "status"} if receipt_version else set()
+                        )
+                        if (
+                            not isinstance(retry, dict)
+                            or set(retry) != retry_fields
+                            or (
+                                receipt_version
+                                and (
+                                    type(retry["ordinal"]) is not int
+                                    or retry["ordinal"] != ordinal
+                                    or type(retry["status"]) is not int
+                                    or retry["status"] != attempt["status"]
+                                )
+                            )
+                            or retry["path"] != path
+                            or path in bound_retries
+                            or attempt["status"] not in RETRY_STATUSES
+                            or file is None
+                            or file.role != "attempt_response"
+                            or file.source_ref != item.source_ref
+                            or file.sha256 != retry["sha256"]
+                            or file.sha256 != attempt["response_sha256"]
+                        ):
+                            reject(
+                                "SOURCE_CONFLICT",
+                                "receipt",
+                                "Retry attempt differs from its ordered response file",
+                            )
+                        bound_retries.add(path)
+                previous_page_end = previous
+                if attempts[-1]["status"] != 200 or attempts[-1]["response_sha256"] != item.sha256:
                     reject(
                         "SOURCE_CONFLICT",
                         "receipt",
                         "Terminal attempt does not bind the successful page",
                     )
-                for retry in receipt["retry_responses"]:
-                    file = indexed.get(retry["path"])
-                    if (
-                        file is None
-                        or file.role != "attempt_response"
-                        or file.sha256 != retry["sha256"]
-                    ):
-                        reject(
-                            "SOURCE_CONFLICT",
-                            "receipt",
-                            "Retry response is not bound by the manifest",
-                        )
-            except (json.JSONDecodeError, KeyError, TypeError, IndexError):
+            except (ValueError, KeyError, TypeError, IndexError):
                 reject("SOURCE_CONFLICT", "receipt", "Malformed acquisition receipt")
+        if bound_receipts != {
+            item.path for item in manifest.files if item.role == "receipt"
+        } or bound_retries != {
+            item.path for item in manifest.files if item.role == "attempt_response"
+        }:
+            reject("SOURCE_CONFLICT", "receipt", "Unreferenced receipt or retry response file")
         if manifest.layer == "normalized":
             parents = [item for item in manifest.files if item.role == "source_manifest"]
             if len(parents) != 1 or parents[0].sha256 != manifest.source_manifest_sha256:
@@ -218,16 +321,7 @@ def audit_archive(snapshot: ArchivedSnapshot) -> dict:
         "files": len(manifest.files),
         "market_data_verified": False,
         "availability_method": "ingestion_upper_bound_unverified",
-        "missing_evidence_roles": sorted(
-            {
-                "corporate_actions",
-                "adjustment_factors",
-                "comparison",
-                "source_definition",
-                "license_terms",
-            }
-            - {item.role for item in manifest.files}
-        ),
+        "missing_evidence_roles": sorted(EVIDENCE_ROLES - {item.role for item in manifest.files}),
     }
 
 

@@ -20,7 +20,20 @@ from .archive import (
     safe_path,
     write_once,
 )
-from .archive_contracts import ADAPTER_VERSION, SourceRequest, canonical, digest, reject
+from .archive_contracts import (
+    ACQUISITION_VERSION,
+    ADAPTER_VERSION,
+    EVIDENCE_ROLES,
+    RECEIPT_VERSION,
+    RETRY_STATUSES,
+    ArchiveFile,
+    SourceRequest,
+    acquisition_binding,
+    canonical,
+    digest,
+    evidence_fingerprint,
+    reject,
+)
 from .contracts import IdentityMap
 from .contracts.errors import timestamp
 
@@ -229,6 +242,7 @@ class MassiveAdapter:
             bodies.append(response.body)
             attempts.append(
                 {
+                    "ordinal": attempt,
                     "status": response.status,
                     "started_at": started.isoformat(),
                     "ended_at": ended.isoformat(),
@@ -243,7 +257,7 @@ class MassiveAdapter:
                     "status",
                     "Provider denied access; this is not empty market data",
                 )
-            if response.status not in {0, 429, 500, 502, 503, 504}:
+            if response.status not in RETRY_STATUSES:
                 reject("TRANSPORT_REJECTED", "status", "Unexpected response or redirect")
             if attempt < self._retries:
                 delay = 0.5 * 2**attempt
@@ -283,7 +297,10 @@ class MassiveAdapter:
                 "access",
                 "Native HTTP requires private archive permission and an environment credential",
             )
-        if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", acquisition_id) is None:
+        if (
+            not isinstance(acquisition_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", acquisition_id) is None
+        ):
             reject(
                 "INVALID_REQUEST", "acquisition_id", "Use a bounded portable acquisition identifier"
             )
@@ -298,13 +315,7 @@ class MassiveAdapter:
             )
         metadata = canonical([asdict(item) for item in identities.entries])
         for item in evidence:
-            if item.role not in {
-                "corporate_actions",
-                "adjustment_factors",
-                "comparison",
-                "source_definition",
-                "license_terms",
-            }:
+            if item.role not in EVIDENCE_ROLES:
                 reject(
                     "INVALID_REQUEST",
                     "evidence",
@@ -318,33 +329,91 @@ class MassiveAdapter:
         session.mkdir(parents=True, exist_ok=True)
         write_once(session / "request.json", request_bytes)
         write_once(session / "identities.json", metadata)
-        evidence_fingerprint = canonical(
-            [
-                {
-                    "path": item.path,
-                    "role": item.role,
-                    "sha256": digest(item.content),
-                    "source_ref": item.source_ref,
-                }
+        fingerprint = evidence_fingerprint(
+            tuple(
+                ArchiveFile(
+                    path=item.path,
+                    role=item.role,
+                    sha256=digest(item.content),
+                    size_bytes=len(item.content),
+                    source_ref=item.source_ref,
+                )
                 for item in evidence
-            ]
+            )
         )
-        self._check_secret(evidence_fingerprint)
-        write_once(session / "evidence.json", evidence_fingerprint)
+        self._check_secret(fingerprint)
+        write_once(session / "evidence.json", fingerprint)
+        binding = acquisition_binding(
+            request, acquisition_id, digest(metadata), digest(fingerprint)
+        )
+        write_once(session / "acquisition.json", binding)
+        checkpoint_binding = {
+            "schema_version": ACQUISITION_VERSION,
+            "request_id": request.request_id,
+            "acquisition_id": acquisition_id,
+            "binding_sha256": digest(binding),
+        }
         completed = safe_path(session, "completed.json")
         if completed.exists():
             try:
-                revision = json.loads(completed.read_bytes())["revision"]
-            except (ValueError, KeyError, OSError):
+                checkpoint_bytes = completed.read_bytes()
+                checkpoint = json.loads(checkpoint_bytes)
+                revision = checkpoint["revision"]
+            except (ValueError, KeyError, OSError, TypeError):
                 reject("HASH_MISMATCH", "checkpoint", "Invalid acquisition checkpoint")
             if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{64}", revision) is None:
                 reject("HASH_MISMATCH", "checkpoint", "Invalid acquisition revision")
-            return load_archive(store.root / "source" / revision)
+            if checkpoint_bytes != canonical(checkpoint_binding | {"revision": revision}):
+                reject("SOURCE_CONFLICT", "checkpoint", "Checkpoint belongs to another acquisition")
+            snapshot = load_archive(safe_path(store.root, "source/" + revision))
+            if (
+                snapshot.manifest.request != request
+                or snapshot.manifest.adapter_version != ADAPTER_VERSION
+                or {
+                    item.path
+                    for item in snapshot.manifest.files
+                    if item.role == "acquisition_session"
+                }
+                != {"acquisition.json"}
+                or snapshot.read("acquisition.json") != binding
+                or snapshot.read("identities.json") != metadata
+                or evidence_fingerprint(snapshot.manifest.files) != fingerprint
+            ):
+                reject(
+                    "SOURCE_CONFLICT", "checkpoint", "Archive differs from the current acquisition"
+                )
+            try:
+                for item in snapshot.manifest.files:
+                    if item.role in {"response", "receipt", "attempt_response"}:
+                        content = safe_path(session, item.path).read_bytes()
+                        if len(content) != item.size_bytes or digest(content) != item.sha256:
+                            reject(
+                                "HASH_MISMATCH",
+                                "checkpoint",
+                                "Archive differs from saved session pages",
+                            )
+                        if (
+                            item.role == "receipt"
+                            and safe_path(session, item.path.removesuffix(".json") + ".sha256")
+                            .read_text(encoding="ascii")
+                            .strip()
+                            != item.sha256
+                        ):
+                            reject("HASH_MISMATCH", "checkpoint", "Saved receipt digest differs")
+            except (OSError, UnicodeError):
+                reject("HASH_MISMATCH", "checkpoint", "Completed session pages are unreadable")
+            return snapshot
         inputs = [
             ArchiveInput(
                 "request.json", "request", request_bytes, "request://" + request.request_id
             ),
             ArchiveInput("identities.json", "identities", metadata, "identity-map://canonical"),
+            ArchiveInput(
+                "acquisition.json",
+                "acquisition_session",
+                binding,
+                f"acquisition://{request.request_id}/{acquisition_id}",
+            ),
             *evidence,
         ]
         url, visited, total = request_url(request), set(), 0
@@ -390,6 +459,7 @@ class MassiveAdapter:
                     )
                 )
                 receipt = {
+                    "schema_version": RECEIPT_VERSION,
                     "url": url,
                     "sha256": digest(body),
                     "status": 200,
@@ -399,7 +469,12 @@ class MassiveAdapter:
                     "next_url": page.get("next_url"),
                     "record_id_kind": "derived_page_row_timestamp_v1",
                     "retry_responses": [
-                        {"path": f"{prefix}.attempt-{ordinal:02d}.bin", "sha256": digest(content)}
+                        {
+                            "ordinal": ordinal,
+                            "status": attempts[ordinal]["status"],
+                            "path": f"{prefix}.attempt-{ordinal:02d}.bin",
+                            "sha256": digest(content),
+                        }
                         for ordinal, content in enumerate(bodies[:-1])
                     ],
                 }
@@ -417,19 +492,20 @@ class MassiveAdapter:
             total += len(body)
             try:
                 for entry in receipt["retry_responses"]:
-                    if not re.fullmatch(
-                        re.escape(prefix) + r"\.attempt-[0-9]{2}\.bin", entry["path"]
+                    path = entry["path"]
+                    if not isinstance(path, str) or not re.fullmatch(
+                        re.escape(prefix) + r"\.attempt-[0-9]{2}\.bin", path
                     ):
                         reject(
                             "HASH_MISMATCH",
                             "checkpoint",
                             "Retry response path differs from its page",
                         )
-                    content = safe_path(session, entry["path"]).read_bytes()
+                    content = safe_path(session, path).read_bytes()
                     if digest(content) != entry["sha256"]:
                         reject("HASH_MISMATCH", "checkpoint", "Retry response bytes changed")
                     total += len(content)
-                    inputs.append(ArchiveInput(entry["path"], "attempt_response", content, url))
+                    inputs.append(ArchiveInput(path, "attempt_response", content, url))
                 started = timestamp(
                     datetime.fromisoformat(receipt["attempts"][0]["started_at"]), "started_at"
                 )
@@ -470,7 +546,10 @@ class MassiveAdapter:
                     adapter_version=ADAPTER_VERSION,
                     writer_version="original_bytes_v1",
                 )
-                write_once(completed, canonical({"revision": snapshot.manifest.revision}))
+                write_once(
+                    completed,
+                    canonical(checkpoint_binding | {"revision": snapshot.manifest.revision}),
+                )
                 return snapshot
             url = checked_url(page["next_url"], request)
         reject(

@@ -66,6 +66,25 @@ their cursor. A completed ID returns its frozen snapshot without a network call.
 ID explicitly refetches; changed bytes/clocks produce another revision and preserve the old one.
 An incomplete/corrupt checkpoint fails closed; do not repair it by silently recalculating hashes.
 
+Each new acquisition archives an `acquisition.json` (`research_acquisition_v1`) with an explicit
+`acquisition_session` role. It binds the full request digest, request/acquisition IDs, identity hash
+and the sorted supplementary evidence fingerprint. `completed.json` binds that session digest to
+the frozen revision. Recovery checks the target manifest, identities, evidence and all saved page,
+receipt and retry bytes/digests against the current session before returning it. A pointer to another
+otherwise valid revision is rejected without fetching or creating a replacement archive. Different
+acquisition IDs have distinct bindings even when the market bytes and acquisition clocks coincide.
+Old standalone snapshots can still replay offline after integrity audit, but an old completion
+pointer lacking a session binding is rejected; start a new acquisition ID instead of upgrading it
+or rewriting the old files.
+
+New receipts use `research_receipt_v1`. The ordered attempts have explicit zero-based ordinals;
+each failed attempt has exactly one retry file with the same ordinal, status and response digest,
+a page-specific path and matching source reference. Only the final attempt is successful and binds
+the page. Extra/unreferenced retry files, missing responses, exchanged paths/hashes/statuses, bad
+ordinals and downgrade to an unversioned receipt fail audit even if all file and manifest hashes
+were freshly recomputed. Older standalone unversioned receipts retain positional count/path/hash/
+status validation; they cannot satisfy the new bound-session format.
+
 | Layer | Content and purpose |
 | --- | --- |
 | L0 source | Original successful page bytes, retry-response bytes, sanitized URLs/receipts, exact request, identity entries and optional supplementary source evidence |
@@ -149,3 +168,27 @@ synthetic retry/pagination/resume, hashing/revision, scope, identity, session, m
 credential regressions. Full CI and Ecosystem remain mandatory. A licensed real-data smoke test
 and provider evidence are still outstanding; 5C raw/factor verification, 5D PIT/provider conversion,
 5E enforced entry and 5F authorized real-history E2E remain separate acceptance stages.
+
+## Documentation destination checks
+
+Strict MkDocs, internal destinations/anchors and external guide links remain merge gates. External
+checks in this fork use `validation/check_research_documentation_links.py`, preserving the imported
+upstream checker and retained evidence byte-for-byte. External
+429/5xx/timeout failures have at most three attempts per channel, 15-second timeouts and bounded
+backoff (numeric `Retry-After` up to 10 seconds). A webpage 404/410 is a missing destination and
+never becomes a pass through a fallback. Authentication/access errors also remain blocking.
+
+After an exhausted transient failure on a canonical GitHub blob link, the checker may use the
+[official Contents API](https://docs.github.com/en/rest/repos/contents?apiVersion=2022-11-28).
+The repository, exact ref and path must agree with a regular-file response, its HTML identity,
+Git blob URL, SHA and size. Direct main/master refs, full commit SHAs and slash refs encoded in a
+single URL segment are supported; other ambiguous mappings are not guessed. The API request stays
+on `api.github.com` and cannot redirect a credential. CI supplies its existing read-only token
+only to that API; local public checks can run unauthenticated.
+
+The CLI logs each result as `verified_present`, `verified_missing` or `temporarily_unverifiable`,
+including HTTP attempts and any official repository/ref/path/blob evidence. An API-backed presence
+result proves the linked file exists at that scope; it does not claim the GitHub webpage recovered.
+If both channels are unavailable, the metadata identifies another file/ref, or the API returns
+404/410, Documentation fails and the final merge gate stays blocked. None of these checks certify
+market-data authenticity or remove Issue #5's research blocker.

@@ -343,7 +343,9 @@ jobs:
         run: uv run mkdocs build --strict
 
       - name: Check rendered guide links
-        run: uv run python validation/check_documentation_links.py --site site
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: uv run python validation/check_research_documentation_links.py --site site
 
       - name: Verify rendered documentation identity
         run: >-

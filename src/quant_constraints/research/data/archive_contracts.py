@@ -17,6 +17,12 @@ from .normalize import NORMALIZER_VERSION
 
 ARCHIVE_VERSION = "research_archive_v1"
 ADAPTER_VERSION = "massive_aggregates_v1"
+ACQUISITION_VERSION = "research_acquisition_v1"
+RECEIPT_VERSION = "research_receipt_v1"
+EVIDENCE_ROLES = frozenset(
+    {"corporate_actions", "adjustment_factors", "comparison", "source_definition", "license_terms"}
+)
+RETRY_STATUSES = frozenset({0, 429, 500, 502, 503, 504})
 FEATURES = frozenset({"trf", "auction", "odd_lot", "out_of_session"})
 ROLES = frozenset(
     {
@@ -33,6 +39,7 @@ ROLES = frozenset(
         "attempt_response",
         "source_definition",
         "license_terms",
+        "acquisition_session",
     }
 )
 
@@ -334,6 +341,42 @@ class ArchiveFile:
         if not isinstance(self.sha256, str) or re.fullmatch(r"[0-9a-f]{64}", self.sha256) is None:
             reject("UNSUPPORTED_MANIFEST", "sha256", "Expected SHA-256 hexadecimal digest")
         nonempty(self.source_ref, "source_ref")
+
+
+def acquisition_binding(
+    request: SourceRequest, acquisition_id: str, identity_sha256: str, evidence_sha256: str
+) -> bytes:
+    """Bind one acquisition namespace, without upgrading the market-data contract."""
+    if (
+        not isinstance(acquisition_id, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", acquisition_id) is None
+    ):
+        reject("INVALID_REQUEST", "acquisition_id", "Use a bounded portable acquisition identifier")
+    return canonical(
+        {
+            "schema_version": ACQUISITION_VERSION,
+            "request_id": request.request_id,
+            "acquisition_id": acquisition_id,
+            "request_sha256": digest(canonical(asdict(request))),
+            "identities_sha256": identity_sha256,
+            "evidence_sha256": evidence_sha256,
+        }
+    )
+
+
+def evidence_fingerprint(files: tuple[ArchiveFile, ...]) -> bytes:
+    return canonical(
+        [
+            {
+                "path": item.path,
+                "role": item.role,
+                "sha256": item.sha256,
+                "source_ref": item.source_ref,
+            }
+            for item in sorted(files, key=lambda item: item.path)
+            if item.role in EVIDENCE_ROLES
+        ]
+    )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
