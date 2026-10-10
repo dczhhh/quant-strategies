@@ -82,6 +82,53 @@ intervals of that symbol/venue, rather than O(M) across the whole pool. The deri
 excluded from equality/repr; copy/pickle rebuild it from canonical entries. For serialization,
 persist the public entries, not the private cache. This remains effective-fact lookup, not PIT.
 
+### Identity market, consolidated coverage and SMART routing
+
+Following the [SMART routing review decision](https://github.com/dczhhh/quant-strategies/pull/6#issuecomment-6097465498),
+`venue` in `SecurityIdentity`, `RawBar` and `SignalBar` identifies the security's contemporary
+**listing/identity market**. For example, a Nasdaq-listed security's consolidated bar can use
+`venue="XNAS"` to associate it with its historical identity. This does not assert that every trade
+in that bar occurred on Nasdaq, or identify the final execution destination of an IBKR SMART order.
+Consolidated cross-market trades do not relax stable-ID, symbol, half-open interval or rename checks.
+Unknown SMART execution destinations do not make an otherwise valid consolidated bar inadmissible.
+The v2 fields and normalization behavior remain unchanged; coverage is not inferred from `venue`.
+
+The research acquisition default for 5B/5C is qualified US consolidated trades OHLCV across
+Tape A/B/C, including eligible cross-exchange and FINRA TRF-reported trades according to the
+supplier's documented policy. Prioritize suppliers' consolidated coverage of NYSE/Nasdaq/Cboe,
+IEX/MEMX and TRF, then assess security coverage, historical depth, RTH/early-close sessions,
+raw prices, PIT corporate actions, quotes/NBBO, licensing and cost. This does not require
+independent order books from every exchange or authorize an unverified source.
+
+5B must record the following in the dataset/immutable manifest, bound to archived source evidence;
+these are **future manifest requirements, not new v2 record fields**:
+
+| Declaration | Required meaning |
+| --- | --- |
+| `market_scope` | Explicit `us_consolidated` or `single_venue`; never infer full-market coverage from the identity market |
+| `coverage` / `exclusions` | Actual venues/reporting facilities and included/excluded TRF, opening/closing auctions, odd lots and out-of-session trades, with the supplier's definitions |
+| `source_feed` | Documented originating feed and aggregation policy; identify overlapping SIP and venue-specific inputs |
+| `tape` | Applicable Tape A/B/C coverage, without treating a listing tape as the execution venue |
+| `session_filter` | Actual included sessions and RTH/early-close filtering policy |
+
+Unknown source scope must fail closed at the later validation/entry gates. Single-venue data cannot
+be relabeled consolidated; missing coverage is not zero volume. Combining SIP and venue-specific
+inputs must avoid double counting. The current 5A contracts do not authenticate or enforce these
+manifest declarations, so Issue #5's research block remains in force.
+
+Minimum 5B/5C acceptance regressions must distinguish consolidated and single-venue inputs for the
+same NYSE/Nasdaq-listed security: only qualified consolidated input can support an indicator
+labeled full-market RVOL/volume, without discarding trades because they occurred away from its
+listing market. Preserve historical rename/half-open identity cases; require explicit missing
+coverage disclosures and reject overlapping-feed double counts. Retain raw-price, split-factor,
+availability and source/hash checks regardless of the unknown SMART destination.
+
+Reliable historical NBBO may inform spread/reachability assumptions, but neither NBBO nor bar
+high/low guarantees a fill. Keep the existing [IBKR Pro Tiered fee proxies and 2/3/5 bps slippage
+scenarios](us-cash-concentrated.md) explicit; do not infer venue fees/rebates or claim exact broker
+fills from consolidated bars. Optional execution-venue modeling belongs to a later scope with
+reliable venue-specific trades and a microstructure/directed-order simulation requirement.
+
 ## Source record namespace and schema migration
 
 `record_id` is unique only inside
