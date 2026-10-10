@@ -129,6 +129,7 @@ nav:
     - Account Policies: user-guide/accounts.md
     - Rebalancing: user-guide/rebalancing.md
     - Data Feed: user-guide/data-feed.md
+    - Research Data Contracts: research-data-contracts.md
     - Results & Analysis: user-guide/results.md
     - Market Impact: user-guide/market-impact.md
     - Stateful Strategies: user-guide/stateful-strategies.md

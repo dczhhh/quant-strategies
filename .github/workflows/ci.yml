@@ -10,7 +10,7 @@ on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, issue-3-us-cash-constraints]
 
 permissions:
   contents: read
