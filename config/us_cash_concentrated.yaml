@@ -10,6 +10,12 @@ slippage_regular_bps: 2.0
 slippage_early_close_bps: 3.0
 slippage_earnings_bps: 5.0
 slippage_missing_earnings: stress
+corporate_actions_enabled: false
+split_order_policy: adjust
+execution_data_mode: raw_execution
+signal_data_mode: split_adjusted_signal
+dividend_withholding_rate: 0.0
+dividend_tax_scenario: gross_no_withholding
 cash_reserve: 0.10
 settlement_cycle: historical
 minimum_hold_sessions: 0

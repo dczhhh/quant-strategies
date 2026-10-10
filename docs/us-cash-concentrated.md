@@ -26,6 +26,72 @@ cost_totals = engine.broker.execution_cost_statistics()
 
 `earnings_provider` 实现 `EarningsProvider.snapshot(asset, asof)`，返回 `EarningsCoverage` 和 `EarningsEvent`。`context_provider(asof, asset, phase)` 返回 `MarketContext`，必须使用同一个带时区的 `asof`。生产数据需提供可信的证券类型、行业、历史财报日程版本和行情可用时间。测试中的人工覆盖声明不是生产数据。
 
+## 公司行为：原始执行行情与 PIT 事件
+
+长历史回测不能忽略拆股、反向拆股和现金股息。新增独立
+`quant_constraints.corporate_actions`，默认不启用，以保持既有基座行为。
+研究真实股票历史时必须显式设置 `corporate_actions_enabled=True` 并向
+`constrained_engine(..., corporate_action_provider=provider)` 或 `broker_factory`
+提供 `CorporateActionProvider`，二者缺一或误传均报错。不提供实盘连接和买卖信号。
+
+Provider 的 `snapshot(security_id, asof)` 返回 `CorporateActionCoverage` 和最新可见
+`CorporateAction`，包含取消版本。事件必须有稳定证券 ID（不能只用 ticker）、事件 ID、
+有效/除息日期、实际 `available_at`、来源、正整数版本、币种和经济条款；记录日/付款日是
+可选元数据。覆盖声明需有开始/结束日期、可用时间和 `point_in_time=True`。
+仅有事后整理的数据不能冒充 PIT 覆盖；覆盖缺失或存在无法重建的迟到事件时停止运行。
+人工 InMemory 覆盖仅用于测试，不是历史行情/事件供应商。
+
+`MarketContext` 在启用时必须声明 `security_id`、`execution_data_mode='raw_execution'`、
+`risk_data_mode='raw_execution'` 和与配置一致的 `signal_data_mode`。订单撮合、估值、
+绝对止损/ATR、佣金、滑点及成交量一律使用原始价格和当时股份单位。因子输入可以选择
+`raw_execution`、`split_adjusted_signal` 或 `total_return_signal`；不会生成因子/信号，
+也不会用总回报行情估值后再加现金股息。复权执行数据明确拒绝，未实现隐式反向转换。
+这些标签是数据契约，不是自动检测供应商是否错误标注价格。
+
+事件在有效日期首个可见 bar、订单/财报/风控检查之前处理；拆股及除息日期按美东 NYSE
+有效交易日定位。首个观测可以是盘前，事件不因此创建盘前交易。跨缺失 bar 时，已知事件
+在下一观测恢复并标记 `recovered_after_gap`、`missing_asset_bar`；资产缺行情时转换历史
+估值缓存，不凭空生成成交。有效开盘之后才发现的事件，如存在持仓、挂单或该日以后的
+成交，则拒绝并要求回到前序 checkpoint 对账/重放，不能用当前仓位猜历史资格。
+
+| 事件/策略 | 唯一账本行为 |
+|---|---|
+| `SPLIT`，`r=new/old` | 数量/初始数量/未成交余量乘 r；成本、当前价、water marks、绝对订单/止损/止盈/追踪距离、每股滑点、缓存 ATR、调仓参考价除 r |
+| 比例与累计费用 | 目标权重、百分比阈值、MFE/MAE、累计入场佣金、持仓起点不变；拆股不形成 Fill、Trade、已实现盈亏、周新仓或 IBKR 月度成交量 |
+| `split_order_policy=adjust` | 原子转换挂单及部分成交后的 Bracket/OCO 父子数量，重新报价预约费；不会改写历史 Fill 或重新收取修改最低费 |
+| `split_order_policy=cancel` | 撤销普通/父单未成交余量；已成交裸露敞口的保护子单仍转换并保留，不允许撤保护留下裸仓 |
+| 反向拆股 | 仅支持来源声明的 `fractional_policy=retain` 和 `quantity_precision`（0–12）；不丢弃碎股，无法表示的资格报错；现金替代暂不支持，明确阻断，不伪造卖出 |
+| `CASH_DIVIDEND` | 以除息日开始前已持有、经过同日拆股转换的股数计资格；当日新买无资格，当日卖出不取消应收；仅支持明确的 `dividend_basis=post_split` 普通 USD 股息 |
+| 股息应收 | 毛额、预扣税、费用及净额分别审计；净额进入 AccountState 的非现金应收及权益，不进入 cash、settled_cash 或 buying power |
+| `CASH_CREDIT` | 来源确认的实际信用事件，`parent_event_id` 指向股息资格，`effective_date` 是实际入账日、`available_at` 是确认可用时间；可提供本账户实际 `credited_net`，与预估差额单独对账；非交易日到账不按交易日历前移 |
+
+例如 100 股 × $100，除息后原价 $99：$9,900 股票加 $100 应收仍为税前 $10,000。
+付款仅把应收转现金，不再增加一次权益。`payable_date` **不会自动释放现金**；未确定
+真实到账的股息保持应收，需独立信用事件才能交易。`dividend_withholding_rate=0.0` 与
+`dividend_tax_scenario='gross_no_withholding'` 是默认税前情景，不是所有投资者的税率。
+非零税率必须给情景命名；来源提供的本账户预扣率优先，费用按明确每股费用计算。
+
+事件键 `(security_id, event_id)`、已处理经济版本、应收/信用资格都保存在同一个
+AccountState checkpoint 中。重复 bar、处理器重建、恢复后重放不会重复加股/加钱。
+处理前可见修订选最新；入账后经济条款改变或取消则停止要求对账，纯来源/版本元数据
+更新不重复执行。持仓/挂单期间 ticker 对应证券 ID 改变会报错；并购、分拆、退市、
+改名迁移、特殊股息/due bill、非 USD、未知自定义风控价格语义均显式阻断受影响敞口，
+不把资产归零或悄悄丢弃。未持有的复杂事件只记 `ignored_unexposed`。
+基座 Canonical pre-open intent 的股份目标和授权迁移暂不支持与本公司行为适配器混用，
+存在此类意图时明确停止；使用本约束层的目标/调仓计划接口。实际信用事件表示一笔资格的
+完整最终到账，分期/部分到账需独立条款实现，不能当作普通全额信用事件；实际净额不能
+超过已确认资格毛额，也不能给零股资格凭空加钱。
+
+`broker.corporate_action_evidence()` 和结果 `metrics['corporate_actions_v1']` 包含版本、
+逐事件来源/时点/股数/状态、应收、现金增量、收入与失败诊断，可随结果 Parquet 保存。
+原有 cash/exposure 字段含义不变：`equity = cash + net_exposure + outstanding_receivables`。
+交易 P&L 与股息收入分开；统一终值不变量检查 `initial + trading P&L + funding + income`，
+不豁免公司行为回测的会计校验。
+
+依据：[SEC 除息日与股息资格](https://www.investor.gov/introduction-investing/investing-basics/glossary/ex-dividend-dates-when-are-you-entitled-stock-and)、
+[IBKR 股息日期和拆股](https://www.interactivebrokers.com/campus/trading-lessons/dividend-dates-and-stock-splits/)。
+具体事件条款必须来自实际历史来源；上述普通事件实现不推导特殊事件资格。
+
 纯检查接口为 `controller.check(intent, state, market_context)`，返回 `ALLOW / REJECT / DEFER / RESIZE`、稳定原因码及数据。`submit_intent()` 接收外部意图；也支持原有 `submit_order()`、`update_order()`、`order_target_percent()`、`rebalance_to_weights()`。目标接口表示外部调仓请求，受调仓日期与 3 个百分点死区约束；普通减仓使用 `Kind.REDUCE`，风控使用 `Kind.RISK`。完整目标分配还通过 `check_targets()` 检查 4–6 个标的、单票范围、行业和股票预算。逐步建仓可以暂时少于 4 个持仓，不会为凑齐数量自动下单。
 
 防御配置可以对单次完整目标传 `defensive_allocation=True`，或显式启用 `allow_defensive_underinvested`。这允许 0–3 只及全现金目标，仍保留单票范围、最多 6 只、90% 投资预算、现金储备和行业上限。不会补足持仓数量，也不生成防御信号；禁止买入的市场仍允许合法减仓。

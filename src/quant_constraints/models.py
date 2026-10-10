@@ -78,6 +78,10 @@ class MarketContext:
     execution_liquidity: str = "unknown"
     fee_metadata_available_at: datetime | None = None
     reference_price: float | None = None  # observed mark for external target-quantity contract
+    security_id: str | None = None  # stable source identifier, not a ticker
+    execution_data_mode: str | None = None
+    signal_data_mode: str | None = None
+    risk_data_mode: str | None = None  # ATR/absolute risk inputs must use raw share units
 
     def __post_init__(self):
         aware(self.asof)

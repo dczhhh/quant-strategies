@@ -1,9 +1,10 @@
 """Opt-in backtest adapter; core cash, position and order state remain canonical."""
 
+import copy
 import math
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime
 from types import MappingProxyType
 
@@ -22,6 +23,7 @@ from ml4t.backtest.types import ExecutionMode, Order, OrderSide, OrderStatus, Or
 
 from .calendar import NY, settlement_date
 from .controller import ConstraintController
+from .corporate_actions import CorporateActionProcessor, CorporateActionProvider
 from .fees import IBKRProTieredUSStock
 from .fees.bridge import FeeCommissionBridge
 from .models import Action, Audit, Decision, Holding, Intent, Kind, MarketContext, State, aware
@@ -127,6 +129,7 @@ class ConstrainedBroker(Broker):
         context_provider: ContextProvider,
         config: BacktestConfig,
         fee_model: IBKRProTieredUSStock | None = None,
+        corporate_action_provider: CorporateActionProvider | None = None,
     ) -> None:
         if hasattr(self, "controller"):
             raise ValueError("Constraint broker is already configured")
@@ -152,6 +155,10 @@ class ConstrainedBroker(Broker):
             )
         if self.fill_ordering is not FillOrdering.EXIT_FIRST:
             raise ValueError("Constraint profile requires exit_first fill ordering")
+        if controller.config.corporate_actions_enabled != (corporate_action_provider is not None):
+            raise ValueError(
+                "Corporate actions require both opt-in config and an explicit provider"
+            )
         self.controller = controller
         self.context_provider = context_provider
         if controller.config.pricing_plan == "ibkr_pro_tiered":
@@ -225,6 +232,11 @@ class ConstrainedBroker(Broker):
         )
         self._fill_executor.fill_engine = self._fill_engine
         self._fill_engine.executor = self._fill_executor
+        self.corporate_action_processor = (
+            CorporateActionProcessor(self, corporate_action_provider)
+            if corporate_action_provider is not None
+            else None
+        )
 
     def context_for(
         self,
@@ -267,7 +279,11 @@ class ConstrainedBroker(Broker):
             holdings[asset] = Holding(
                 position.quantity, price, supplied.sector, position.entry_time, supplied.instrument
             )
-        equity = self.cash + sum(h.quantity * h.price for h in holdings.values())
+        equity = (
+            self.cash
+            + self.account._receivable_value
+            + sum(h.quantity * h.price for h in holdings.values())
+        )
         if not missing_marks:
             self.constraint_peak = max(self.constraint_peak, equity)
         buys: dict[str, float] = {}
@@ -1261,7 +1277,24 @@ class ConstrainedBroker(Broker):
 
     def _update_time(self, timestamp, prices, opens, highs=None, lows=None, *rest, **kwargs):
         aware(timestamp)
-        super()._update_time(timestamp, prices, opens, highs, lows, *rest, **kwargs)
+        processor = getattr(self, "corporate_action_processor", None)
+        if processor is None:
+            super()._update_time(timestamp, prices, opens, highs, lows, *rest, **kwargs)
+        else:
+            snapshot = self._snapshot_lifecycle_state(
+                all_positions=True, all_pending_orders=True, risk_rules=True, all_asset_stats=True
+            )
+            try:
+                observed = set(prices) | set(opens)
+                prepared = processor.prepare(timestamp, observed)
+                super()._update_time(timestamp, prices, opens, highs, lows, *rest, **kwargs)
+                processor.apply(timestamp, observed, prepared)
+            except Exception as error:
+                self._restore_lifecycle_state(snapshot)
+                processor.failures.append(
+                    {"timestamp": timestamp.isoformat(), "reason": str(error)}
+                )
+                raise
         if hasattr(self, "controller"):
             self.expire_orders()
         if (
@@ -1305,17 +1338,53 @@ class ConstrainedBroker(Broker):
         finally:
             self.risk_monitor_submission = False
 
+    def corporate_action_evidence(self):
+        processor = getattr(self, "corporate_action_processor", None)
+        return processor.evidence() if processor is not None else None
+
+    def _snapshot_lifecycle_state(self, **scope):
+        snapshot = super()._snapshot_lifecycle_state(**scope)
+        if getattr(self, "corporate_action_processor", None) is not None:
+            snapshot["corporate_extension"] = {
+                "market": copy.deepcopy(self._market_state),
+                "orders": [(order, copy.deepcopy(vars(order))) for order in self.orders],
+                "maps": {
+                    name: copy.deepcopy(getattr(self, name))
+                    for name in ("order_requested", "order_permitted", "order_audit_state")
+                },
+                "plans": dict(self.plan_manager.records),
+                "audit_length": len(self.controller.audit),
+            }
+        return snapshot
+
+    def _restore_lifecycle_state(self, state):
+        super()._restore_lifecycle_state(state)
+        extra = state.get("corporate_extension")
+        if extra is not None:
+            for item in fields(self._market_state):
+                setattr(self._market_state, item.name, getattr(extra["market"], item.name))
+            for order, state in extra["orders"]:
+                order.__dict__.clear()
+                order.__dict__.update(state)
+            for name, mapping in extra["maps"].items():
+                setattr(self, name, mapping)
+            self.plan_manager.records = extra["plans"]
+            del self.controller.audit[extra["audit_length"] :]
+
 
 def broker_factory(
     controller: ConstraintController,
     context_provider: ContextProvider,
     *,
     fee_model: IBKRProTieredUSStock | None = None,
+    corporate_action_provider: CorporateActionProvider | None = None,
 ):
     def factory(config: BacktestConfig, **kwargs) -> ConstrainedBroker:
         broker = ConstrainedBroker.from_config(config, **kwargs)
         assert isinstance(broker, ConstrainedBroker)
-        broker.configure_constraints(controller, context_provider, config, fee_model)
+        broker.configure_constraints(
+            controller, context_provider, config, fee_model, corporate_action_provider
+        )
         return broker
 
     return factory
@@ -1327,12 +1396,16 @@ def constrained_engine(
     controller: ConstraintController,
     context_provider: ContextProvider,
     config: BacktestConfig | None = None,
+    *,
+    corporate_action_provider: CorporateActionProvider | None = None,
     **kwargs,
 ) -> Engine:
     return Engine(
         feed,
         strategy,
         config or cash_backtest_config(),
-        broker_factory=broker_factory(controller, context_provider),
+        broker_factory=broker_factory(
+            controller, context_provider, corporate_action_provider=corporate_action_provider
+        ),
         **kwargs,
     )

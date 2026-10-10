@@ -28,7 +28,7 @@ class PortfolioLedger:
         self.orders = orders
 
     def get_account_value(self) -> float:
-        value = self.account.cash
+        value = self.account.cash + self.account._receivable_value
         for asset, pos in self.account.positions.items():
             price = self.broker.get_mark_price(asset, quantity=pos.quantity)
             if price is None:

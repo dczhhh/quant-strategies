@@ -611,7 +611,7 @@ class Engine:
             gross_exposure += abs(position_value)
             net_exposure += position_value
 
-        equity = cash + net_exposure
+        equity = cash + self.broker.account._receivable_value + net_exposure
         self.equity_curve.append((timestamp, equity))
         self.portfolio_state.append(
             (timestamp, equity, cash, gross_exposure, net_exposure, len(self.broker.positions))
@@ -732,6 +732,13 @@ class Engine:
                 }
                 for invocation in self.lifecycle_dispatcher.invocations
             ]
+
+        # Versioned, opt-in accounting evidence; native result keys stay unchanged.
+        corporate_evidence = getattr(self.broker, "corporate_action_evidence", None)
+        if corporate_evidence is not None:
+            evidence = corporate_evidence()
+            if evidence is not None:
+                contract_evidence["corporate_actions_v1"] = evidence
 
         if not self.equity_curve:
             # Return empty result for no-data case

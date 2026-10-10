@@ -72,6 +72,14 @@ class ConstraintConfig:
     slippage_early_close_bps: float = 3.0
     slippage_earnings_bps: float = 5.0
     slippage_missing_earnings: Literal["stress", "regular", "error"] = "stress"
+    corporate_actions_enabled: bool = False
+    split_order_policy: Literal["adjust", "cancel"] = "adjust"
+    execution_data_mode: Literal["raw_execution"] = "raw_execution"
+    signal_data_mode: Literal["raw_execution", "split_adjusted_signal", "total_return_signal"] = (
+        "split_adjusted_signal"
+    )
+    dividend_withholding_rate: float = 0.0
+    dividend_tax_scenario: str = "gross_no_withholding"
 
     def __post_init__(self):
         for item in fields(self):
@@ -90,6 +98,9 @@ class ConstraintConfig:
         ):
             raise ValueError("Invalid drawdown reduction fraction")
         choices = {
+            "split_order_policy": {"adjust", "cancel"},
+            "execution_data_mode": {"raw_execution"},
+            "signal_data_mode": {"raw_execution", "split_adjusted_signal", "total_return_signal"},
             "pricing_plan": {"ibkr_pro_tiered", "custom"},
             "fee_history_mode": {"current_snapshot_backcast", "strict_historical"},
             "slippage_mode": {"regime", "configured"},
@@ -128,6 +139,7 @@ class ConstraintConfig:
                 raise ValueError("rebalance_anchor must be an ISO date")
             date.fromisoformat(self.rebalance_anchor)
         for name in (
+            "corporate_actions_enabled",
             "hold_through_earnings",
             "market_gates",
             "allow_defensive_underinvested",
@@ -168,6 +180,7 @@ class ConstraintConfig:
             if type(value) is not int or value < minimum:
                 raise ValueError(f"Invalid {name}")
         fractions = (
+            "dividend_withholding_rate",
             "cash_reserve",
             "max_spread",
             "event_position_multiplier",
@@ -206,6 +219,13 @@ class ConstraintConfig:
             and not 0 < self.drawdown_reduction_fraction <= 1
         ):
             raise ValueError("Invalid drawdown reduction fraction")
+        if (
+            not isinstance(self.dividend_tax_scenario, str)
+            or not self.dividend_tax_scenario.strip()
+        ):
+            raise ValueError("An explicit dividend tax scenario is required")
+        if self.dividend_withholding_rate and self.dividend_tax_scenario == "gross_no_withholding":
+            raise ValueError("Nonzero withholding requires a named investor tax scenario")
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "ConstraintConfig":
