@@ -18,6 +18,7 @@ from .models import (
     State,
 )
 from .plans import RebalancePlan
+from .slippage import RegimeSlippage, SlippageQuote, SlippageRecord
 
 __all__ = [
     "AccountConstraint",
@@ -36,6 +37,9 @@ __all__ = [
     "FeeRecord",
     "IBKRProTieredUSStock",
     "RegulatoryRate",
+    "RegimeSlippage",
+    "SlippageQuote",
+    "SlippageRecord",
     "Holding",
     "InMemoryEarningsProvider",
     "Intent",

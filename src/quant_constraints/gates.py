@@ -172,9 +172,8 @@ class EarningsGate:
     def sessions(self, event: EarningsEvent):
         raw = event.announcement_at.astimezone(NY).date()
         day = self.calendar.on_or_after(raw)
-        trading_day = self.calendar.session(raw) is not None
-        affected = self.calendar.shift(day, 1) if event.timing == "AMC" and trading_day else day
-        exit_day = raw if event.timing == "AMC" and trading_day else self.calendar.shift(day, -1)
+        affected = self.calendar.first_affected_session(event.announcement_at)
+        exit_day = self.calendar.shift(affected, -1)
         session = self.calendar.session(exit_day)
         assert session is not None
         deadline = session.market_close - timedelta(
@@ -325,16 +324,24 @@ class PortfolioGate:
         if current_value / state.equity > self.config.max_weight + 1e-12:
             return reject("overweight_drift", weight=current_value / state.equity)
         target = (current_value + committed + intent.quantity * context.price) / state.equity
+        reference = (
+            context.reference_price if context.reference_price is not None else context.price
+        )
+        contract_weight = (
+            (current.quantity if current else 0) * reference
+            + committed
+            + intent.quantity * reference
+        ) / state.equity
         if (
             intent.target_weight is not None
             and context.phase in {"submission", "amendment"}
             and (
                 not math.isfinite(intent.target_weight)
                 or intent.target_weight < 0
-                or abs(intent.target_weight - target) > 1e-8
+                or abs(intent.target_weight - contract_weight) > 1e-8
             )
         ):
-            return reject("target_quantity_mismatch", projected_weight=target)
+            return reject("target_quantity_mismatch", projected_weight=contract_weight)
         floor = intent.target_weight if intent.target_weight is not None else target
         # A partial fill is not a new target; ordinary price drift never creates orders.
         if (
@@ -373,9 +380,12 @@ class PortfolioGate:
             for asset, value in state.pending_buys.items()
             if asset != intent.asset and not state.pending_sectors.get(asset)
         )
+        # Actual commission reduces equity before the accepted fill is booked.
+        # The external target contract still uses the original observed marks.
+        post_fee_equity = state.equity - context.commission
         remaining = min(
-            cap * state.equity - current_value - committed,
-            self.config.industry_cap * state.equity - same_industry,
+            cap * post_fee_equity - current_value - committed,
+            self.config.industry_cap * post_fee_equity - same_industry,
         )
         if remaining <= 1e-10:
             return reject("position_or_industry_cap")
@@ -395,7 +405,7 @@ class PortfolioGate:
             )
             code = (
                 "earnings_position_cap"
-                if event and remaining == cap * state.equity - current_value - committed
+                if event and remaining == cap * post_fee_equity - current_value - committed
                 else "position_or_industry_cap"
             )
             return Decision(

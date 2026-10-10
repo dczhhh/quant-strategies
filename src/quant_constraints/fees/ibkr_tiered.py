@@ -1,6 +1,6 @@
 """IBKR Pro Tiered US stocks: read-only quotes and idempotent confirmed fills.
 
-Published broker/venue snapshot: 2026-10-10. Regulatory coverage: 2026 only.
+Published broker/venue snapshot: 2026-10-10. Strict regulatory coverage: 2026 only.
 Not a statement reconciliation model: see docs/us-cash-concentrated.md.
 """
 
@@ -87,6 +87,18 @@ REGULATORY_RATES = (
     ),
 )
 
+# Counterfactual normal-charge scenario, deliberately excluding the Q4 TAF
+# holiday. These are snapshot proxies, never claims about historical rates.
+BACKCAST_REGULATORY_RATE = RegulatoryRate(
+    date.min,
+    date.max,
+    0.0000206,
+    0.000195,
+    9.79,
+    version="snapshot-2026-10-10:normal-nonholiday-proxy",
+    sources=(SEC_SOURCE, TAF_SOURCE, SOURCE),
+)
+
 
 @dataclass(frozen=True)
 class FeeExecutionContext:
@@ -139,6 +151,9 @@ class FeeBreakdown:
     rate_version: str
     assumptions: tuple[str, ...]
     sources: tuple[str, ...]
+    historical_fee_proxy: bool = False
+    fee_snapshot_date: str = "2026-10-10"
+    fee_history_mode: str = "strict_historical"
 
     @property
     def total_fees(self) -> float:
@@ -196,7 +211,17 @@ class IBKRProTieredUSStock:
         unknown_venue_per_share=0.0035,
         unknown_venue_rate=0.0035,
         regulatory_rates=REGULATORY_RATES,
+        history_mode="strict_historical",
+        snapshot_date="2026-10-10",
+        backcast_regulatory_rate=BACKCAST_REGULATORY_RATE,
     ):
+        if history_mode not in {"current_snapshot_backcast", "strict_historical"}:
+            raise ValueError("Invalid fee history mode")
+        if snapshot_date != "2026-10-10":
+            raise ValueError("Only the documented 2026-10-10 fee snapshot is supported")
+        self.history_mode = history_mode
+        self.snapshot_date = snapshot_date
+        self.backcast_regulatory_rate = backcast_regulatory_rate
         for value, name in (
             (initial_monthly_volume, "initial volume"),
             (unknown_venue_per_share, "unknown venue fee"),
@@ -263,7 +288,12 @@ class IBKRProTieredUSStock:
         if self._last_time is not None and context.timestamp < self._last_time:
             raise ValueError("Fee executions must be chronological")
         day = context.timestamp.astimezone(NY).date()
-        regime = next((r for r in self.regulatory_rates if r.start <= day <= r.end), None)
+        proxy = self.history_mode == "current_snapshot_backcast"
+        regime = (
+            self.backcast_regulatory_rate
+            if proxy
+            else next((r for r in self.regulatory_rates if r.start <= day <= r.end), None)
+        )
         if regime is None:
             raise ValueError(f"No explicit regulatory fee version for {day}")
         volume = self.volume(context.month)
@@ -288,6 +318,13 @@ class IBKRProTieredUSStock:
             "CAT uses 2026-10-10 snapshot, not historical CAT archive",
             "published broker/venue snapshot 2026-10-10; taxes excluded",
         ]
+        if proxy:
+            assumptions.append(
+                "counterfactual uniform snapshot backcast; SEC/TAF/CAT/venue proxies, "
+                "not historical broker statements; normal nonholiday TAF scenario"
+            )
+        else:
+            assumptions.append("strict dated regulatory coverage; broker/venue/CAT remain proxies")
         # Only displayed regular-hours NASDAQ/ARCA/IEX schedules are modeled.
         # Unknown routing is an explicit scenario, not a universal upper bound.
         if context.venue in {"NASDAQ", "ARCA", "IEX"} and context.liquidity != "unknown":
@@ -333,6 +370,9 @@ class IBKRProTieredUSStock:
             regime.version,
             tuple(assumptions),
             (SOURCE, venue_source, *regime.sources),
+            proxy,
+            self.snapshot_date,
+            self.history_mode,
         )
         if fees.total_fees < 0 or not math.isfinite(fees.total_fees):
             raise ValueError("Invalid total fees")

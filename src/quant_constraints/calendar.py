@@ -44,6 +44,15 @@ class SessionCalendar:
         item = self.session(aware(asof).astimezone(NY).date())
         return (item.market_open, item.market_close) if item else None
 
+    def first_affected_session(self, announcement: datetime) -> date:
+        """Release at/after the actual close first affects the next session."""
+        stamp = aware(announcement).astimezone(NY)
+        day = stamp.date()
+        session = self.session(day)
+        if session is None:
+            return self.on_or_after(day)
+        return self.shift(day, 1) if stamp >= session.market_close else day
+
 
 def settlement_date(
     trade: date, cycle: str = "historical", holidays: frozenset[date] = frozenset()

@@ -20,6 +20,8 @@ audit = controller.audit_records()
 statistics = controller.event_statistics()
 fees = engine.broker.fee_records
 fee_totals = engine.broker.fee_statistics()
+slippage = engine.broker.slippage_records
+cost_totals = engine.broker.execution_cost_statistics()
 ```
 
 `earnings_provider` 实现 `EarningsProvider.snapshot(asset, asof)`，返回 `EarningsCoverage` 和 `EarningsEvent`。`context_provider(asof, asset, phase)` 返回 `MarketContext`，必须使用同一个带时区的 `asof`。生产数据需提供可信的证券类型、行业、历史财报日程版本和行情可用时间。测试中的人工覆盖声明不是生产数据。
@@ -61,7 +63,44 @@ fee_totals = engine.broker.fee_statistics()
 - 未知场所/流动性采用 ARCA routed 的保守情景：价格至少 $1 时 $0.0035/股，低于 $1 时交易价值×0.0035，由 `fee_unknown_venue_per_share` / `fee_unknown_venue_rate` 显式可调。它不是所有可能路由的数学上界，压力研究可上调；绝不计入推测 rebate。
 - 清算为 $0.0002/股、上限交易价值 0.5%；NYSE/FINRA pass-through 为基础佣金×0.000175/0.00056。税费、介绍经纪商/顾问加价、特殊账户及优惠项目未包含；不提供实盘连接。
 
-默认监管版本**只覆盖 2026 年**：SEC 卖出费在 4 月 4 日前为零，此后交易价值×0.0000206（[SEC 生效文件](https://www.sec.gov/files/rules/other/2026/34-104909.pdf)）；TAF 在 1 月 1 日至 9 月 30 日按 $0.000195/卖出股、每笔最高 $9.79（[FINRA 费率文件](https://www.finra.org/sites/default/files/2024-11/sr-finra-2024-019.pdf)），10 月 1 日至 12 月 31 日官方假期为零。CAT 的 $0.000003/股是 **2026-10-10 官网快照假设，不是完整历史 CAT 档案**；不做券商特定分币取整。历史回测或 2027 年起必须通过 `broker_factory(..., fee_model=IBKRProTieredUSStock(regulatory_rates=...))` 显式提供有效期不重叠的 `RegulatoryRate`；未覆盖日期报错，不把当前监管费率静默套用历史。基础佣金/场所费表也为 2026-10-10 快照，不声明历史费率完整。当前规则和这些情景仍需与实际账户定价和 PIT 路由资料核对。
+项目默认 `fee_history_mode=current_snapshot_backcast`、`fee_snapshot_date='2026-10-10'`：把同一套当前经纪佣金档位和明确的第三方费用情景回套整个历史区间。这是反事实成本假设，不声称还原 2005/2015/2025 年的真实账单。每笔 `FeeBreakdown` 明示 `historical_fee_proxy=true`、快照日期、模式、版本、来源和假设。历史成交仍按其美东月份累计档位，按历史交易日期结算，快照日期不改写交易日历或结算周期。当前仅支持这份有来源的快照；更换快照须补充对应资料和实现。
+
+回套采用**正常收费、非假期监管代理**：SEC 卖出交易价值×0.0000206（[SEC 2026 生效文件](https://www.sec.gov/files/rules/other/2026/34-104909.pdf)）、TAF $0.000195/卖出股且每笔最高 $9.79（[FINRA 费率文件](https://www.finra.org/sites/default/files/2024-11/sr-finra-2024-019.pdf)）、CAT $0.000003/成交股。2026 年第四季度的 TAF 假期**不回套**全部历史交易，因此这份快照情景连 2026 年第四季度也保留正常 TAF。这些费率与场所代理都不是完整历史档案，也不做券商特定分币取整。费用敏感性可以显式传入 `IBKRProTieredUSStock(history_mode='current_snapshot_backcast', backcast_regulatory_rate=...)`，用带版本和来源的 `RegulatoryRate` 上调 SEC/TAF 等代理。
+
+`fee_history_mode=strict_historical` 则按真实成交日期选择明确监管版本，缺失覆盖立即报错。目前内置监管覆盖只到 2026 年：SEC 4 月 4 日前为零，之后按上述费率；TAF 1–9 月正常，10–12 月按已记录假期为零。其他日期需显式提供不重叠的 `regulatory_rates`。该模式只保证监管版本日期覆盖，基础佣金、场所费用和 CAT 仍是披露的快照代理，不能称为完整历史费用还原。独立构造 `IBKRProTieredUSStock()` 保持严格模式；项目工厂根据配置显式选择回套模式。传入自定义 `fee_model` 时使用该模型声明的模式和参数。
+
+## 按成交状态选择滑点（默认启用）
+
+`slippage_mode=regime` 安装独立 `RegimeSlippage`，不改动上游 `SlippageModel.calculate(asset, quantity, price, volume)`。执行器绑定成交当时的上下文；动态滑点替换简化滑点，不叠加固定 2 bps。正常成交买入价为 `reference_price × (1 + bps/10000)`，卖出价为 `reference_price × (1 - bps/10000)`；第三方费用随后按该真实成交价计算。
+
+| 成交状态 | 默认 | 配置 |
+|---|---|---|
+| 正常 RTH | 2 bps | `slippage_regular_bps` |
+| NYSE 提前收盘/半日市 | 3 bps | `slippage_early_close_bps` |
+| 公司公告后的首个实际受影响 RTH | 5 bps | `slippage_earnings_bps` |
+| 财报压力敏感性 | 10 bps，仅显式情景 | `slippage_earnings_bps=10` |
+
+重叠状态取适用 bps 的**最大值**，半日市与财报默认为 5，不相加为 8。各值可设为 1/2/3/5/10 做敏感性；0 仅用于隔离测试或调试。行业 ETF 必须当时明确分类为 `plain_sector_etf` 才不使用发行公司财报状态，仍使用半日市滑点。单独使用 `cash_backtest_config()` 的后备为统一 2 bps，动态状态须通过约束工厂接入。
+
+财报状态同时要求 `announcement_at<=asof` 与 `available_at<=asof`，只读取 `snapshot(asset, asof)` 当时可见且未取消的版本：已知未来日程不会提前升档，未来修订不会改变过去成交。BMO 在公告当天升档；AMC 公告前仍使用当日正常/半日市档，公告后在下一交易日升档；DURING 在真实公告且信息已可用之后升档。实际公告落在周末、休市或半日市收盘后，顺延至第一个真实交易时段；日期转换使用纽约时区并处理夏令时。默认只覆盖该受影响交易日，盘外不会成交。财报前的例行清仓按当时正常/半日市档，风险卖出也按真实成交时状态计费。
+
+`slippage_missing_earnings=stress` 是缺失公司分类/当时可见覆盖时的默认保守 5 bps 后备；可明确选择 `regular` 或 `error`，审计记录具体后备依据。它独立于买入准入的缺失配置，不能放宽证券或财报门禁。无当前 NYSE session 的**预估**使用保守日历后备并记录依据，实际执行仍受 RTH 门禁约束，不能把无数据当成正常可交易日。
+
+预约采用适用的配置最大值（股票通常 5 bps，明确行业 ETF 通常 3 bps），加上按预约价格计算的保守费用；部分成交余量保留同一预约价格，不重复加滑点或重复扣费。每笔实际成交重新计算当天状态、现金储备、扣费后的单票/行业上限和真实价格。外部目标数量仍按已观测参考价格校验，成本价用于限额及现金检查。真实开盘跳变或新财报资料导致越界时，拒绝成交并释放余量，不计入月度股数、费用或滑点。成交量参与上限仍在滑点计算前执行，5 bps 不赋予无限成交量。
+
+动态模型拒绝同时使用 bid/ask 执行价、spread/fixed/volume slippage、stop 附加滑点或 market impact，以防重复计算 spread/impact。已有专门报价/冲击模型时应显式用 `slippage_mode=configured`，由基座使用指定模型；统一 1/2/5 bps 可通过此模式配合 `cash_backtest_config(slippage_rate=...)` 比较。
+
+`slippage_records` 和增量成交审计记录 `slippage_regime`、`slippage_bps`、`slippage_amount`（本次股数×每股滑点）及事件/日历/缺失后备依据。`slippage_statistics()` 分状态统计成交次数、数量和金额；`execution_cost_statistics()` 将费用明细和滑点分开，另以 `fee_scenarios` 汇总费用模式、快照日期、代理标记、版本、来源和假设。自定义佣金无法拆分时按真实成交记录列入 `custom_unclassified_fees`，不捏造第三方明细。滑点已体现在成交价，不重复计入 `Fill.commission`。这些 bps 是流动性良好的大中票成本情景，不是流动性或成交价格保证。
+
+回归中的固定参考价 $100、整股 100 股买入再卖出、财报受影响日、未知场所的敏感性对照：
+
+| 情景 | 财报 bps | 两笔滑点合计 | 两笔费用合计（约） |
+|---|---|---|---|
+| 默认 2/3/5 | 5 | $10 | $1.666512 |
+| 全状态统一 1 | 1 | $2 | $1.666594 |
+| 财报压力 10 | 10 | $20 | $1.666409 |
+
+这只是成本对照，没有策略收益结论；卖出 SEC 代理随真实成交价略变，费用与滑点始终分别列示。
 
 ## 时段与真实成交
 

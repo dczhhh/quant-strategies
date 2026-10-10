@@ -313,12 +313,15 @@ class RebalancePlanManager:
             plan = replace(plan, status=status)
             self.records[plan_id] = plan
             for asset, delta in sorted(candidates.items()):
-                price = broker._market_state.prices[asset]
+                price = broker.estimate_execution_price(
+                    asset, delta, broker._market_state.prices[asset]
+                )
                 context = broker.context_for(
                     asset,
                     price,
                     "plan_check",
                     broker.estimate_order_fees(asset, delta, price, plan_id),
+                    broker._market_state.prices[asset],
                 )
                 decision = controller.check(
                     Intent(

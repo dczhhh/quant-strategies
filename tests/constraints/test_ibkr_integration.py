@@ -10,6 +10,7 @@ from test_adapter import ASSETS, ExternalOrders, at, make, market, tick
 from test_review_continuation import process
 
 from ml4t.backtest import Broker, DataFeed, OrderStatus, OrderType
+from ml4t.backtest.config import SlippageType
 from ml4t.backtest.execution.limits import VolumeParticipationLimit
 from ml4t.backtest.models import calculate_commission, estimate_commission
 from quant_constraints import (
@@ -24,9 +25,14 @@ from quant_constraints import (
 
 def fee_broker(settings=None, provider=market, fee_model=None, initial_cash=10000):
     _, fixture = make()
-    ctrl = ConstraintController(settings or ConstraintConfig(), fixture.earnings.provider)
+    ctrl = ConstraintController(
+        replace(settings or ConstraintConfig(), slippage_mode="configured"),
+        fixture.earnings.provider,
+    )
     broker = broker_factory(ctrl, provider, fee_model=fee_model)(
-        cash_backtest_config(initial_cash=initial_cash)
+        cash_backtest_config(
+            initial_cash=initial_cash, slippage_type=SlippageType.NONE, slippage_rate=0
+        )
     )
     return broker, ctrl
 
@@ -328,8 +334,11 @@ def test_engine_net_value_includes_ibkr_fees_and_keeps_public_fill_schema():
     result = engine.run()
     assert len(engine.broker.fee_records) == len(engine.broker._execution_journal.fills) == 1
     assert engine.broker.get_account_value() == pytest.approx(
-        10000 - engine.broker.fee_statistics()["total_fees"]
+        10000
+        - engine.broker.fee_statistics()["total_fees"]
+        - engine.broker.slippage_statistics()["total_slippage"]
     )
+    assert engine.broker._execution_journal.fills[0].price == pytest.approx(100.02)
     assert result is not None
 
 

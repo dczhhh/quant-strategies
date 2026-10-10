@@ -1,8 +1,15 @@
 pricing_plan: ibkr_pro_tiered
+fee_history_mode: current_snapshot_backcast
+fee_snapshot_date: '2026-10-10'
 fee_initial_monthly_volume: 0.0
 fee_initial_month: null
 fee_unknown_venue_per_share: 0.0035
 fee_unknown_venue_rate: 0.0035
+slippage_mode: regime
+slippage_regular_bps: 2.0
+slippage_early_close_bps: 3.0
+slippage_earnings_bps: 5.0
+slippage_missing_earnings: stress
 cash_reserve: 0.10
 settlement_cycle: historical
 minimum_hold_sessions: 0

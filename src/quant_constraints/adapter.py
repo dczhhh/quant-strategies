@@ -8,10 +8,16 @@ from datetime import datetime
 from types import MappingProxyType
 
 from ml4t.backtest import BacktestConfig, Broker, Engine
-from ml4t.backtest.config import CommissionType, DataFrequency, ExecutionPrice, FillOrdering
+from ml4t.backtest.config import (
+    CommissionType,
+    DataFrequency,
+    ExecutionPrice,
+    FillOrdering,
+    SlippageType,
+)
 from ml4t.backtest.core.shared import SubmitOrderOptions
 from ml4t.backtest.execution.fill_executor import FillExecutor
-from ml4t.backtest.models import calculate_commission
+from ml4t.backtest.models import calculate_commission, calculate_slippage
 from ml4t.backtest.types import ExecutionMode, Order, OrderSide, OrderStatus, OrderType
 
 from .calendar import NY, settlement_date
@@ -20,6 +26,7 @@ from .fees import IBKRProTieredUSStock
 from .fees.bridge import FeeCommissionBridge
 from .models import Action, Audit, Decision, Holding, Intent, Kind, MarketContext, State, aware
 from .plans import RebalancePlanManager
+from .slippage import RegimeSlippage, SlippageQuote, SlippageRecord
 
 ContextProvider = Callable[[datetime, str, str], MarketContext]
 
@@ -37,6 +44,8 @@ def cash_backtest_config(**changes) -> BacktestConfig:
         "commission_type": CommissionType.PER_SHARE,
         "commission_per_share": 0.0035,
         "commission_minimum": 0.35,
+        "slippage_type": SlippageType.PERCENTAGE,
+        "slippage_rate": 0.0002,
     }
     defaults.update(changes)
     return replace(config, **defaults)
@@ -86,9 +95,18 @@ class ConstraintFillExecutor(FillExecutor):
         broker.checking_actual_fill = True
         try:
             with (
-                broker.fee_bridge.bind(order, actual=True)
-                if broker.fee_bridge is not None
-                else nullcontext()
+                (
+                    broker.fee_bridge.bind(order, actual=True)
+                    if broker.fee_bridge is not None
+                    else nullcontext()
+                ),
+                (
+                    broker.regime_slippage.bind(
+                        broker.context_for(order.asset, base_price, "slippage"), actual=True
+                    )
+                    if broker.regime_slippage is not None
+                    else nullcontext()
+                ),
             ):
                 completed = super().execute(order, base_price)
         finally:
@@ -143,6 +161,8 @@ class ConstrainedBroker(Broker):
                 initial_month=settings.fee_initial_month,
                 unknown_venue_per_share=settings.fee_unknown_venue_per_share,
                 unknown_venue_rate=settings.fee_unknown_venue_rate,
+                history_mode=settings.fee_history_mode,
+                snapshot_date=settings.fee_snapshot_date,
             )
             self.fee_bridge = FeeCommissionBridge(self, self.fee_model)
             self.commission_model = self.fee_bridge
@@ -152,6 +172,29 @@ class ConstrainedBroker(Broker):
                 raise ValueError("fee_model requires pricing_plan=ibkr_pro_tiered")
             self.fee_model = None
             self.fee_bridge = None
+        self.regime_slippage = None
+        if controller.config.slippage_mode == "regime":
+            if (
+                config.slippage_type not in {SlippageType.NONE, SlippageType.PERCENTAGE}
+                or config.slippage_spread
+                or config.slippage_spread_by_asset
+                or config.slippage_fixed
+                or config.slippage_rate not in {0, 0.0002}
+                or self.market_impact_model is not None
+                or self.stop_slippage_rate
+                or config.execution_price in {ExecutionPrice.BID, ExecutionPrice.ASK}
+            ):
+                raise ValueError(
+                    "Regime slippage replaces spread/impact costs; use slippage_mode=configured "
+                    "for a separate explicit execution-cost scenario"
+                )
+            self.regime_slippage = RegimeSlippage(
+                controller.config,
+                controller.calendar,
+                controller.earnings.provider,
+                lambda asset: self.context_for(asset, 0, "slippage"),
+            )
+            self.slippage_model = self.regime_slippage
         self.constraint_frequency = config.resolved_data_frequency.value
         self.constraint_kinds: dict[str, Kind] = {}
         self.constraint_targets: dict[str, float] = {}
@@ -184,7 +227,12 @@ class ConstrainedBroker(Broker):
         self._fill_engine.executor = self._fill_executor
 
     def context_for(
-        self, asset: str, price: float, phase: str, commission: float = 0
+        self,
+        asset: str,
+        price: float,
+        phase: str,
+        commission: float = 0,
+        reference_price: float | None = None,
     ) -> MarketContext:
         timestamp = self._market_state.time
         assert timestamp is not None
@@ -198,6 +246,7 @@ class ConstrainedBroker(Broker):
             commission=commission,
             phase=phase,
             data_frequency=self.constraint_frequency,
+            reference_price=reference_price,
         )
 
     def constraint_state(self, exclude: str = "", phase: str = "submission") -> State:
@@ -278,6 +327,100 @@ class ConstrainedBroker(Broker):
         return {
             name: sum(getattr(record.fees, name) for record in self.fee_records) for name in fields
         }
+
+    @property
+    def slippage_records(self):
+        if self.regime_slippage is not None:
+            return self.regime_slippage.records
+        return tuple(
+            SlippageRecord(
+                f"configured/{index}",
+                fill.order_id,
+                fill.side.value,
+                SlippageQuote(
+                    fill.asset,
+                    fill.timestamp,
+                    fill.quantity,
+                    fill.price - fill.slippage
+                    if fill.side is OrderSide.BUY
+                    else fill.price + fill.slippage,
+                    "configured",
+                    fill.slippage
+                    / (
+                        fill.price - fill.slippage
+                        if fill.side is OrderSide.BUY
+                        else fill.price + fill.slippage
+                    )
+                    * 10_000,
+                    ("explicit configured upstream slippage model",),
+                ),
+            )
+            for index, fill in enumerate(self._execution_journal.fills)
+        )
+
+    def slippage_statistics(self):
+        regimes = {}
+        for record in self.slippage_records:
+            quote = record.quote
+            group = regimes.setdefault(
+                quote.slippage_regime, {"fills": 0, "quantity": 0.0, "slippage_amount": 0.0}
+            )
+            group["fills"] += 1
+            group["quantity"] += quote.quantity
+            group["slippage_amount"] += quote.slippage_amount
+        return {
+            "total_slippage": sum(q.quote.slippage_amount for q in self.slippage_records),
+            "by_regime": regimes,
+        }
+
+    def execution_cost_statistics(self):
+        scenarios = {}
+        for record in self.fee_records:
+            fee = record.fees
+            key = (fee.fee_history_mode, fee.fee_snapshot_date, fee.rate_version)
+            scenario = scenarios.setdefault(
+                key,
+                {
+                    "fee_history_mode": fee.fee_history_mode,
+                    "fee_snapshot_date": fee.fee_snapshot_date,
+                    "historical_fee_proxy": fee.historical_fee_proxy,
+                    "rate_version": fee.rate_version,
+                    "executions": 0,
+                    "sources": set(),
+                    "assumptions": set(),
+                },
+            )
+            scenario["executions"] += 1
+            scenario["sources"].update(fee.sources)
+            scenario["assumptions"].update(fee.assumptions)
+        fees = self.fee_statistics()
+        if self.fee_model is None:
+            total = sum(fill.commission for fill in self._execution_journal.fills)
+            fees.update(total_fees=total, custom_unclassified_fees=total)
+        return {
+            "fees": fees,
+            "slippage": self.slippage_statistics(),
+            "fee_scenarios": tuple(
+                {
+                    **scenario,
+                    "sources": tuple(sorted(scenario["sources"])),
+                    "assumptions": tuple(sorted(scenario["assumptions"])),
+                }
+                for scenario in scenarios.values()
+            ),
+        }
+
+    def estimate_execution_price(self, asset, signed_quantity, price):
+        if price <= 0:
+            return price  # price gate handles missing observations
+        amount = calculate_slippage(
+            self.slippage_model,
+            asset,
+            abs(signed_quantity),
+            price,
+            self._market_state.volumes.get(asset),
+        )
+        return price + amount if signed_quantity > 0 else price - amount
 
     def estimate_order_fees(
         self, asset, signed_quantity, price, order_id="estimate", generation=None
@@ -370,6 +513,16 @@ class ConstrainedBroker(Broker):
     ):
         now = self._market_state.time
         assert now is not None
+        execution = next(
+            (
+                record.quote
+                for record in reversed(self.slippage_records)
+                if filled > 0
+                and record.order_id == order.order_id
+                and record.quote.timestamp == now
+            ),
+            None,
+        )
         self.controller.audit.append(
             Audit(
                 now,
@@ -388,6 +541,10 @@ class ConstrainedBroker(Broker):
                 permitted_quantity=self.order_permitted.get(order.order_id, 0),
                 filled_quantity=filled,
                 final_status=status or order.status.value,
+                slippage_regime=execution.slippage_regime if execution else None,
+                slippage_bps=execution.slippage_bps if execution else None,
+                slippage_amount=execution.slippage_amount if execution else 0.0,
+                slippage_basis=execution.basis if execution else (),
             )
         )
 
@@ -875,6 +1032,8 @@ class ConstrainedBroker(Broker):
         )
         intent = Intent(asset, signed, next_id, kind, order_type.value, target_weight, rebalance_id)
         deadline = self.order_deadline(kind, time_in_force, valid_until, rebalance_id, asset)
+        reference_price = price
+        price = self.estimate_execution_price(asset, signed, price)
         commission = self.estimate_order_fees(asset, signed, price, next_id)
         was_new = asset not in self.account.positions
         snapshot = self.constraint_state(phase=phase)
@@ -894,7 +1053,7 @@ class ConstrainedBroker(Broker):
         decision = self.controller.check(
             intent,
             snapshot,
-            self.context_for(asset, price, "submission", commission),
+            self.context_for(asset, price, "submission", commission, reference_price),
         )
         if (
             kind is not Kind.RISK
@@ -1042,6 +1201,12 @@ class ConstrainedBroker(Broker):
         price = candidate.limit_price or max(
             self._market_state.prices.get(candidate.asset, 0), candidate.stop_price or 0
         )
+        reference_price = price
+        price = self.estimate_execution_price(
+            candidate.asset,
+            candidate.quantity * (1 if candidate.side is OrderSide.BUY else -1),
+            price,
+        )
         context = self.context_for(
             candidate.asset,
             price,
@@ -1052,6 +1217,7 @@ class ConstrainedBroker(Broker):
                 price,
                 order_id,
             ),
+            reference_price,
         )
         decision = self.controller.check(
             self.intent_for(candidate), self.constraint_state(order_id), context
@@ -1079,6 +1245,8 @@ class ConstrainedBroker(Broker):
         assert self._cash_account_rules is not None
         if self.fee_bridge is not None:
             self.fee_bridge.commit_fill(order, self._execution_journal.fills[-1])
+        if self.regime_slippage is not None:
+            self.regime_slippage.commit_fill(order, self._execution_journal.fills[-1])
         with self.fee_bridge.bind(order) if self.fee_bridge is not None else nullcontext():
             self._cash_account_rules.reserve_remainder(order, remaining_quantity)
         if order.side is OrderSide.SELL and cash_change > 0:

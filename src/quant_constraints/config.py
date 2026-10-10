@@ -59,10 +59,19 @@ class ConstraintConfig:
     drawdown_reduce: float = 0.15
     drawdown_reduction_fraction: float | None = None
     pricing_plan: Literal["ibkr_pro_tiered", "custom"] = "ibkr_pro_tiered"
+    fee_history_mode: Literal["current_snapshot_backcast", "strict_historical"] = (
+        "current_snapshot_backcast"
+    )
+    fee_snapshot_date: str = "2026-10-10"
     fee_initial_monthly_volume: float = 0.0
     fee_initial_month: str | None = None
     fee_unknown_venue_per_share: float = 0.0035
     fee_unknown_venue_rate: float = 0.0035
+    slippage_mode: Literal["regime", "configured"] = "regime"
+    slippage_regular_bps: float = 2.0
+    slippage_early_close_bps: float = 3.0
+    slippage_earnings_bps: float = 5.0
+    slippage_missing_earnings: Literal["stress", "regular", "error"] = "stress"
 
     def __post_init__(self):
         for item in fields(self):
@@ -82,6 +91,9 @@ class ConstraintConfig:
             raise ValueError("Invalid drawdown reduction fraction")
         choices = {
             "pricing_plan": {"ibkr_pro_tiered", "custom"},
+            "fee_history_mode": {"current_snapshot_backcast", "strict_historical"},
+            "slippage_mode": {"regime", "configured"},
+            "slippage_missing_earnings": {"stress", "regular", "error"},
             "settlement_cycle": {"historical", "T+1", "T+2"},
             "unknown_industry": {"reject", "warn"},
             "drift_reduction": {"next_session", "rebalance", "disabled"},
@@ -97,6 +109,8 @@ class ConstraintConfig:
         for name, allowed in choices.items():
             if not isinstance(getattr(self, name), str) or getattr(self, name) not in allowed:
                 raise ValueError(f"Invalid {name}")
+        if self.fee_snapshot_date != "2026-10-10":
+            raise ValueError("Only the documented 2026-10-10 fee snapshot is supported")
         for item in fields(self):
             value = getattr(self, item.name)
             if isinstance(value, float) and (not math.isfinite(value) or value < 0):

@@ -1,5 +1,6 @@
 """Immutable input snapshots and auditable decisions; no signal generation."""
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -76,9 +77,14 @@ class MarketContext:
     execution_venue: str = "unknown"
     execution_liquidity: str = "unknown"
     fee_metadata_available_at: datetime | None = None
+    reference_price: float | None = None  # observed mark for external target-quantity contract
 
     def __post_init__(self):
         aware(self.asof)
+        if self.reference_price is not None and (
+            not math.isfinite(self.reference_price) or self.reference_price <= 0
+        ):
+            raise ValueError("Observed reference_price must be finite and positive")
         for timestamp in (
             self.liquidity_available_at,
             self.vix_available_at,
@@ -118,6 +124,10 @@ class Audit:
     final_status: str | None = None
     earnings_checked: bool = False
     earnings_event_id: str | None = None
+    slippage_regime: str | None = None
+    slippage_bps: float | None = None
+    slippage_amount: float = 0.0
+    slippage_basis: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
