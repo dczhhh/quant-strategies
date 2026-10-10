@@ -10,7 +10,7 @@ on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, issue-3-us-cash-constraints]
 
 permissions:
   contents: read
@@ -225,6 +225,20 @@ jobs:
           path: |
             performance-evidence.json
             release-performance-evidence.json
+          if-no-files-found: error
+
+      # Identity query work is gated by regular regression tests; timings are evidence.
+      - name: Measure offline research contract normalization
+        run: >-
+          uv run python validation/benchmark_research_contracts.py
+          --samples 1 --output research-contract-performance.json
+
+      - name: Retain research contract performance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: research-contract-performance
+          path: research-contract-performance.json
           if-no-files-found: error
 
   public-parity:

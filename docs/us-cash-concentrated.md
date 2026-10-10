@@ -2,6 +2,8 @@
 
 `quant_constraints` 是可选扩展，检查外部提供的订单和目标配置，不生成选股、入场、加仓或财报后买入信号。未启用时，原有 `Broker` / `Engine` 行为保持不变。
 
+Issue #5 的第一阶段另提供[离线数据契约与规范化层](research-data-contracts.md)，不接入 Broker/Engine，也不解除真实历史行情研究的验证阻塞。
+
 ## 接入
 
 ```python
