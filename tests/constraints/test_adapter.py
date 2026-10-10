@@ -8,7 +8,7 @@ import polars as pl
 import pytest
 
 from ml4t.backtest import DataFeed, OrderStatus, OrderType, Strategy
-from ml4t.backtest.config import DataFrequency
+from ml4t.backtest.config import CommissionType, DataFrequency
 from ml4t.backtest.core.shared import SubmitOrderOptions
 from ml4t.backtest.models import PerShareCommission
 from ml4t.backtest.risk import (
@@ -61,8 +61,14 @@ def make(events=(), settings=None, **changes):
         EarningsCoverage(asset, at("2020-01-01"), at("2030-01-01"), "fixture") for asset in ASSETS
     )
     controller = ConstraintController(
-        settings or ConstraintConfig(), InMemoryEarningsProvider(tuple(events), coverage)
+        # These original gate/lifecycle fixtures isolate account behavior from
+        # brokerage costs. Default IBKR pricing has its own integration suite.
+        replace(settings or ConstraintConfig(), pricing_plan="custom"),
+        InMemoryEarningsProvider(tuple(events), coverage),
     )
+    changes.setdefault("commission_type", CommissionType.NONE)
+    changes.setdefault("commission_per_share", 0.0)
+    changes.setdefault("commission_minimum", 0.0)
     config = cash_backtest_config(initial_cash=10000, **changes)
     return broker_factory(controller, market)(config), controller
 

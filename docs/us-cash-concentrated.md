@@ -18,6 +18,8 @@ engine = constrained_engine(
 result = engine.run()
 audit = controller.audit_records()
 statistics = controller.event_statistics()
+fees = engine.broker.fee_records
+fee_totals = engine.broker.fee_statistics()
 ```
 
 `earnings_provider` 实现 `EarningsProvider.snapshot(asset, asof)`，返回 `EarningsCoverage` 和 `EarningsEvent`。`context_provider(asof, asset, phase)` 返回 `MarketContext`，必须使用同一个带时区的 `asof`。生产数据需提供可信的证券类型、行业、历史财报日程版本和行情可用时间。测试中的人工覆盖声明不是生产数据。
@@ -37,6 +39,29 @@ statistics = controller.event_statistics()
 | 证券范围 | 要求显式 `equity` 或 `plain_sector_etf` 元数据；未知、大盘、反向、杠杆和衍生 ETF 类型拒绝。元数据真实性由数据提供方负责 |
 
 结算日使用基座的 SIFMA 美国工作日并排除 Good Friday，加上 `BacktestConfig.settlement_holidays` 的额外官方关闭日期。结算与交易日历不同：Columbus Day / Veterans Day 可以交易却不结算。不能简单按收到的 bar 数结算。
+
+## IBKR Pro Tiered 费用（默认启用）
+
+`ConstraintConfig.pricing_plan=ibkr_pro_tiered` 是本项目的默认费用计划，不是上游通用的按成交金额百分比 `TieredCommission`。`broker_factory` 安装独立 `IBKRProTieredUSStock` 和只读费用适配器，不修改上游 `CommissionModel` 签名或未配置的 Broker。`cash_backtest_config()` 单独使用时也不再为零佣金：它提供 $0.0035/股、每单最低 $0.35 的**非零首档简化后备**；只有约束工厂安装的模型才有完整月度档位、订单生命周期和第三方费用。需要研究其他费用情景时显式选择 `pricing_plan=custom` 并配置自己的费用模型，不能把后备模型称作精确 IBKR 计费。
+
+依据 [IBKR 美股官方定价及脚注](https://www.interactivebrokers.com/en/pricing/commissions-stocks.php)，按美东日历月的已确认成交股数边际分档：前 300,000 股 $0.0035，至 3,000,000 股 $0.0020，至 20,000,000 股 $0.0015，至 100,000,000 股 $0.0010，其上 $0.0005。例如月初累计 299,900 股后成交 200 股，基础佣金为 `100×0.0035+100×0.002=$0.55`，而不是整单使用下一档。
+
+计量池包括同月美/加股票及 ETF、买入和卖出，只计 Tiered 且未触发佣金上限的股份。仿真默认**一个直接客户账户、每月未知外部成交量为零**，由 `fee_initial_monthly_volume=0.0` 明示；中途开始且已有累计量时设置该值和 `fee_initial_month=YYYY-MM`。其他已确认美/加股票、ETF 成交可通过 `fee_model.record_external_volume()` 按时间顺序加入同一计量池；必须提供唯一成交 ID、市场、类型、Tiered/上限标识。此接口不模拟加拿大佣金、汇率或其他账户现金；不凭空聚合机构/顾问账户。月度计量保留历史月份，美东新月重新从零（或该月显式初始值）开始，不以 UTC 午夜切换。
+
+常规整数股基础佣金按订单累计实际成交计算，每单最低 $0.35，采用**美股专表及脚注 8 的交易价值 1% 上限**，不把第三方费用纳入此上限。低价股若上限低于最低则上限优先；达到上限的整数部分不累计月度计量。部分成交同一日、同一未修改订单共享最低收费；成功修改按保守的 cancel/replace 生命周期重新适用最低收费，失败修改不改变生命周期。隔夜订单在新的美东日期重新适用最低收费。小数部分按官方脚注 11 的 `max(交易价值×1%, $0.01)`，不四舍五入为零。混合整股/小数股按**每次实际成交分别拆分**，这是缺少券商内部拆单明细时的显式仿真假设，碎片化成交可能更贵。已成交费用不因剩余订单撤销而退还，零成交撤单无费用。动态订单上限资格按当时累计成交在线调整，未用未来成交提前获得低档费率，不能宣称与券商月底追溯处理完全一致。
+
+每次成交的 `FeeRecord` 包含资产、方向、订单 ID、修改代次、时间、数量、真实价格，以及 `broker_commission`、`exchange_ecn_fees_or_rebates`、`clearing_fees`、`regulatory_fees`（另列 SEC/TAF/CAT）、`pass_through_fees`、`total_fees`、累计股数、资格变化、生效版本、假设和来源。总费用复用基座 `Fill.commission`，进入唯一现金、预约、成交、交易盈亏、净值和统计，不另建现金/持仓账本。卖出结算的是扣除总费用后的净款；预约和实际费用都包含在 10% 储备校验中。费用上调、滑点或余额不足导致的拒单仍保留准入原因，拒单不累计档位。
+
+**预估和入账严格分离**：`estimate()`、`quote()`、上游 `calculate()`、deepcopy 预估、提交、修改、现金预约和调仓预检查均不改变月度股数或费用记录。预约用首档费率和新订单最低收费保守估算，不提前依赖未来低档或 rebate；每个真实部分成交仍重新验证费用及现金，因此碎片数量未知时不保证全部余量可成交。只有基座记录并扣除被接受的真实成交后才 `commit(execution_id, quote)`，重复相同成交幂等、冲突/陈旧报价拒绝；撤销、到期、拒单或 DEFER 不入账。部分成交余量重新预约但不重复扣除费用。
+
+第三方费用采用以下**可审计情景，不是券商对账单保证**：
+
+- 执行场所/流动性仅在 `MarketContext.execution_venue`、`execution_liquidity` 和 `fee_metadata_available_at<=asof` 都可验证时使用；未来或缺失元数据按未知处理。
+- 已知 NASDAQ/ARCA/IEX 使用官网显示的普通 RTH displayed 情景。添加流动性不计 rebate；移除流动性按场所/价格计算。没有 auction、非显示单、复杂路由或交易所等级建模，不能仅凭 limit 单推断 maker。直接 API 路由不属于本模型 Tiered 范围，明确报错。
+- 未知场所/流动性采用 ARCA routed 的保守情景：价格至少 $1 时 $0.0035/股，低于 $1 时交易价值×0.0035，由 `fee_unknown_venue_per_share` / `fee_unknown_venue_rate` 显式可调。它不是所有可能路由的数学上界，压力研究可上调；绝不计入推测 rebate。
+- 清算为 $0.0002/股、上限交易价值 0.5%；NYSE/FINRA pass-through 为基础佣金×0.000175/0.00056。税费、介绍经纪商/顾问加价、特殊账户及优惠项目未包含；不提供实盘连接。
+
+默认监管版本**只覆盖 2026 年**：SEC 卖出费在 4 月 4 日前为零，此后交易价值×0.0000206（[SEC 生效文件](https://www.sec.gov/files/rules/other/2026/34-104909.pdf)）；TAF 在 1 月 1 日至 9 月 30 日按 $0.000195/卖出股、每笔最高 $9.79（[FINRA 费率文件](https://www.finra.org/sites/default/files/2024-11/sr-finra-2024-019.pdf)），10 月 1 日至 12 月 31 日官方假期为零。CAT 的 $0.000003/股是 **2026-10-10 官网快照假设，不是完整历史 CAT 档案**；不做券商特定分币取整。历史回测或 2027 年起必须通过 `broker_factory(..., fee_model=IBKRProTieredUSStock(regulatory_rates=...))` 显式提供有效期不重叠的 `RegulatoryRate`；未覆盖日期报错，不把当前监管费率静默套用历史。基础佣金/场所费表也为 2026-10-10 快照，不声明历史费率完整。当前规则和这些情景仍需与实际账户定价和 PIT 路由资料核对。
 
 ## 时段与真实成交
 

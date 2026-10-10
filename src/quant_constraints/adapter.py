@@ -2,12 +2,13 @@
 
 import math
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime
 from types import MappingProxyType
 
 from ml4t.backtest import BacktestConfig, Broker, Engine
-from ml4t.backtest.config import DataFrequency, ExecutionPrice, FillOrdering
+from ml4t.backtest.config import CommissionType, DataFrequency, ExecutionPrice, FillOrdering
 from ml4t.backtest.core.shared import SubmitOrderOptions
 from ml4t.backtest.execution.fill_executor import FillExecutor
 from ml4t.backtest.models import calculate_commission
@@ -15,6 +16,8 @@ from ml4t.backtest.types import ExecutionMode, Order, OrderSide, OrderStatus, Or
 
 from .calendar import NY, settlement_date
 from .controller import ConstraintController
+from .fees import IBKRProTieredUSStock
+from .fees.bridge import FeeCommissionBridge
 from .models import Action, Audit, Decision, Holding, Intent, Kind, MarketContext, State, aware
 from .plans import RebalancePlanManager
 
@@ -29,6 +32,11 @@ def cash_backtest_config(**changes) -> BacktestConfig:
         "execution_price": ExecutionPrice.OPEN,
         "cash_buffer_pct": 0.0,
         "fill_ordering": FillOrdering.EXIT_FIRST,
+        # Nonzero fallback for a caller using this BacktestConfig without the
+        # constrained factory. The factory installs the full explicit plan.
+        "commission_type": CommissionType.PER_SHARE,
+        "commission_per_share": 0.0035,
+        "commission_minimum": 0.35,
     }
     defaults.update(changes)
     return replace(config, **defaults)
@@ -38,6 +46,8 @@ class ConstraintFillExecutor(FillExecutor):
     def execute(self, order: Order, base_price: float) -> bool:
         broker = self.broker
         assert isinstance(broker, ConstrainedBroker)
+        if order.status is not OrderStatus.PENDING:
+            return True
         if broker.expire_order(order):
             return True
         intent = broker.intent_for(order)
@@ -75,7 +85,12 @@ class ConstraintFillExecutor(FillExecutor):
             return False
         broker.checking_actual_fill = True
         try:
-            completed = super().execute(order, base_price)
+            with (
+                broker.fee_bridge.bind(order, actual=True)
+                if broker.fee_bridge is not None
+                else nullcontext()
+            ):
+                completed = super().execute(order, base_price)
         finally:
             broker.checking_actual_fill = False
         broker.refresh_brackets()
@@ -93,6 +108,7 @@ class ConstrainedBroker(Broker):
         controller: ConstraintController,
         context_provider: ContextProvider,
         config: BacktestConfig,
+        fee_model: IBKRProTieredUSStock | None = None,
     ) -> None:
         if hasattr(self, "controller"):
             raise ValueError("Constraint broker is already configured")
@@ -120,6 +136,22 @@ class ConstrainedBroker(Broker):
             raise ValueError("Constraint profile requires exit_first fill ordering")
         self.controller = controller
         self.context_provider = context_provider
+        if controller.config.pricing_plan == "ibkr_pro_tiered":
+            settings = controller.config
+            self.fee_model = fee_model or IBKRProTieredUSStock(
+                initial_monthly_volume=settings.fee_initial_monthly_volume,
+                initial_month=settings.fee_initial_month,
+                unknown_venue_per_share=settings.fee_unknown_venue_per_share,
+                unknown_venue_rate=settings.fee_unknown_venue_rate,
+            )
+            self.fee_bridge = FeeCommissionBridge(self, self.fee_model)
+            self.commission_model = self.fee_bridge
+            self.gatekeeper.commission_model = self.fee_bridge
+        else:
+            if fee_model is not None:
+                raise ValueError("fee_model requires pricing_plan=ibkr_pro_tiered")
+            self.fee_model = None
+            self.fee_bridge = None
         self.constraint_frequency = config.resolved_data_frequency.value
         self.constraint_kinds: dict[str, Kind] = {}
         self.constraint_targets: dict[str, float] = {}
@@ -229,6 +261,35 @@ class ConstrainedBroker(Broker):
     @property
     def rebalance_plans(self):
         return MappingProxyType(self.plan_manager.records)
+
+    @property
+    def fee_records(self):
+        return self.fee_model.records if self.fee_model is not None else ()
+
+    def fee_statistics(self):
+        fields = (
+            "broker_commission",
+            "exchange_ecn_fees_or_rebates",
+            "clearing_fees",
+            "regulatory_fees",
+            "pass_through_fees",
+            "total_fees",
+        )
+        return {
+            name: sum(getattr(record.fees, name) for record in self.fee_records) for name in fields
+        }
+
+    def estimate_order_fees(
+        self, asset, signed_quantity, price, order_id="estimate", generation=None
+    ):
+        if self.fee_bridge is not None:
+            return self.fee_bridge.estimate(asset, signed_quantity, price, order_id, generation)
+        return calculate_commission(self.commission_model, asset, abs(signed_quantity), price)
+
+    def reserve_cash_order(self, order, quantity=None):
+        bridge = getattr(self, "fee_bridge", None)
+        with bridge.bind(order) if bridge is not None else nullcontext():
+            return super().reserve_cash_order(order, quantity)
 
     def create_rebalance_plan(
         self, target_weights, *, rebalance_id=None, valid_until=None, defensive_allocation=False
@@ -814,7 +875,7 @@ class ConstrainedBroker(Broker):
         )
         intent = Intent(asset, signed, next_id, kind, order_type.value, target_weight, rebalance_id)
         deadline = self.order_deadline(kind, time_in_force, valid_until, rebalance_id, asset)
-        commission = calculate_commission(self.commission_model, asset, abs(signed), price)
+        commission = self.estimate_order_fees(asset, signed, price, next_id)
         was_new = asset not in self.account.positions
         snapshot = self.constraint_state(phase=phase)
         if kind is Kind.RISK:
@@ -965,6 +1026,18 @@ class ConstrainedBroker(Broker):
         order = next((o for o in self._order_state.pending if o.order_id == order_id), None)
         if order is None:
             return False
+        # Price-only amendments preserve the real unfilled quantity. The core
+        # cash amendment API treats quantity as the replacement's remainder.
+        # Otherwise a partial order's original quantity would be replenished.
+        remainder = self._order_state.partial_quantities.get(order_id, order.quantity)
+        if set(kwargs) - self._order_book._UPDATABLE_ORDER_FIELDS:
+            return super().update_order(order_id, **kwargs)  # retain core validation/error
+        if all(
+            (remainder if name == "quantity" else getattr(order, name)) == value
+            for name, value in kwargs.items()
+        ):
+            return True
+        kwargs.setdefault("quantity", remainder)
         candidate = replace(order, **kwargs)
         price = candidate.limit_price or max(
             self._market_state.prices.get(candidate.asset, 0), candidate.stop_price or 0
@@ -973,18 +1046,41 @@ class ConstrainedBroker(Broker):
             candidate.asset,
             price,
             "amendment",
-            calculate_commission(self.commission_model, candidate.asset, candidate.quantity, price),
+            self.estimate_order_fees(
+                candidate.asset,
+                candidate.quantity * (1 if candidate.side is OrderSide.BUY else -1),
+                price,
+                order_id,
+            ),
         )
         decision = self.controller.check(
             self.intent_for(candidate), self.constraint_state(order_id), context
         )
         if decision.action is not Action.ALLOW:
             return False
-        return super().update_order(order_id, **kwargs)
+        bridge = self.fee_bridge
+        if bridge is None:
+            return super().update_order(order_id, **kwargs)
+        generation = bridge.generations.get(order_id, 0) + 1
+        # Core reserve_cash_order binds the candidate, so make the tentative
+        # generation visible only for the duration of this atomic amendment.
+        old_generation = bridge.generations.get(order_id, 0)
+        bridge.generations[order_id] = generation
+        try:
+            changed = super().update_order(order_id, **kwargs)
+        except Exception:
+            bridge.generations[order_id] = old_generation
+            raise
+        if not changed:
+            bridge.generations[order_id] = old_generation
+        return changed
 
     def settle_cash_fill(self, order, remaining_quantity, cash_change):
         assert self._cash_account_rules is not None
-        self._cash_account_rules.reserve_remainder(order, remaining_quantity)
+        if self.fee_bridge is not None:
+            self.fee_bridge.commit_fill(order, self._execution_journal.fills[-1])
+        with self.fee_bridge.bind(order) if self.fee_bridge is not None else nullcontext():
+            self._cash_account_rules.reserve_remainder(order, remaining_quantity)
         if order.side is OrderSide.SELL and cash_change > 0:
             timestamp = self._market_state.time
             assert timestamp is not None
@@ -1042,11 +1138,16 @@ class ConstrainedBroker(Broker):
             self.risk_monitor_submission = False
 
 
-def broker_factory(controller: ConstraintController, context_provider: ContextProvider):
+def broker_factory(
+    controller: ConstraintController,
+    context_provider: ContextProvider,
+    *,
+    fee_model: IBKRProTieredUSStock | None = None,
+):
     def factory(config: BacktestConfig, **kwargs) -> ConstrainedBroker:
         broker = ConstrainedBroker.from_config(config, **kwargs)
         assert isinstance(broker, ConstrainedBroker)
-        broker.configure_constraints(controller, context_provider, config)
+        broker.configure_constraints(controller, context_provider, config, fee_model)
         return broker
 
     return factory

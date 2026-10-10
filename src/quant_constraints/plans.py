@@ -10,7 +10,6 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
-from ml4t.backtest.models import calculate_commission
 from ml4t.backtest.types import OrderSide, OrderStatus
 
 from .calendar import NY
@@ -319,7 +318,7 @@ class RebalancePlanManager:
                     asset,
                     price,
                     "plan_check",
-                    calculate_commission(broker.commission_model, asset, abs(delta), price),
+                    broker.estimate_order_fees(asset, delta, price, plan_id),
                 )
                 decision = controller.check(
                     Intent(

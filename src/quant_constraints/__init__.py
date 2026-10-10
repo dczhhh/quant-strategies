@@ -4,6 +4,7 @@ from .adapter import ConstrainedBroker, broker_factory, cash_backtest_config, co
 from .config import ConstraintConfig
 from .controller import ConstraintController
 from .events import EarningsCoverage, EarningsEvent, EarningsProvider, InMemoryEarningsProvider
+from .fees import FeeBreakdown, FeeExecutionContext, FeeRecord, IBKRProTieredUSStock, RegulatoryRate
 from .gates import AccountConstraint, EarningsGate, PortfolioGate, RebalanceGate, SessionGate
 from .models import (
     Action,
@@ -30,6 +31,11 @@ __all__ = [
     "EarningsEvent",
     "EarningsGate",
     "EarningsProvider",
+    "FeeBreakdown",
+    "FeeExecutionContext",
+    "FeeRecord",
+    "IBKRProTieredUSStock",
+    "RegulatoryRate",
     "Holding",
     "InMemoryEarningsProvider",
     "Intent",

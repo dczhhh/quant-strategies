@@ -1,3 +1,8 @@
+pricing_plan: ibkr_pro_tiered
+fee_initial_monthly_volume: 0.0
+fee_initial_month: null
+fee_unknown_venue_per_share: 0.0035
+fee_unknown_venue_rate: 0.0035
 cash_reserve: 0.10
 settlement_cycle: historical
 minimum_hold_sessions: 0

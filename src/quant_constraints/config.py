@@ -58,6 +58,11 @@ class ConstraintConfig:
     drawdown_block: float = 0.10
     drawdown_reduce: float = 0.15
     drawdown_reduction_fraction: float | None = None
+    pricing_plan: Literal["ibkr_pro_tiered", "custom"] = "ibkr_pro_tiered"
+    fee_initial_monthly_volume: float = 0.0
+    fee_initial_month: str | None = None
+    fee_unknown_venue_per_share: float = 0.0035
+    fee_unknown_venue_rate: float = 0.0035
 
     def __post_init__(self):
         for item in fields(self):
@@ -76,6 +81,7 @@ class ConstraintConfig:
         ):
             raise ValueError("Invalid drawdown reduction fraction")
         choices = {
+            "pricing_plan": {"ibkr_pro_tiered", "custom"},
             "settlement_cycle": {"historical", "T+1", "T+2"},
             "unknown_industry": {"reject", "warn"},
             "drift_reduction": {"next_session", "rebalance", "disabled"},
@@ -95,6 +101,14 @@ class ConstraintConfig:
             value = getattr(self, item.name)
             if isinstance(value, float) and (not math.isfinite(value) or value < 0):
                 raise ValueError(f"Invalid {item.name}")
+        if self.fee_initial_month is not None:
+            if not isinstance(self.fee_initial_month, str):
+                raise ValueError("fee_initial_month must be YYYY-MM")
+            parsed = date.fromisoformat(self.fee_initial_month + "-01")
+            if parsed.strftime("%Y-%m") != self.fee_initial_month:
+                raise ValueError("fee_initial_month must be YYYY-MM")
+        if self.fee_initial_monthly_volume and self.fee_initial_month is None:
+            raise ValueError("Nonzero initial fee volume requires fee_initial_month")
         if self.rebalance_anchor is not None:
             if not isinstance(self.rebalance_anchor, str):
                 raise ValueError("rebalance_anchor must be an ISO date")

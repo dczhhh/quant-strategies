@@ -73,10 +73,17 @@ class MarketContext:
     liquidity_available_at: datetime | None = None
     vix: float | None = None
     vix_available_at: datetime | None = None
+    execution_venue: str = "unknown"
+    execution_liquidity: str = "unknown"
+    fee_metadata_available_at: datetime | None = None
 
     def __post_init__(self):
         aware(self.asof)
-        for timestamp in (self.liquidity_available_at, self.vix_available_at):
+        for timestamp in (
+            self.liquidity_available_at,
+            self.vix_available_at,
+            self.fee_metadata_available_at,
+        ):
             if timestamp is not None:
                 aware(timestamp)
 
