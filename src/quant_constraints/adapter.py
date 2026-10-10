@@ -4,6 +4,7 @@ import math
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime
+from types import MappingProxyType
 
 from ml4t.backtest import BacktestConfig, Broker, Engine
 from ml4t.backtest.config import DataFrequency, ExecutionPrice, FillOrdering
@@ -15,6 +16,7 @@ from ml4t.backtest.types import ExecutionMode, Order, OrderSide, OrderStatus, Or
 from .calendar import NY, settlement_date
 from .controller import ConstraintController
 from .models import Action, Audit, Decision, Holding, Intent, Kind, MarketContext, State, aware
+from .plans import RebalancePlanManager
 
 ContextProvider = Callable[[datetime, str, str], MarketContext]
 
@@ -36,17 +38,23 @@ class ConstraintFillExecutor(FillExecutor):
     def execute(self, order: Order, base_price: float) -> bool:
         broker = self.broker
         assert isinstance(broker, ConstrainedBroker)
+        if broker.expire_order(order):
+            return True
         intent = broker.intent_for(order)
         context = broker.context_for(order.asset, base_price, "fill")
         state = broker.constraint_state(order.order_id, phase="fill")
         if order.asset not in self.market.opens and order.asset not in self.market.prices:
+            broker.audit_deferred(order, "price_missing")
             return False
         due = broker.deferred_until.get(order.order_id)
         if due and context.asof.astimezone(NY).date() < due:
+            broker.audit_deferred(order, "risk_wait_session")
             return False
         session = broker.controller.session.check(intent, state, context)
         if session.action is not Action.ALLOW:
             broker.controller.check(intent, state, context)
+            if session.action is Action.DEFER:
+                broker.audit_deferred(order, session.code)
             if intent.kind is Kind.RISK:
                 broker.deferred_risk.add(order.order_id)
             if session.action is Action.REJECT:
@@ -63,6 +71,7 @@ class ConstraintFillExecutor(FillExecutor):
             order._risk_fill_price = None
         preliminary = broker.controller.check(intent, state, context)
         if preliminary.action is Action.DEFER:
+            broker.audit_deferred(order, preliminary.code)
             return False
         broker.checking_actual_fill = True
         try:
@@ -72,6 +81,7 @@ class ConstraintFillExecutor(FillExecutor):
         broker.refresh_brackets()
         if order.status is OrderStatus.REJECTED and order.order_id in broker.fill_rejections:
             order._rejection_code = broker.fill_rejections.pop(order.order_id)
+        broker.audit_order_transition(order)
         return completed
 
 
@@ -124,6 +134,11 @@ class ConstrainedBroker(Broker):
         self.risk_monitor_submission = False
         self.deferred_rule_assets: set[str] = set()
         self.bracket_children: dict[str, tuple[str, str]] = {}
+        self.order_validity: dict[str, datetime] = {}
+        self.order_requested: dict[str, float] = {}
+        self.order_permitted: dict[str, float] = {}
+        self.order_audit_state: dict[str, tuple[float, OrderStatus]] = {}
+        self.plan_manager = RebalancePlanManager(self)
         self._fill_executor = ConstraintFillExecutor(
             self,
             account=self.account,
@@ -167,8 +182,10 @@ class ConstrainedBroker(Broker):
                 if price is None or not math.isfinite(price) or price <= 0:
                     raise ValueError(f"No valid historical valuation for {asset}")
                 missing_marks.add(asset)
-            sector = self.context_provider(market.time, asset, phase).sector
-            holdings[asset] = Holding(position.quantity, price, sector, position.entry_time)
+            supplied = self.context_provider(market.time, asset, phase)
+            holdings[asset] = Holding(
+                position.quantity, price, supplied.sector, position.entry_time, supplied.instrument
+            )
         equity = self.cash + sum(h.quantity * h.price for h in holdings.values())
         if not missing_marks:
             self.constraint_peak = max(self.constraint_peak, equity)
@@ -206,7 +223,171 @@ class ConstrainedBroker(Broker):
             1 - equity / self.constraint_peak if self.constraint_peak > 0 else 0.0,
             {asset: self.context_provider(market.time, asset, phase).sector for asset in buys},
             frozenset(missing_marks),
+            self.plan_manager.authorized(market.time),
         )
+
+    @property
+    def rebalance_plans(self):
+        return MappingProxyType(self.plan_manager.records)
+
+    def create_rebalance_plan(
+        self, target_weights, *, rebalance_id=None, valid_until=None, defensive_allocation=False
+    ):
+        return self.plan_manager.create(
+            dict(target_weights),
+            plan_id=rebalance_id,
+            valid_until=valid_until,
+            defensive_allocation=defensive_allocation,
+        )
+
+    def cancel_rebalance_plan(self, rebalance_id):
+        return self.plan_manager.cancel(rebalance_id)
+
+    def audit_plan_rejection(self, code: str) -> None:
+        timestamp = self._market_state.time
+        assert timestamp is not None
+        self.controller.audit.append(
+            Audit(
+                timestamp,
+                "portfolio",
+                "targets",
+                Kind.REBALANCE.value,
+                "market",
+                "plan",
+                self.settled_cash,
+                0,
+                Decision(Action.REJECT, code),
+            )
+        )
+
+    def order_deadline(self, kind, time_in_force, valid_until, rebalance_id, asset):
+        now = self._market_state.time
+        assert now is not None
+        if kind is Kind.RISK:
+            if valid_until is not None or time_in_force not in {None, "GTC"}:
+                raise ValueError("Risk protection uses GTC and cannot inherit a buy expiry")
+            return None
+        plan_deadline = None
+        if rebalance_id is not None:
+            plan = self.plan_manager.records.get(rebalance_id)
+            if plan is not None and plan.active:
+                plan_deadline = plan.valid_until
+        tif = time_in_force or self.controller.config.buy_time_in_force
+        if tif not in {"DAY", "GTD"}:
+            raise ValueError("Ordinary orders require DAY or GTD validity")
+        calendar = self.controller.calendar
+        day = calendar.on_or_after(now.astimezone(NY).date())
+        if tif == "GTD":
+            day = calendar.shift(day, self.controller.config.max_defer_sessions - 1)
+        session = calendar.session(day)
+        assert session is not None
+        deadline = session.market_close
+        if plan_deadline is not None:
+            deadline = plan_deadline
+        if valid_until is not None:
+            deadline = min(deadline, aware(valid_until))
+        # A company's event admission never spills into an unrelated session.
+        context = self.context_for(asset, self._market_state.prices.get(asset, 0), "submission")
+        event = (
+            self.controller.earnings.active_event(asset, context)
+            if context.instrument == "equity"
+            else None
+        )
+        if event is not None:
+            _, affected, _ = self.controller.earnings.sessions(event)
+            end = calendar.session(
+                calendar.shift(affected, self.controller.config.post_earnings_sessions - 1)
+            )
+            assert end is not None
+            deadline = min(deadline, end.market_close)
+        if deadline <= now:
+            raise ValueError("Order valid_until must be in the future")
+        return deadline
+
+    def audit_order_event(
+        self, order: Order, phase: str, decision: Decision, *, filled=0.0, status=None
+    ):
+        now = self._market_state.time
+        assert now is not None
+        self.controller.audit.append(
+            Audit(
+                now,
+                order.asset,
+                order.order_id,
+                self.intent_for(order).kind.value,
+                order.order_type.value,
+                phase,
+                self.settled_cash,
+                0,
+                decision,
+                side=order.side.value,
+                requested_quantity=self.order_requested.get(
+                    order.order_id, order.requested_quantity or order.quantity
+                ),
+                permitted_quantity=self.order_permitted.get(order.order_id, 0),
+                filled_quantity=filled,
+                final_status=status or order.status.value,
+            )
+        )
+
+    def audit_order_transition(self, order: Order):
+        previous = self.order_audit_state.get(order.order_id, (0.0, OrderStatus.PENDING))
+        increment = order.filled_quantity - previous[0]
+        if increment > 1e-10:
+            self.audit_order_event(
+                order, "execution", Decision(Action.ALLOW, "executed"), filled=increment
+            )
+        if order.status is not OrderStatus.PENDING and (
+            order.status is not previous[1] or order.order_id not in self.order_audit_state
+        ):
+            self.audit_order_event(
+                order,
+                "terminal",
+                Decision(
+                    Action.REJECT if order.status is OrderStatus.REJECTED else Action.ALLOW,
+                    order.rejection_code or order.status.value,
+                ),
+            )
+        self.order_audit_state[order.order_id] = (order.filled_quantity, order.status)
+
+    def audit_deferred(self, order: Order, code: str):
+        self.audit_order_event(order, "deferred", Decision(Action.DEFER, code))
+
+    def cancel_constraint_order(self, order_id: str, reason: str, *, expired: bool = False):
+        order = self.get_order(order_id)
+        result = super().cancel_order(order_id)
+        if result and order is not None:
+            order._reserved_cash = 0.0
+            self.audit_order_event(
+                order,
+                "terminal",
+                Decision(Action.REJECT, reason),
+                status="expired" if expired else "canceled",
+            )
+            self.order_audit_state[order_id] = (order.filled_quantity, order.status)
+        return result
+
+    def expire_order(self, order: Order) -> bool:
+        deadline = self.order_validity.get(order.order_id)
+        now = self._market_state.time
+        assert now is not None
+        if deadline is not None and now >= deadline and order.status is OrderStatus.PENDING:
+            if order.rebalance_id in self.plan_manager.records:
+                self.plan_manager.cancel(order.rebalance_id, "rebalance_plan_expired", expired=True)
+            else:
+                self.cancel_constraint_order(order.order_id, "order_expired", expired=True)
+                self.refresh_brackets()
+            return True
+        return False
+
+    def expire_orders(self):
+        now = self._market_state.time
+        assert now is not None
+        for identifier, plan in tuple(self.plan_manager.records.items()):
+            if plan.active and now >= plan.valid_until:
+                self.plan_manager.cancel(identifier, "rebalance_plan_expired", expired=True)
+        for order in tuple(self._order_state.pending):
+            self.expire_order(order)
 
     def submit_bracket(
         self,
@@ -260,7 +441,10 @@ class ConstrainedBroker(Broker):
                 _risk_exit_reason=reason,
             )
             self.constraint_kinds[child.order_id] = Kind.RISK
+            self.order_requested[child.order_id] = child.quantity
+            self.order_permitted[child.order_id] = 0.0
             self._order_state.orders.append(child)
+            self.audit_order_event(child, "order", Decision(Action.DEFER, "bracket_wait_parent"))
             children.append(child)
         tp, sl = children
         self.bracket_children[entry.order_id] = (tp.order_id, sl.order_id)
@@ -285,13 +469,23 @@ class ConstrainedBroker(Broker):
             assert tp is not None and sl is not None
             exited = tp.filled_quantity + sl.filled_quantity
             if exited and parent.status is OrderStatus.PENDING:
-                super().cancel_order(parent_id)
+                self.cancel_constraint_order(parent_id, "bracket_exit_canceled_parent_remainder")
             exposure = max(0.0, parent.filled_quantity - exited)
             if exposure <= 1e-10:
                 if parent.status is not OrderStatus.PENDING:
                     for child in (tp, sl):
                         if child.status is OrderStatus.PENDING:
                             child.status = OrderStatus.CANCELLED
+                            self.audit_order_event(
+                                child,
+                                "terminal",
+                                Decision(Action.ALLOW, "bracket_exposure_closed"),
+                                status="canceled",
+                            )
+                            self.order_audit_state[child.order_id] = (
+                                child.filled_quantity,
+                                child.status,
+                            )
                         if child in self._order_state.pending:
                             self._order_state.pending.remove(child)
                 continue
@@ -302,6 +496,7 @@ class ConstrainedBroker(Broker):
                     )
                 if child.status is OrderStatus.PENDING:
                     child.quantity = exposure
+                    self.order_permitted[child.order_id] = child.filled_quantity + exposure
                     if child.order_id in self._order_state.partial_quantities:
                         self._order_state.partial_quantities[child.order_id] = exposure
                     if child not in self._order_state.pending:
@@ -314,7 +509,9 @@ class ConstrainedBroker(Broker):
             assert parent is not None
             if parent.filled_quantity > 0 and self.account.get_position_quantity(order.asset) > 0:
                 return False  # do not leave a live bracket without its promised protection
-        result = super().cancel_order(order_id)
+        if order and order.rebalance_id in self.plan_manager.records:
+            return self.plan_manager.cancel(order.rebalance_id)
+        result = self.cancel_constraint_order(order_id, "order_canceled")
         self.refresh_brackets()
         return result
 
@@ -340,11 +537,13 @@ class ConstrainedBroker(Broker):
             kind,
             order.order_type.value,
             self.constraint_targets.get(order.order_id),
+            order.rebalance_id if order.rebalance_id in self.plan_manager.records else None,
         )
 
     def submit_intent(self, intent: Intent) -> Order | None:
         options = SubmitOrderOptions(
-            risk_exit_reason="external_risk" if intent.kind is Kind.RISK else None
+            risk_exit_reason="external_risk" if intent.kind is Kind.RISK else None,
+            rebalance_id=intent.rebalance_id,
         )
         return self.submit_order(
             intent.asset,
@@ -353,10 +552,20 @@ class ConstrainedBroker(Broker):
             _options=options,
             constraint_kind=intent.kind,
             target_weight=intent.target_weight,
+            valid_until=intent.valid_until,
+            time_in_force=intent.time_in_force,
         )
 
     def order_target_percent(
-        self, asset, target_percent, order_type=OrderType.MARKET, limit_price=None
+        self,
+        asset,
+        target_percent,
+        order_type=OrderType.MARKET,
+        limit_price=None,
+        *,
+        rebalance_id=None,
+        valid_until=None,
+        time_in_force=None,
     ):
         snapshot = self.constraint_state()
         price = self._market_state.prices.get(asset)
@@ -365,6 +574,25 @@ class ConstrainedBroker(Broker):
         current = snapshot.holdings.get(asset)
         shares = current.quantity if current else 0
         shares += snapshot.pending_buys.get(asset, 0) / price - snapshot.pending_sells.get(asset, 0)
+        if rebalance_id is not None:
+            plan = self.plan_manager.records.get(rebalance_id)
+            if plan is None or not plan.active or plan.targets.get(asset) != target_percent:
+                self.audit_plan_rejection("rebalance_plan_not_active")
+                return None
+            pending = next(
+                (
+                    order
+                    for identifier in plan.order_ids
+                    if (order := self.get_order(identifier)) is not None
+                    and order.asset == asset
+                    and order.status is OrderStatus.PENDING
+                ),
+                None,
+            )
+            if pending is not None:
+                return pending
+            if asset in plan.completed_assets:
+                return None
         return self.submit_order(
             asset,
             target_percent * snapshot.equity / price - shares,
@@ -372,9 +600,30 @@ class ConstrainedBroker(Broker):
             limit_price=limit_price,
             constraint_kind=Kind.REBALANCE,
             target_weight=target_percent,
+            _options=SubmitOrderOptions(rebalance_id=rebalance_id),
+            valid_until=valid_until,
+            time_in_force=time_in_force,
         )
 
-    def rebalance_to_weights(self, target_weights, order_type=OrderType.MARKET):
+    def rebalance_to_weights(
+        self,
+        target_weights,
+        order_type=OrderType.MARKET,
+        *,
+        rebalance_id=None,
+        valid_until=None,
+        defensive_allocation=False,
+    ):
+        if self.controller.config.rebalance_plan_enabled or rebalance_id is not None:
+            if order_type is not OrderType.MARKET:
+                raise ValueError("Continuation plans require market orders at observed prices")
+            plan = self.create_rebalance_plan(
+                target_weights,
+                rebalance_id=rebalance_id,
+                valid_until=valid_until,
+                defensive_allocation=defensive_allocation,
+            )
+            return [self.get_order(identifier) for identifier in plan.order_ids] if plan else []
         timestamp = self._market_state.time
         assert timestamp is not None
         active = {asset: weight for asset, weight in target_weights.items() if weight != 0}
@@ -382,7 +631,9 @@ class ConstrainedBroker(Broker):
             asset: self.context_provider(timestamp, asset, "submission").sector for asset in active
         }
         sectors = {asset: sector for asset, sector in sectors.items() if sector is not None}
-        decision = self.controller.check_targets(active, sectors)
+        decision = self.controller.check_targets(
+            active, sectors, defensive_allocation=defensive_allocation
+        )
         if decision.action is not Action.ALLOW:
             self.controller.audit.append(
                 Audit(
@@ -416,20 +667,34 @@ class ConstrainedBroker(Broker):
         return orders
 
     def _process_orders(self, *args, **kwargs):
+        self.expire_orders()
+        self.plan_manager.advance()
         # Risk sells precede ordinary sells; the core exit_first mode then precedes buys.
         self._order_state.pending.sort(
             key=lambda order: 0 if self.intent_for(order).kind is Kind.RISK else 1
         )
         pending = tuple(self._order_state.pending)
+        for order in pending:
+            if (
+                order.asset not in self._market_state.opens
+                and order.asset not in self._market_state.prices
+            ):
+                self.audit_deferred(order, "price_missing")
         audit_start = len(self.controller.audit)
         result = super()._process_orders(*args, **kwargs)
         self.refresh_brackets()
-        checked = {record.order_id for record in self.controller.audit[audit_start:]}
+        checked = {
+            record.order_id
+            for record in self.controller.audit[audit_start:]
+            if record.phase in {"fill", "fill_precheck"}
+        }
         use_open = kwargs.get("use_open", args[0] if args else False)
         for order in pending:
             if order.status is OrderStatus.REJECTED and order.order_id not in checked:
                 price = self._fill_engine.get_fill_price_for_order(order, use_open)
                 self.audit_core_rejection(order, price or 0, "fill_precheck")
+            self.audit_order_transition(order)
+        self.plan_manager.advance()
         return result
 
     def audit_core_rejection(self, order: Order, price: float, phase: str) -> None:
@@ -460,6 +725,9 @@ class ConstrainedBroker(Broker):
                     order.rejection_reason or "",
                     data={"funds_basis": "precheck_estimate"},
                 ),
+                side=order.side.value,
+                requested_quantity=self.order_requested.get(order.order_id, abs(intent.quantity)),
+                final_status=order.status.value,
             )
         )
 
@@ -496,6 +764,8 @@ class ConstrainedBroker(Broker):
         *,
         constraint_kind=None,
         target_weight=None,
+        valid_until=None,
+        time_in_force=None,
     ):
         if not hasattr(self, "controller"):
             return super().submit_order(
@@ -537,7 +807,13 @@ class ConstrainedBroker(Broker):
         if self.constraint_anchor is None:
             self.constraint_anchor = timestamp
         next_id = f"ORD-{self._order_state.counter + 1}"
-        intent = Intent(asset, signed, next_id, kind, order_type.value, target_weight)
+        rebalance_id = (
+            _options.rebalance_id
+            if _options and _options.rebalance_id in self.plan_manager.records
+            else None
+        )
+        intent = Intent(asset, signed, next_id, kind, order_type.value, target_weight, rebalance_id)
+        deadline = self.order_deadline(kind, time_in_force, valid_until, rebalance_id, asset)
         commission = calculate_commission(self.commission_model, asset, abs(signed), price)
         was_new = asset not in self.account.positions
         snapshot = self.constraint_state(phase=phase)
@@ -559,6 +835,40 @@ class ConstrainedBroker(Broker):
             snapshot,
             self.context_for(asset, price, "submission", commission),
         )
+        if (
+            kind is not Kind.RISK
+            and any(plan.active for plan in self.plan_manager.records.values())
+            and rebalance_id is None
+        ):
+            decision = Decision(Action.REJECT, "rebalance_plan_order_conflict")
+        if rebalance_id is not None:
+            plan = self.plan_manager.records[rebalance_id]
+            price_now = self._market_state.prices.get(asset, 0)
+            expected = (
+                plan.targets.get(asset, 0) * snapshot.equity / price_now
+                - self.account.get_position_quantity(asset)
+                if price_now > 0
+                else 0
+            )
+            if (
+                not plan.active
+                or order_type is not OrderType.MARKET
+                or asset not in plan.targets
+                or target_weight != plan.targets[asset]
+                or signed * expected <= 0
+                or abs(signed) > abs(expected) + 1e-8
+                or (signed > 0 and plan.status == "selling")
+                or snapshot.pending_buys.get(asset, 0)
+                or snapshot.pending_sells.get(asset, 0)
+            ):
+                decision = Decision(Action.REJECT, "rebalance_plan_order_conflict")
+            elif decision.action is Action.RESIZE:
+                decision = Decision(Action.REJECT, "rebalance_plan_target_illegal")
+        self.order_requested[next_id] = abs(quantity)
+        if self.controller.audit[-1].decision != decision:
+            self.controller.audit[-1] = replace(
+                self.controller.audit[-1], decision=decision, permitted_quantity=0.0
+            )
         if decision.action is Action.REJECT:
             self._order_state.counter += 1
             order = Order(
@@ -571,30 +881,50 @@ class ConstrainedBroker(Broker):
             )
             order.reject(decision.reason or decision.code, decision.code)
             self._order_state.orders.append(order)
+            self.constraint_kinds[next_id] = kind
+            self.audit_order_event(order, "order", decision)
+            self.audit_order_transition(order)
             return order
         if decision.action is Action.RESIZE:
             assert decision.quantity is not None
             signed = decision.quantity
         if kind is Kind.RISK:
+            for identifier, plan in tuple(self.plan_manager.records.items()):
+                if plan.active:
+                    self.plan_manager.cancel(identifier, "rebalance_plan_superseded_by_risk")
             for pending in tuple(self._order_state.pending):
                 if pending.asset == asset and pending.side is OrderSide.SELL:
                     if pending.parent_id in self.bracket_children:
-                        super().cancel_order(pending.parent_id)
-                    super().cancel_order(pending.order_id)
+                        self.cancel_constraint_order(pending.parent_id, "risk_superseded")
+                    self.cancel_constraint_order(pending.order_id, "risk_superseded")
         # Register before core reserve/fill callbacks so final checks retain intent kind.
         self.constraint_kinds[next_id] = kind
+        self.order_permitted[next_id] = 0.0 if decision.action is Action.DEFER else abs(signed)
+        if deadline is not None:
+            self.order_validity[next_id] = deadline
         if target_weight is not None:
             self.constraint_targets[next_id] = target_weight
         order = super().submit_order(
             asset, signed, None, order_type, limit_price, stop_price, trail_amount, _options
         )
+        if order is not None and rebalance_id is not None:
+            plan = self.plan_manager.records[rebalance_id]
+            if order.order_id not in plan.order_ids:
+                self.plan_manager.records[rebalance_id] = replace(
+                    plan, order_ids=(*plan.order_ids, order.order_id)
+                )
+        if order is not None:
+            self.audit_order_event(order, "order", decision)
+            self.audit_order_transition(order)
         if order is not None and order.status is OrderStatus.REJECTED:
             self.audit_core_rejection(order, price, "reservation")
         if order is not None and order.status is not OrderStatus.REJECTED:
             if kind is not Kind.RISK and signed > 0 and was_new:
                 self.entry_times.append(timestamp)
             if decision.action is Action.DEFER:
-                self.deferred_risk.add(order.order_id)
+                if kind is Kind.RISK:
+                    self.deferred_risk.add(order.order_id)
+                self.audit_deferred(order, decision.code)
         return order
 
     def validate_cash_fill(self, order, quantity, price, commission):
@@ -608,11 +938,27 @@ class ConstrainedBroker(Broker):
         intent = self.intent_for(order, quantity)
         if phase == "fill":
             decision = self.controller.check(intent, state, context)
+            if order.rebalance_id in self.plan_manager.records:
+                plan = self.plan_manager.records[order.rebalance_id]
+                if (
+                    abs(price / plan.reference_prices[order.asset] - 1)
+                    > self.controller.config.rebalance_plan_max_price_change + 1e-12
+                ):
+                    check_record = self.controller.audit[-1]
+                    self.plan_manager.cancel(plan.plan_id, "rebalance_plan_price_changed")
+                    decision = Decision(Action.REJECT, "rebalance_plan_price_changed")
+                    self.controller.audit.append(
+                        replace(check_record, decision=decision, permitted_quantity=0.0)
+                    )
         else:
             decision = self.controller.account.check(intent, state, context)
         if decision.action not in {Action.ALLOW}:
             self.fill_rejections[order.order_id] = decision.code
             return False, decision.reason or decision.code
+        if phase == "fill":
+            self.order_permitted[order.order_id] = max(
+                self.order_permitted.get(order.order_id, 0), order.filled_quantity + quantity
+            )
         return super().validate_cash_fill(order, quantity, price, commission)
 
     def update_order(self, order_id, **kwargs):
@@ -652,6 +998,8 @@ class ConstrainedBroker(Broker):
     def _update_time(self, timestamp, prices, opens, highs=None, lows=None, *rest, **kwargs):
         aware(timestamp)
         super()._update_time(timestamp, prices, opens, highs, lows, *rest, **kwargs)
+        if hasattr(self, "controller"):
+            self.expire_orders()
         if (
             hasattr(self, "controller")
             and self.constraint_anchor is None

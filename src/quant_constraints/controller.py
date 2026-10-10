@@ -30,6 +30,7 @@ class ConstraintController:
 
     def check(self, intent: Intent, state: State, market_context: MarketContext) -> Decision:
         context = market_context
+        earnings_checked = False
         # Even an outside-session risk request must not queue a short or invalid order.
         session = self.session.check(intent, state, context)
         account = self.account.check(intent, state, context)
@@ -45,10 +46,14 @@ class ConstraintController:
                 if intent.kind is Kind.REBALANCE
                 else ALLOW
             )
+        elif context.instrument not in {"equity", "plain_sector_etf"}:
+            decision = reject("instrument_not_allowed")
         else:
             decision = ALLOW
             warning = ALLOW
             for gate in (self.earnings, self.rebalance, self.portfolio):
+                if gate is self.earnings and context.instrument == "equity":
+                    earnings_checked = True
                 decision = gate.check(intent, state, context)
                 if decision.action is not Action.ALLOW:
                     break
@@ -56,6 +61,14 @@ class ConstraintController:
                     warning = decision
             if decision.action is Action.ALLOW and warning.code != "allowed":
                 decision = warning
+        event = self.earnings.active_event(intent.asset, context) if earnings_checked else None
+        event_id = (
+            str(decision.data["event_id"])
+            if "event_id" in decision.data
+            else event.event_id
+            if event
+            else None
+        )
         self.audit.append(
             Audit(
                 context.asof,
@@ -67,6 +80,17 @@ class ConstraintController:
                 state.settled_cash - state.reserved_cash,
                 max(0, intent.quantity * context.price + context.commission),
                 decision,
+                side="buy" if intent.quantity > 0 else "sell",
+                requested_quantity=abs(intent.quantity),
+                permitted_quantity=(
+                    abs(decision.quantity)
+                    if decision.action is Action.RESIZE and decision.quantity is not None
+                    else abs(intent.quantity)
+                    if decision.action is Action.ALLOW
+                    else 0.0
+                ),
+                earnings_checked=earnings_checked,
+                earnings_event_id=event_id,
             )
         )
         return decision
@@ -76,8 +100,14 @@ class ConstraintController:
         day = context.asof.astimezone(NY).date()
         for asset, holding in state.holdings.items():
             reason, quantity = "", 0.0
-            coverage, events = self.earnings.known(asset, context.asof)
-            if not self.config.hold_through_earnings:
+            coverage, events = (
+                (None, ())
+                if holding.instrument == "plain_sector_etf"
+                else self.earnings.known(asset, context.asof)
+            )
+            if holding.instrument not in {"equity", "plain_sector_etf"}:
+                reason, quantity = "instrument_metadata_missing_exit", holding.quantity
+            if holding.instrument != "plain_sector_etf" and not self.config.hold_through_earnings:
                 if (
                     coverage is None
                     or coverage.missing
@@ -167,9 +197,19 @@ class ConstraintController:
                 requests.append(RiskRequest(asset, quantity, reason))
         return tuple(requests)
 
-    def check_targets(self, targets: dict[str, float], sectors: dict[str, str]) -> Decision:
+    def check_targets(
+        self,
+        targets: dict[str, float],
+        sectors: dict[str, str],
+        *,
+        defensive_allocation: bool = False,
+    ) -> Decision:
         """Validate a complete external allocation without submitting any orders."""
-        if not self.config.preferred_min_names <= len(targets) <= self.config.max_names:
+        if type(defensive_allocation) is not bool:
+            raise ValueError("defensive_allocation must be boolean")
+        defensive = defensive_allocation or self.config.allow_defensive_underinvested
+        minimum = 0 if defensive else self.config.preferred_min_names
+        if not minimum <= len(targets) <= self.config.max_names:
             return reject("target_name_count")
         if any(
             not self.config.min_target_weight <= weight <= self.config.max_weight
@@ -196,15 +236,32 @@ class ConstraintController:
         return [asdict(record) for record in self.audit]
 
     def event_statistics(self) -> dict[str, float | int]:
-        buys = [
-            a
-            for a in self.audit
-            if a.order_kind in {Kind.ENTRY.value, Kind.ADD.value, Kind.REBALANCE.value}
-            and a.phase == "submission"
-        ]
-        triggered = sum(a.decision.code.startswith(("earnings_", "post_earnings_")) for a in buys)
-        return {
+        buys = [a for a in self.audit if a.side == "buy" and a.phase == "submission"]
+        earnings_buys = [a for a in buys if a.earnings_checked]
+        triggered = sum(
+            a.decision.code.startswith(("earnings_", "post_earnings_")) for a in earnings_buys
+        )
+        executions = [a for a in self.audit if a.side == "buy" and a.phase == "execution"]
+        terminals = {a.order_id: a for a in self.audit if a.side == "buy" and a.phase == "terminal"}
+        statistics: dict[str, float | int] = {
             "buy_checks": len(buys),
+            "earnings_buy_checks": len(earnings_buys),
             "earnings_gate_triggers": triggered,
-            "earnings_gate_trigger_rate": triggered / len(buys) if buys else 0.0,
+            "earnings_gate_trigger_rate": triggered / len(earnings_buys) if earnings_buys else 0.0,
+            "buy_orders": len(
+                {a.order_id for a in self.audit if a.side == "buy" and a.phase == "order"}
+            ),
+            "buy_fill_events": len(executions),
+            "buy_filled_quantity": sum(a.filled_quantity for a in executions),
+            "buy_filled_orders": sum(a.final_status == "filled" for a in terminals.values()),
+            "earnings_events": len(
+                {a.earnings_event_id for a in earnings_buys if a.earnings_event_id is not None}
+            ),
         }
+        statistics.update(
+            {
+                f"buy_{action.value.lower()}_checks": sum(a.decision.action is action for a in buys)
+                for action in Action
+            }
+        )
+        return statistics

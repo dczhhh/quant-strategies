@@ -16,6 +16,7 @@ from .models import (
     RiskRequest,
     State,
 )
+from .plans import RebalancePlan
 
 __all__ = [
     "AccountConstraint",
@@ -36,6 +37,7 @@ __all__ = [
     "MarketContext",
     "PortfolioGate",
     "RebalanceGate",
+    "RebalancePlan",
     "RiskRequest",
     "SessionGate",
     "State",

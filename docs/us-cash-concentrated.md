@@ -24,6 +24,8 @@ statistics = controller.event_statistics()
 
 纯检查接口为 `controller.check(intent, state, market_context)`，返回 `ALLOW / REJECT / DEFER / RESIZE`、稳定原因码及数据。`submit_intent()` 接收外部意图；也支持原有 `submit_order()`、`update_order()`、`order_target_percent()`、`rebalance_to_weights()`。目标接口表示外部调仓请求，受调仓日期与 3 个百分点死区约束；普通减仓使用 `Kind.REDUCE`，风控使用 `Kind.RISK`。完整目标分配还通过 `check_targets()` 检查 4–6 个标的、单票范围、行业和股票预算。逐步建仓可以暂时少于 4 个持仓，不会为凑齐数量自动下单。
 
+防御配置可以对单次完整目标传 `defensive_allocation=True`，或显式启用 `allow_defensive_underinvested`。这允许 0–3 只及全现金目标，仍保留单票范围、最多 6 只、90% 投资预算、现金储备和行业上限。不会补足持仓数量，也不生成防御信号；禁止买入的市场仍允许合法减仓。
+
 ## 账户规则与策略偏好
 
 | 分类 | 行为 |
@@ -54,6 +56,8 @@ statistics = controller.event_statistics()
 
 `EarningsCoverage` 必须在当时可见并覆盖至少前瞻 2 个交易日，含该日结束。空事件列表仅在有可信覆盖声明时代表“未发现财报”；缺失日历对新增买入关闭准入。普通减仓和风险卖出不受财报买入限制。
 
+当时可信分类为 `plain_sector_etf` 的普通行业 ETF 豁免单一公司财报覆盖、禁买/清仓窗口及财报半仓上限；不会对股票全局放宽日历规则。ETF 仍检查价差、正成交量与流动性可用时间，以及时段、已结算现金、行业、单票和市场门槛。未知/杠杆/反向/大盘类型不能获得豁免。持仓分类缺失或不受支持时产生保守风险退出，不能推断它是 ETF；数据提供方必须维护历史分类。
+
 - 前 2 个交易日从首日开盘起，直到公告前，禁止新建和加仓。AMC 包含公告当天的 RTH。
 - 默认 `hold_through_earnings: false`。BMO 在前一交易日收盘前 30 分钟请求清仓，AMC 在公告当天收盘前 30 分钟请求清仓。DURING/UNKNOWN 按前一交易日处理；非交易日公告在前一合法交易日清仓。缺失覆盖对现有仓位产生保守清仓请求。
 - 若公告信息到达时已错过窗口，只对公告前已持有的仓位在当前/下一合法观测点处理并留下审计记录；财报后新仓不会重用财报前清仓计划。缺少建仓时间的迁移持仓保守视作公告前仓位。不伪造前一天或盘后的平仓。
@@ -67,6 +71,36 @@ statistics = controller.event_statistics()
 超过 25% 的价格漂移会阻止加仓并记录。默认请求在下一交易日合法行情减仓；可改为调仓日减仓或仅监测。请求数量按观测时权益计算，因此价格跳变或部分成交可能继续漂移；没有“瞬间保证权重”的假设。
 
 每 N 个交易日默认为 N=10，以第一次观测到的交易日为锚点（第 0 天允许），不依赖首次订单或输入方式；可用 ISO 日期 `rebalance_anchor` 固定锚点。纯检查接口须提供 `State.anchor` 或显式配置。也可用 `monthly` 每月首/末交易日，或 `semi_monthly` 每月 1 日、16 日及之后的首个交易日（节假日顺延）。日期仅许可外部调整，零交易合法。`submit_intent`、目标百分比、完整权重及标记为调仓的基座子订单共享日期规则。变动小于 3 个百分点忽略。每周按纽约时间 ISO 周计数，最多接受 4 次新建仓订单，未成交订单立即占用额度；取消仍保守计入该周，成交与修改不重复计数。加仓、普通减仓和风险卖出不消费新建额度。
+
+## 跨结算日调仓计划
+
+默认仍使用单次调仓接口。启用 `rebalance_plan_enabled=True` 后，`rebalance_to_weights()` 创建可延续的外部配置计划；也可显式调用以下接口（计划仅接受市价单）：
+
+```python
+plan = broker.create_rebalance_plan(
+    external_weights, rebalance_id="allocation-2026-10",
+    defensive_allocation=False,
+)
+current_plan = broker.rebalance_plans[plan.plan_id]
+# 可显式撤销剩余部分；保留已实际成交的持仓。
+broker.cancel_rebalance_plan(plan.plan_id)
+```
+
+计划只能在合法调仓日的 RTH 创建。记录不可改写的 ID、目标、创建时间、有效期与参考价格，状态为 `selling / waiting_cash / buying / completed / canceled / expired`。先完成所有减仓，再用真正已结算现金提交买入；有未成交卖单或价格缺口时不提前进入买入阶段。交易日与 T+1/T+2 结算日分别计算。每个新增子单仍遵守原有 `NEXT_BAR` 时间顺序、账户、财报、RTH、流动性、仓位和周建仓额度。
+
+只有有效计划里的授权资产可以在非调仓日延续；不绕过其他门槛。`order_target_percent(..., rebalance_id=...)` 可检查/继续已授权目标；`Intent.rebalance_id` 引用同一授权。重复 ID 返回原计划及原订单，不重复开仓；不能改变目标或延长旧计划，同资产只保留一个待成交子单，同时只允许一个活动计划。其他普通订单与活动计划冲突时拒绝；风险退出可以取消剩余计划。
+
+默认有效期为创建日及之后共 `rebalance_plan_sessions=5` 个真实交易日，截止最后一天实际收盘；`valid_until` 可进一步缩短。目标分类、财报、行业或市场变得不合法时取消剩余计划。当前观测开盘/收盘或含费用模型的实际执行价偏离参考价格超过 `rebalance_plan_max_price_change=0.05` 时取消；允许范围内重新按当前权益/价格计算剩余申请，绝不按参考价成交。若最终现金预算已不足且没有待结算款，取消并记录 `rebalance_plan_cash_budget_changed`；不削减现金储备、追单或自动填仓。原有死区可以使保留仓位偏离理想权重，费用和价格变化也可能使目标无法完成。
+
+计划只保存授权及订单 ID、完成标的，实际股份、成交、费用、预约现金和结算均读取基座的唯一账本。部分成交保留剩余预约；取消/到期只释放未成交预约，已经成交的卖出款继续按实际结算日期释放。已完成计划不因后续漂移自动重启。
+
+## 延后订单的有效期
+
+普通买卖单默认 `buy_time_in_force=DAY`，截止提交日实际收盘（包含半日市）。可用 `GTD` 延续，但最多覆盖 `max_defer_sessions=2` 个真实交易日；订单/意图可传带时区的 `valid_until` 缩短有效期。计划子单继承计划有效期。股票财报后准入订单还受对应事件期最后收盘限制，不能等到事件失效后才补单。
+
+到期在新的行情时间推进时、成交检查前执行：取消剩余订单、释放剩余预约，记录 `expired` 与原因。盘外和开盘/收盘买入缓冲内的有效旧订单等待下一合法窗口；缺失数据不会延长有效期。数据恢复后重检当时的财报修订、市场、现金和仓位，实际成交再用真实价格/费用/成交量检查。修改不能延长有效期。
+
+`Kind.RISK` 与 Bracket 保护子单采用 GTC，不能赋予普通买单的 DAY/GTD 到期。风险退出缺价或盘外时继续等待下一个合法真实报价，不会无声消失，也不保证历史触发价。审计分别保留 `deferred`、显式取消、计划取消和 `expired` 原因。
 
 ## 缺失数据策略
 
@@ -85,6 +119,8 @@ statistics = controller.event_statistics()
 可选 `market_gates` 默认关闭。启用后需要当时可见的 VIX：20–30 将单票上限乘 0.5，≥30 或账户回撤 ≥10% 禁止新增买入。回撤 ≥15% 仅使用显式 `drawdown_reduction_fraction` 生成预定义减仓请求；未配置时记录 `drawdown_reduction_plan_missing`，不会声称已执行。减仓计划每个持续回撤区间只请求一次，避免每个 bar 递归减半。
 
 所有提交/修改和最终成交分别检查。提交可 `RESIZE`；实际价格/费用使计划越界时拒绝成交并释放预约资金，不偷偷更改外部目标。结构化审计包含时间、资产、订单 ID、种类、阶段、可用结算现金、所需资金和原因。常见码包括 `outside_rth`、`entry_window`、`settled_cash`、`cash_reserve`、`short_sale`、`earnings_blackout`、`earnings_liquidity_missing`、`overweight_drift`、`industry_missing`、`rebalance_schedule`、`weight_deadband` 和 `weekly_entries`。
+
+审计还包括 `side`、申请数量、许可数量、单次实际成交量和最终状态。`submission` 是尝试，`order` 是基座订单，`execution` 是一次增量成交，`terminal` 是终止；不能把重复成交前检查当作成交。`buy_checks` 仅统计买入提交（卖出 `REBALANCE` 不计入），`earnings_buy_checks` 统计真正到达股票财报门禁的提交，财报触发率以此为分母；分别报告四种准入动作、唯一订单数、成交次数/数量、完整成交订单数和唯一财报事件数。ETF 的财报豁免不会虚增股票财报调用。DEFER 是等待而非最终成交许可。
 
 ## 验证与数据依赖
 

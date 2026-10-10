@@ -139,7 +139,12 @@ def test_actual_gap_and_commission_rejection_are_atomic():
     assert order._rejection_code == "position_or_industry_cap"
     assert (broker.cash, broker.settled_cash, dict(broker.account.positions)) == before
     assert broker.reserved_cash == 0
-    assert ctrl.audit[-1].phase == "fill"
+    assert any(
+        a.phase == "fill"
+        and a.order_id == order.order_id
+        and a.decision.code == "position_or_industry_cap"
+        for a in ctrl.audit
+    )
 
 
 def test_cash_reserve_is_fraction_of_equity():
@@ -164,7 +169,7 @@ def test_changed_actual_commission_cannot_make_cash_negative():
     assert order.status is OrderStatus.REJECTED and order._rejection_code == "settled_cash"
     assert broker.cash == broker.settled_cash == 10000
     assert not broker.account.positions
-    assert ctrl.audit[-1].required_funds == 11000
+    assert next(a for a in reversed(ctrl.audit) if a.phase == "fill").required_funds == 11000
 
 
 def test_core_cash_precheck_rejection_has_structured_audit():
@@ -174,7 +179,7 @@ def test_core_cash_precheck_rejection_has_structured_audit():
     tick(broker, at(clock="10:31"), price=1000)
     broker._process_orders(use_open=True)
     assert order.status is OrderStatus.REJECTED
-    record = ctrl.audit[-1]
+    record = next(a for a in reversed(ctrl.audit) if a.phase == "fill_precheck")
     assert record.order_id == order.order_id
     assert record.decision.action is Action.REJECT
     assert record.required_funds == 20000 and record.available_settled_cash == 10000
@@ -375,7 +380,12 @@ def test_post_earnings_liquidity_is_checked_again_at_fill():
     assert order.status is OrderStatus.REJECTED
     assert order._rejection_code == "earnings_liquidity_missing"
     assert broker.cash == 10000 and not broker.get_position("A")
-    assert ctrl.audit[-1].phase == "fill"
+    assert any(
+        a.phase == "fill"
+        and a.order_id == order.order_id
+        and a.decision.code == "earnings_liquidity_missing"
+        for a in ctrl.audit
+    )
 
 
 def test_drawdown_plan_is_applied_once_per_continuous_breach():

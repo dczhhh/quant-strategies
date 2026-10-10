@@ -36,7 +36,11 @@ class SessionGate:
             <= context.asof
             < bounds[1] - timedelta(minutes=self.config.entry_close_buffer_minutes)
         ):
-            return reject("entry_window", "Buy window excludes opening and closing buffers")
+            return Decision(
+                Action.DEFER if context.phase == "fill" else Action.REJECT,
+                "entry_window",
+                "Buy window excludes opening and closing buffers",
+            )
         return ALLOW
 
 
@@ -126,14 +130,22 @@ class RebalanceGate:
 
     def check(self, intent: Intent, state: State, context: MarketContext) -> Decision:
         if intent.kind is Kind.REBALANCE:
-            if not self.scheduled(state, context.asof):
+            if (
+                intent.rebalance_id is not None
+                and intent.rebalance_id not in state.authorized_plans
+            ):
+                return reject("rebalance_plan_not_active")
+            if intent.rebalance_id is None and not self.scheduled(state, context.asof):
                 return reject("rebalance_schedule")
             current = state.holdings.get(intent.asset)
             current_weight = current.quantity * current.price / state.equity if current else 0
             target = intent.target_weight
             if target is None:
                 target = current_weight + intent.quantity * context.price / state.equity
-            if abs(target - current_weight) < self.config.weight_change_threshold - 1e-12:
+            if (
+                intent.rebalance_id is None
+                and abs(target - current_weight) < self.config.weight_change_threshold - 1e-12
+            ):
                 return reject(
                     "weight_deadband", "Adjustment below configured percentage-point threshold"
                 )
@@ -196,6 +208,8 @@ class EarningsGate:
     def check(self, intent: Intent, state: State, context: MarketContext) -> Decision:
         if intent.quantity < 0:
             return ALLOW
+        if context.instrument == "plain_sector_etf":
+            return ALLOW  # explicit PIT classification; no single-company earnings event
         coverage, events = self.known(intent.asset, context.asof)
         day = context.asof.astimezone(NY).date()
         lookahead = self.calendar.shift(day, self.config.earnings_blackout_sessions)
@@ -259,7 +273,7 @@ class PortfolioGate:
 
     def cap(self, asset: str, state: State, context: MarketContext) -> tuple[float, Decision]:
         cap = self.config.max_weight
-        if self.earnings.active_event(asset, context):
+        if context.instrument == "equity" and self.earnings.active_event(asset, context):
             cap *= self.config.event_position_multiplier
         if self.config.market_gates:
             if (
@@ -287,6 +301,21 @@ class PortfolioGate:
             return ALLOW
         if context.instrument not in {"equity", "plain_sector_etf"}:
             return reject("instrument_not_allowed", "Only ordinary stocks and plain sector ETFs")
+        if context.instrument == "plain_sector_etf":
+            if (
+                context.spread is None
+                or not math.isfinite(context.spread)
+                or context.volume is None
+                or not math.isfinite(context.volume)
+                or context.liquidity_available_at is None
+                or context.liquidity_available_at > context.asof
+            ):
+                return Decision(
+                    Action.DEFER if self.config.missing_liquidity == "defer" else Action.REJECT,
+                    "liquidity_missing",
+                )
+            if not 0 <= context.spread <= self.config.max_spread or context.volume <= 0:
+                return reject("liquidity")
         cap, market = self.cap(intent.asset, state, context)
         if market.action is not Action.ALLOW:
             return market
@@ -359,7 +388,11 @@ class PortfolioGate:
                 < self.config.min_target_weight - 1e-12
             ):
                 return reject("cap_below_target_minimum")
-            event = self.earnings.active_event(intent.asset, context)
+            event = (
+                self.earnings.active_event(intent.asset, context)
+                if context.instrument == "equity"
+                else None
+            )
             code = (
                 "earnings_position_cap"
                 if event and remaining == cap * state.equity - current_value - committed

@@ -10,6 +10,8 @@ missing_earnings_position: liquidate
 missing_liquidity: reject
 missing_market: reject
 missing_price: error
+buy_time_in_force: DAY
+max_defer_sessions: 2
 liquidation_close_buffer_minutes: 30
 post_earnings_wait_minutes: 60
 post_earnings_sessions: 1
@@ -19,6 +21,7 @@ event_position_multiplier: 0.5
 min_target_weight: 0.10
 max_weight: 0.25
 preferred_min_names: 4
+allow_defensive_underinvested: false
 max_names: 6
 equity_target: 0.90
 industry_cap: 0.40
@@ -28,6 +31,9 @@ rebalance_mode: every_n_trading_days
 rebalance_anchor: null
 rebalance_n: 10
 monthly_session: first
+rebalance_plan_enabled: false
+rebalance_plan_sessions: 5
+rebalance_plan_max_price_change: 0.05
 weight_change_threshold: 0.03
 weekly_entries: 4
 market_gates: false

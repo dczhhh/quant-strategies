@@ -23,6 +23,8 @@ class ConstraintConfig:
     missing_liquidity: Literal["reject", "defer"] = "reject"
     missing_market: Literal["reject", "defer"] = "reject"
     missing_price: Literal["error", "defer"] = "error"
+    buy_time_in_force: Literal["DAY", "GTD"] = "DAY"
+    max_defer_sessions: int = 2
     liquidation_close_buffer_minutes: int = 30
     post_earnings_wait_minutes: int = 60
     post_earnings_sessions: int = 1
@@ -32,6 +34,7 @@ class ConstraintConfig:
     min_target_weight: float = 0.10
     max_weight: float = 0.25
     preferred_min_names: int = 4
+    allow_defensive_underinvested: bool = False
     max_names: int = 6
     equity_target: float = 0.90
     industry_cap: float = 0.40
@@ -43,6 +46,9 @@ class ConstraintConfig:
     rebalance_anchor: str | None = None
     rebalance_n: int = 10
     monthly_session: Literal["first", "last"] = "first"
+    rebalance_plan_enabled: bool = False
+    rebalance_plan_sessions: int = 5
+    rebalance_plan_max_price_change: float = 0.05
     weight_change_threshold: float = 0.03
     weekly_entries: int = 4
     market_gates: bool = False
@@ -80,6 +86,7 @@ class ConstraintConfig:
             "missing_liquidity": {"reject", "defer"},
             "missing_market": {"reject", "defer"},
             "missing_price": {"error", "defer"},
+            "buy_time_in_force": {"DAY", "GTD"},
         }
         for name, allowed in choices.items():
             if not isinstance(getattr(self, name), str) or getattr(self, name) not in allowed:
@@ -92,7 +99,12 @@ class ConstraintConfig:
             if not isinstance(self.rebalance_anchor, str):
                 raise ValueError("rebalance_anchor must be an ISO date")
             date.fromisoformat(self.rebalance_anchor)
-        for name in ("hold_through_earnings", "market_gates"):
+        for name in (
+            "hold_through_earnings",
+            "market_gates",
+            "allow_defensive_underinvested",
+            "rebalance_plan_enabled",
+        ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be boolean")
         for name in (
@@ -107,6 +119,8 @@ class ConstraintConfig:
             "max_names",
             "rebalance_n",
             "weekly_entries",
+            "max_defer_sessions",
+            "rebalance_plan_sessions",
         ):
             value = getattr(self, name)
             minimum = (
@@ -118,6 +132,8 @@ class ConstraintConfig:
                     "max_names",
                     "rebalance_n",
                     "weekly_entries",
+                    "max_defer_sessions",
+                    "rebalance_plan_sessions",
                 }
                 else 0
             )
@@ -135,6 +151,7 @@ class ConstraintConfig:
             "vix_position_multiplier",
             "drawdown_block",
             "drawdown_reduce",
+            "rebalance_plan_max_price_change",
         )
         for name in fractions:
             value = getattr(self, name)

@@ -28,6 +28,9 @@ class Intent:
     kind: Kind = Kind.ENTRY
     order_type: str = "market"
     target_weight: float | None = None
+    rebalance_id: str | None = None
+    valid_until: datetime | None = None
+    time_in_force: str | None = None
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,7 @@ class Holding:
     price: float
     sector: str | None = None
     opened_at: datetime | None = None
+    instrument: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,7 @@ class State:
     drawdown: float = 0.0
     pending_sectors: dict[str, str | None] = field(default_factory=dict)
     missing_marks: frozenset[str] = frozenset()
+    authorized_plans: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -99,6 +104,13 @@ class Audit:
     available_settled_cash: float
     required_funds: float
     decision: Decision
+    side: str | None = None
+    requested_quantity: float = 0.0
+    permitted_quantity: float = 0.0
+    filled_quantity: float = 0.0  # incremental execution, not cumulative order fills
+    final_status: str | None = None
+    earnings_checked: bool = False
+    earnings_event_id: str | None = None
 
 
 @dataclass(frozen=True)

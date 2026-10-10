@@ -214,7 +214,7 @@ def test_two_session_blackout(day, blocked):
 
 
 def test_bmo_and_amc_liquidation_windows():
-    snapshot = state(holdings={"A": Holding(20, 100, "technology")})
+    snapshot = state(holdings={"A": Holding(20, 100, "technology", instrument="equity")})
     ctrl = controller([event()])
     assert ctrl.risk_requests(snapshot, context(asof=at("2026-10-13", "15:29"))) == ()
     assert (
@@ -324,10 +324,10 @@ def test_target_quantity_mismatch_cannot_spoof_minimum_weight():
 def test_target_floor_is_not_replenishment_and_drift_is_audited():
     ctrl = controller()
     assert check(ctrl, Intent("A", 9)).code == "target_below_minimum"
-    below = state(holdings={"A": Holding(5, 100, "technology")})
+    below = state(holdings={"A": Holding(5, 100, "technology", instrument="equity")})
     assert ctrl.risk_requests(below, context()) == ()
     assert check(ctrl, Intent("A", 1, kind=Kind.ADD), below).action is Action.ALLOW
-    over = state(holdings={"A": Holding(30, 100, "technology")})
+    over = state(holdings={"A": Holding(30, 100, "technology", instrument="equity")})
     assert check(ctrl, Intent("A", 1, kind=Kind.ADD), over).code == "overweight_drift"
     request = ctrl.risk_requests(over, context())[0]
     assert request.quantity == 5 and request.reason == "overweight_predefined_reduction"
@@ -428,7 +428,9 @@ def test_market_gates_off_missing_future_vix_and_drawdown_plan():
     assert (
         check(ctrl, snapshot=state(drawdown=0.1), market=market).code == "market_additions_blocked"
     )
-    snapshot = state(drawdown=0.15, holdings={"A": Holding(20, 100, "technology")})
+    snapshot = state(
+        drawdown=0.15, holdings={"A": Holding(20, 100, "technology", instrument="equity")}
+    )
     assert ctrl.risk_requests(snapshot, market) == ()
     assert ctrl.audit[-1].decision.code == "drawdown_reduction_plan_missing"
     plan = controller(market_gates=True, drawdown_reduction_fraction=0.5)
