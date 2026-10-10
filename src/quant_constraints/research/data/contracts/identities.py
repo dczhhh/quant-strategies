@@ -1,8 +1,11 @@
 """Effective identity facts; these are not historical-knowledge/PIT lookups."""
 
-from dataclasses import dataclass
+from bisect import bisect_right
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+from types import MappingProxyType
 
 from .errors import SCHEMA_VERSION, ErrorCode, currency, enum_value, fail, schema, text, timestamp
 from .provenance import SourceProvenance, source
@@ -30,8 +33,8 @@ class SecurityIdentity:
     def __post_init__(self):
         schema(self.schema_version)
         source(self.source)
-        for field in ("security_id", "symbol", "venue"):
-            text(getattr(self, field), field)
+        for name in ("security_id", "symbol", "venue"):
+            text(getattr(self, name), name)
         currency(self.currency)
         enum_value(self.transition, IdentityTransition, "transition")
         if self.transition not in (IdentityTransition.LISTING, IdentityTransition.RENAME):
@@ -52,6 +55,9 @@ class SecurityIdentity:
 @dataclass(frozen=True, slots=True)
 class IdentityMap:
     entries: tuple[SecurityIdentity, ...]
+    _index: Mapping[tuple[str, str], tuple[tuple[datetime, ...], tuple[SecurityIdentity, ...]]] = (
+        field(init=False, repr=False, compare=False)
+    )
 
     def __post_init__(self):
         if not isinstance(self.entries, tuple) or not all(
@@ -109,15 +115,29 @@ class IdentityMap:
                         "Symbol change requires an explicit rename",
                     )
         object.__setattr__(self, "entries", entries)
+        object.__setattr__(
+            self,
+            "_index",
+            MappingProxyType(
+                {
+                    key: (tuple(entry.effective_from for entry in group), tuple(group))
+                    for key, group in by_symbol.items()
+                }
+            ),
+        )
+
+    def __reduce__(self):
+        # Only canonical entries travel through a checkpoint; rebuild the cache.
+        return type(self), (self.entries,)
 
     def resolve_effective(self, symbol: str, venue: str, at: datetime) -> SecurityIdentity:
         at = timestamp(at, "at")
-        for entry in self.entries:
-            if (
-                entry.symbol == symbol
-                and entry.venue == venue
-                and entry.effective_from <= at
-                and (entry.effective_until is None or at < entry.effective_until)
-            ):
-                return entry
+        group = self._index.get((symbol, venue))
+        if group is not None:
+            index = bisect_right(group[0], at) - 1
+            if index >= 0:
+                entry = group[1][index]
+                end = entry.effective_until
+                if end is None or at < end:
+                    return entry
         fail(ErrorCode.IDENTITY_MISSING, "symbol", "No identity covers this effective timestamp")

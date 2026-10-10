@@ -12,7 +12,7 @@ from .contracts.identities import IdentityMap, IdentityTransition, SecurityIdent
 from .contracts.market_data import PriceBasis, RawBar, ShareUnit, SignalBar, VolumeUnit
 from .contracts.provenance import SourceProvenance
 
-NORMALIZER_VERSION = "research_normalizer_v1"
+NORMALIZER_VERSION = "research_normalizer_v2"
 
 _RECORD_TYPES = (SourceProvenance, SecurityIdentity, RawBar, SignalBar, CorporateActionRecord)
 _TIMES = frozenset(
@@ -100,6 +100,7 @@ def _bars(
     )
     seen: set[tuple] = set()
     source_ids: set[tuple] = set()
+    partitions: dict[tuple[str, str, str, str], str] = {}
     previous: dict[tuple, RawBar | SignalBar] = {}
     for bar in bars:
         identity = identities.resolve_effective(bar.symbol, bar.venue, bar.bar_start_at)
@@ -117,10 +118,21 @@ def _bars(
         product = bar.product_id if record_type is SignalBar else "raw"
         group = (bar.security_id, bar.venue, product)
         key = (*group, bar.bar_start_at, bar.bar_end_at)
-        origin = (
+        partition = (
             bar.source.provider,
             bar.source.dataset_id,
             bar.source.dataset_revision,
+            bar.source.source_partition_id,
+        )
+        reference = partitions.setdefault(partition, bar.source.source_partition_ref)
+        if reference != bar.source.source_partition_ref:
+            fail(
+                ErrorCode.PROVENANCE_CONFLICT,
+                "source_partition_ref",
+                "One source partition has conflicting references",
+            )
+        origin = (
+            *partition,
             bar.source.record_id,
             bar.source.record_version,
         )

@@ -138,6 +138,7 @@ def validate_price_risk_input(execution: RawBar, risk: RawBar | SignalBar) -> No
         risk.price_basis is not PriceBasis.RAW
         or risk.share_unit is not execution.share_unit
         or risk.security_id != execution.security_id
+        or risk.symbol != execution.symbol
         or risk.currency != execution.currency
         or risk.venue != execution.venue
         or risk.bar_start_at != execution.bar_start_at

@@ -12,6 +12,8 @@ class SourceProvenance:
     provider: str
     dataset_id: str
     dataset_revision: str
+    source_partition_id: str
+    source_partition_ref: str
     record_id: str
     record_version: int
     ingested_at: datetime
@@ -25,6 +27,8 @@ class SourceProvenance:
             "provider",
             "dataset_id",
             "dataset_revision",
+            "source_partition_id",
+            "source_partition_ref",
             "record_id",
             "source_uri",
             "source_timezone",

@@ -6,7 +6,7 @@ from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import Never
 
-SCHEMA_VERSION = "research_data_v1"
+SCHEMA_VERSION = "research_data_v2"
 
 
 class ErrorCode(StrEnum):
@@ -28,6 +28,7 @@ class ErrorCode(StrEnum):
     ACTION_TERMS = "ACTION_TERMS"
     KNOWLEDGE_EVIDENCE = "KNOWLEDGE_EVIDENCE"
     CREDIT_EVIDENCE = "CREDIT_EVIDENCE"
+    PROVENANCE_CONFLICT = "PROVENANCE_CONFLICT"
 
 
 class ContractError(ValueError):

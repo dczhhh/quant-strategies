@@ -37,6 +37,8 @@ def provenance(**changes):
         "provider": "offline-fixture",
         "dataset_id": "synthetic-bars",
         "dataset_revision": "r1",
+        "source_partition_id": "synthetic-partition-1",
+        "source_partition_ref": "fixture://synthetic-bars/r1/partition-1",
         "record_id": "bar-1",
         "record_version": 1,
         "ingested_at": "2026-10-10T10:00:00Z",
@@ -204,7 +206,7 @@ def test_bad_prices_reject_without_repair(value):
         ("share_unit", "unknown", ErrorCode.INVALID_VALUE),
         ("volume_unit", None, ErrorCode.INVALID_VALUE),
         ("source", None, ErrorCode.INVALID_TYPE),
-        ("schema_version", "research_data_v2", ErrorCode.UNSUPPORTED_SCHEMA),
+        ("schema_version", "research_data_v3", ErrorCode.UNSUPPORTED_SCHEMA),
     ],
 )
 def test_bar_structure_rejects_invalid_fields(field, value, code):

@@ -1,4 +1,4 @@
-"""Version-one structural contracts. Acceptance does not establish data authenticity."""
+"""Version-two structural contracts. Acceptance does not establish data authenticity."""
 
 from .corporate_actions import ActionKind, CorporateActionRecord, CreditEvidence
 from .errors import SCHEMA_VERSION, ContractError, ErrorCode
