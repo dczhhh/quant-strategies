@@ -193,7 +193,9 @@ Run `uv run pytest tests/constraints/test_research_data_contracts.py -q -o addop
 Full CI retains coverage, compatibility, security, artifact and ecosystem checks. The CI trigger
 also includes the PR #4 branch so the independent 5A dependency PR receives the full checks.
 
-5B still needs acquisition/archive/immutable content hashes, 5C raw authenticity and factor/unit
+[5B archive infrastructure](research-data-archives.md) now provides bounded aggregate acquisition,
+immutable content hashes and synthetic offline replay; licensed real samples and supplemental
+provider evidence remain outstanding. 5C still needs raw authenticity and factor/unit
 validation, 5D proved PIT/provider conversion, 5E hash-bound research entry and provenance output,
 and 5F licensed real-history E2E acceptance. This stage provides none of those trust guarantees and
 does not close Issue #5. PR #4's separate ninth-review performance work is unchanged.
