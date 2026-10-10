@@ -164,7 +164,7 @@ checkpoint；新格式信用读取已有数量，不扫描历史记录。缺少�
 
 项目默认 `fee_history_mode=current_snapshot_backcast`、`fee_snapshot_date='2026-10-10'`：把同一套当前经纪佣金档位和明确的第三方费用情景回套整个历史区间。这是反事实成本假设，不声称还原 2005/2015/2025 年的真实账单。每笔 `FeeBreakdown` 明示 `historical_fee_proxy=true`、快照日期、模式、版本、来源和假设。历史成交仍按其美东月份累计档位，按历史交易日期结算，快照日期不改写交易日历或结算周期。当前仅支持这份有来源的快照；更换快照须补充对应资料和实现。
 
-回套采用**正常收费、非假期监管代理**：SEC 卖出交易价值×0.0000206（[SEC 2026 生效文件](https://www.sec.gov/files/rules/other/2026/34-104909.pdf)）、TAF $0.000195/卖出股且每笔最高 $9.79（[FINRA 费率文件](https://www.finra.org/sites/default/files/2024-11/sr-finra-2024-019.pdf)）、CAT $0.000003/成交股。2026 年第四季度的 TAF 假期**不回套**全部历史交易，因此这份快照情景连 2026 年第四季度也保留正常 TAF。这些费率与场所代理都不是完整历史档案，也不做券商特定分币取整。费用敏感性可以显式传入 `IBKRProTieredUSStock(history_mode='current_snapshot_backcast', backcast_regulatory_rate=...)`，用带版本和来源的 `RegulatoryRate` 上调 SEC/TAF 等代理。
+回套采用**正常收费、非假期监管代理**：SEC 卖出交易价值×0.0000206（[SEC 2026 生效文件，固定文本副本](sources/sec-fee-2026.txt)）、TAF $0.000195/卖出股且每笔最高 $9.79（[FINRA 费率文件](https://www.finra.org/sites/default/files/2024-11/sr-finra-2024-019.pdf)）、CAT $0.000003/成交股。2026 年第四季度的 TAF 假期**不回套**全部历史交易，因此这份快照情景连 2026 年第四季度也保留正常 TAF。这些费率与场所代理都不是完整历史档案，也不做券商特定分币取整。费用敏感性可以显式传入 `IBKRProTieredUSStock(history_mode='current_snapshot_backcast', backcast_regulatory_rate=...)`，用带版本和来源的 `RegulatoryRate` 上调 SEC/TAF 等代理。
 
 `fee_history_mode=strict_historical` 则按真实成交日期选择明确监管版本，缺失覆盖立即报错。目前内置监管覆盖只到 2026 年：SEC 4 月 4 日前为零，之后按上述费率；TAF 1–9 月正常，10–12 月按已记录假期为零。其他日期需显式提供不重叠的 `regulatory_rates`。该模式只保证监管版本日期覆盖，基础佣金、场所费用和 CAT 仍是披露的快照代理，不能称为完整历史费用还原。独立构造 `IBKRProTieredUSStock()` 保持严格模式；项目工厂根据配置显式选择回套模式。传入自定义 `fee_model` 时使用该模型声明的模式和参数。
 
@@ -290,7 +290,8 @@ broker.cancel_rebalance_plan(plan.plan_id)
 `ConstraintConfig()` 保留旧 `legacy` 模式；项目 YAML 显式选择
 `cn_mainland_individual_treaty`，按**派息主体的税源国**匹配版本化规则：US 10%、CA 15%。
 依据为[中美协定 Article 9](https://www.irs.gov/pub/irs-trty/china.pdf)与
-[中加协定 Article 10(2)(b)](https://www.canada.ca/en/department-finance/programs/tax-policy/tax-treaties/country/china-agreement-1986.html)。
+[中加协定 Article 10(2)(b)，固定文本副本](sources/ca-cn-treaty.txt)。
+副本的原始 URL、获取时间和哈希见[来源清单](sources/manifest.json)及[副本验证边界](us-cash-account.md#official-sources)，不认证现行法规或历史 PIT。
 该情景仅适用于普通 USD 股票股息、中国大陆税收居民个人、非美加税收居民、受益所有人且文书有效的显式假设；
 不能用国籍、上市交易所、SMART 执行场所或 USD 货币判断来源国，也不认定用户真实税收身份。
 
@@ -326,7 +327,7 @@ REIT、ETF/RIC 分配、MLP、资本返还、特殊股息、未知 ADR 分类及
 精确计划 timestamp、`scheduled_known_at`、source/revision、可选实际发布及取消/缺失标记。
 `MacroEventCoverage` 明确覆盖范围、事件集合、当时可见时间、PIT/version；空事件列表必须仍有覆盖证明。
 合成 `InMemoryMacroEventProvider` 只供应 fixture，不下载今日最终版日历回填历史。
-官方计划来自 [BLS CPI](https://www.bls.gov/schedule/news_release/cpi.htm)、
+官方计划参考 [BLS CPI，2026-10-10 固定文本副本](sources/bls-cpi.txt)、
 [BEA](https://www.bea.gov/news/schedule)、[Fed](https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm)，
 逐事件读取精确时刻，代码不制造固定发布日或把全部发布硬编码在 08:30。
 

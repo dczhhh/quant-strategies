@@ -84,15 +84,21 @@ config.settlement_holidays = ("2026-10-13",)
 证券代码本身不提供产品属性，不能据此声称已完成产品过滤。小数股精度和证券资格也需要在券商
 适配层进一步核实。本阶段不实现策略、自动交易或个人账户读取。
 
-## 官方依据与验证
+## 官方依据与验证 {#official-sources}
 
 - [SEC T+1 投资者公告](https://www.investor.gov/introduction-investing/general-resources/news-alerts/alerts-bulletins/investor-bulletins/new-t1-settlement-cycle-what-investors-need-know-investor-bulletin)：2024-05-28 起的周期。
-- [SEC 2017 T+2 变更](https://www.sec.gov/newsroom/press-releases/2017-68-0)：2017-09-05 的历史转换。
+- [SEC 2017 T+2 变更，固定文本副本](sources/sec-t2-2017.txt)：2017-09-05 的历史转换。
 - [NSCC Good Friday 2026，a9732](https://www.dtcc.com/Globals/PDFs/2026/March/06/a9732)：普通股票交付／结算服务关闭。
 - 历史 NSCC 元旦 2022 公告 a9053：既有回归采用2021-12-31正常处理。
 - 历史 Juneteenth 公告：DTCC 2021 a9015、DTC 2022 16811-22。
 - 历史 DTC 退伍军人节 2023 公告19155-23：既有回归采用2023-11-10可结算。
-- [OCC Sandy 2012，31464](https://infomemo.theocc.com/infomemos?date=201210&number=31464)：交易停市时 DTC／NSCC 仍正常营业。
+- [OCC Sandy 2012，31464，固定原文节选](sources/occ-sandy.txt)：交易停市时 DTC／NSCC 仍正常营业。节选不替代完整公告。
+
+2026-10-10 的 GitHub runner 对 SEC、OCC、BLS 和加拿大协定页面返回403或超时。
+涉及的五个引用使用本次直接从官方取得的固定文本副本，原始 URL、获取时间、原始响应与副本的 SHA-256
+见[来源清单](sources/manifest.json)。加拿大文本注明政府来源与非商业转载条件；OCC 仅保留21词原文。
+CI 同时校验审阅固定的清单哈希、每份副本与渲染副本，缺失或篡改即失败。
+这证明引用副本一致，不证明实时 URL 已恢复、现行法规、税收身份或历史 PIT 可用性；其他外链继续实时检查。
 
 2026-10-10 扩展项目文档外链检查时，上述四份历史 DTCC 公告旧地址返回404；
 保留公告身份和旧地址供追溯，不把搜索缓存或链接存在声明当作当前官方源已核验。
