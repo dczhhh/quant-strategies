@@ -6,8 +6,8 @@ event identities and entitlements live in AccountState and survive its checkpoin
 
 import copy
 import math
-from dataclasses import replace
-from datetime import datetime
+from dataclasses import asdict, replace
+from datetime import date, datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
@@ -45,12 +45,30 @@ class CorporateActionProcessor:
                 "identities": {},
                 "entitlements": {},
                 "records": [],
+                "scopes": {},
+                "revisions": [],
                 "last_asof": None,
             }
+        # Legacy checkpoints have no proof of zero historical exposure. Treat
+        # those processed events as economically applied, never downgrade them.
+        self.state.setdefault("scopes", {})
+        self.state.setdefault("revisions", [])
 
     @property
     def state(self):
         return self.broker.account._corporate_action_state  # type: ignore[unresolved-attribute]
+
+    def has_exposure(self, asset: str | None) -> bool:
+        broker = self.broker
+        return asset is not None and (
+            asset in broker.positions
+            or asset in broker._risk_state.pending_exits
+            or any(o.asset == asset and o.status is OrderStatus.PENDING for o in broker.orders)
+            or any(
+                plan.active and asset in plan.reference_prices
+                for plan in broker.plan_manager.records.values()
+            )
+        )
 
     def prepare(self, asof: datetime, observed: set[str]):
         """Read-only preflight. Source gaps/late economics reject before bar mutation."""
@@ -69,6 +87,13 @@ class CorporateActionProcessor:
             observed
             | set(broker.positions)
             | {o.asset for o in broker.orders if o.status is OrderStatus.PENDING}
+            | set(broker._risk_state.pending_exits)
+            | {
+                asset
+                for plan in broker.plan_manager.records.values()
+                if plan.active
+                for asset in plan.reference_prices
+            }
         )
         identities = {}
         for asset in sorted(assets):
@@ -86,9 +111,7 @@ class CorporateActionProcessor:
             if context.signal_data_mode != broker.controller.config.signal_data_mode:
                 raise ValueError(f"Signal adjustment mode mismatch for {asset}")
             old = self.state["identities"].get(asset)
-            exposed = asset in broker.positions or any(
-                o.asset == asset and o.status is OrderStatus.PENDING for o in broker.orders
-            )
+            exposed = self.has_exposure(asset)
             if old is not None and old != context.security_id and exposed:
                 raise ValueError(f"Ticker identity change with exposure: {asset}: {old}")
             identities[asset] = context.security_id
@@ -127,10 +150,25 @@ class CorporateActionProcessor:
             for event in latest.values():
                 applied = self.state["processed"].get(event.key)
                 if applied is not None:
-                    if applied.economics != event.economics:
+                    scope = self.state.get("scopes", {}).get(event.key)
+                    if applied.economics != event.economics and scope != "observed_only":
                         raise ValueError(
                             f"Applied corporate action revised; reconcile checkpoint: {event.key}"
                         )
+                    if scope == "observed_only" and applied != event:
+                        # The zero-exposure proof belongs to this historical
+                        # event, not to today's holdings. A changed date/kind
+                        # needs a new proof and cannot reuse that observation.
+                        if (
+                            applied.kind != event.kind
+                            or applied.effective_date != event.effective_date
+                        ):
+                            raise ValueError(
+                                "Observed corporate action scope revised; reconcile checkpoint: "
+                                f"{event.key}"
+                            )
+                        effective = broker.controller.calendar.on_or_after(event.effective_date)
+                        events.append((effective, by_security.get(sid), event, True))
                     continue
                 if event.cancelled:
                     continue
@@ -142,12 +180,7 @@ class CorporateActionProcessor:
                 if effective > day:
                     continue
                 asset = by_security.get(sid)
-                exposed = asset is not None and (
-                    asset in broker.positions
-                    or any(
-                        o.asset == asset and o.status is OrderStatus.PENDING for o in broker.orders
-                    )
-                )
+                exposed = self.has_exposure(asset)
                 session = broker.controller.calendar.session(effective)
                 traded_after_effective = session is not None and any(
                     fill.asset == asset and fill.timestamp >= session.market_open
@@ -164,11 +197,15 @@ class CorporateActionProcessor:
                         f"Late corporate action after effective-session observation: {event.key}"
                     )
                 pos = broker.positions.get(asset) if asset is not None else None
-                if pos is not None and pos.entry_time.astimezone(NY).date() >= effective:
+                if (
+                    event.kind in {"SPLIT", "CASH_DIVIDEND"}
+                    and pos is not None
+                    and pos.entry_time.astimezone(NY).date() >= effective
+                ):
                     raise ValueError(f"Cannot reconstruct pre-event entitlement/basis: {event.key}")
                 if exposed or event.kind == "CASH_CREDIT":
                     self.validate_terms(event)
-                events.append((effective, asset, event))
+                events.append((effective, asset, event, False))
         rank = {"SPLIT": 0, "CASH_DIVIDEND": 1, "CASH_CREDIT": 2}
         events.sort(key=lambda item: (item[0], rank.get(item[2].kind, 3), item[2].key))
         return identities, events
@@ -188,8 +225,31 @@ class CorporateActionProcessor:
 
     def apply(self, asof: datetime, observed: set[str], prepared):
         identities, events = prepared
+        # A legacy snapshot may be restored into an existing processor. Backfill
+        # only on the transactional write path, keeping preflight read-only.
+        self.state.setdefault("scopes", {})
+        self.state.setdefault("revisions", [])
         self.state["identities"].update(identities)
-        for effective, asset, event in events:
+        for effective, asset, event, observation_revision in events:
+            if observation_revision:
+                previous = self.state["processed"][event.key]
+                self.state["revisions"].append(
+                    {
+                        "security_id": event.security_id,
+                        "event_id": event.event_id,
+                        "previous_version": previous.version,
+                        "previous_source": previous.source,
+                        "previous_terms": self.event_snapshot(previous),
+                        "version": event.version,
+                        "source": event.source,
+                        "available_at": event.available_at.isoformat(),
+                        "observed_at": asof.isoformat(),
+                        "scope": "observed_only",
+                        "terms": self.event_snapshot(event),
+                    }
+                )
+                self.state["processed"][event.key] = event
+                continue
             quantity = (
                 self.broker.account.get_position_quantity(asset) if asset is not None else 0.0
             )
@@ -214,16 +274,30 @@ class CorporateActionProcessor:
                 "missing_asset_bar": asset not in observed,
                 "status": "ignored_unexposed",
             }
-            if event.kind == "SPLIT" and asset is not None:
+            scope = "observed_only"
+            if event.kind == "SPLIT" and asset is not None and self.has_exposure(asset):
                 self.split(asset, event, observed)
                 record.update(status="split_applied", ratio=event.split_ratio)
+                scope = "economically_applied"
             elif event.kind == "CASH_DIVIDEND":
                 self.dividend(event, quantity, record)
+                if quantity:
+                    scope = "economically_applied"
             elif event.kind == "CASH_CREDIT":
                 self.credit(event, record)
+                scope = "economically_applied"
+            record["scope"] = scope
             self.state["processed"][event.key] = event
+            self.state["scopes"][event.key] = scope
             self.state["records"].append(record)
         self.state["last_asof"] = asof
+
+    @staticmethod
+    def event_snapshot(event: CorporateAction) -> dict:
+        return {
+            name: value.isoformat() if isinstance(value, (date, datetime)) else value
+            for name, value in asdict(event).items()
+        }
 
     def split(self, asset: str, event: CorporateAction, observed: set[str]):
         broker = self.broker
@@ -426,7 +500,12 @@ class CorporateActionProcessor:
         if net < 0:
             raise ValueError(f"Dividend deductions exceed gross: {event.key}")
         self.broker.account._receivables[entitlement_key(*event.key)] = net
-        self.state["entitlements"][event.key] = {"net": net, "gross": gross, "credited": False}
+        self.state["entitlements"][event.key] = {
+            "net": net,
+            "gross": gross,
+            "quantity": quantity,
+            "credited": False,
+        }
         record.update(
             status="dividend_receivable",
             gross=gross,
@@ -459,6 +538,17 @@ class CorporateActionProcessor:
         item["credited"] = True
         record.update(
             status="cash_credited",
+            eligible_quantity=item.get(
+                "quantity",
+                next(
+                    (
+                        r["eligible_quantity"]
+                        for r in self.state["records"]
+                        if (r["security_id"], r["event_id"]) == parent
+                    ),
+                    0.0,
+                ),
+            ),
             cash_delta=actual,
             income_delta=actual - estimate,
             parent_event_id=event.parent_event_id,
@@ -475,6 +565,7 @@ class CorporateActionProcessor:
             },
             "split_order_policy": self.broker.controller.config.split_order_policy,
             "records": records,
+            "observation_revisions": copy.deepcopy(self.state.get("revisions", [])),
             "income": sum(r["income_delta"] for r in records),
             "receivables": dict(self.broker.account._receivables),
             "outstanding": self.broker.account._receivable_value,

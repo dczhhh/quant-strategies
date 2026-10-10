@@ -30,7 +30,8 @@ cost_totals = engine.broker.execution_cost_statistics()
 
 长历史回测不能忽略拆股、反向拆股和现金股息。新增独立
 `quant_constraints.corporate_actions`，默认不启用，以保持既有基座行为。
-研究真实股票历史时必须显式设置 `corporate_actions_enabled=True` 并向
+仅在数据来源完成原始行情真实性验证后，研究真实股票历史才可显式设置
+`corporate_actions_enabled=True` 并向
 `constrained_engine(..., corporate_action_provider=provider)` 或 `broker_factory`
 提供 `CorporateActionProvider`，二者缺一或误传均报错。不提供实盘连接和买卖信号。
 
@@ -45,8 +46,15 @@ Provider 的 `snapshot(security_id, asof)` 返回 `CorporateActionCoverage` 和�
 `risk_data_mode='raw_execution'` 和与配置一致的 `signal_data_mode`。订单撮合、估值、
 绝对止损/ATR、佣金、滑点及成交量一律使用原始价格和当时股份单位。因子输入可以选择
 `raw_execution`、`split_adjusted_signal` 或 `total_return_signal`；不会生成因子/信号，
-也不会用总回报行情估值后再加现金股息。复权执行数据明确拒绝，未实现隐式反向转换。
-这些标签是数据契约，不是自动检测供应商是否错误标注价格。
+也不会用总回报行情估值后再加现金股息。声明为复权的执行数据明确拒绝，未实现隐式反向转换。
+这些标签只校验声明一致性，**不能证明 OHLCV 实际未复权**，也不能识别供应商误标。
+
+**真实历史策略研究目前阻塞于 [Issue #5](https://github.com/dczhhh/quant-strategies/issues/5)。**
+本模块尚无数据接入真实性验证器，不能直接接入未经验证的历史行情进行公司行为回放。
+验收前仅可使用明确构造的人工 fixture 验证账户语义；不得把配置标签、自报 raw/verified
+或价格跳变猜测当作证据。后续数据入口必须验证供应商调整因子、价格/股份/成交量单位，
+将数据哈希、来源/调整版本、PIT 事件 provenance 与验证结果绑定并审计；证据缺失或冲突
+须在回放和账户变化前拒绝。Issue #5 的验收实现完成前，不宣称该数据入口已受保护。
 
 事件在有效日期首个可见 bar、订单/财报/风控检查之前处理；拆股及除息日期按美东 NYSE
 有效交易日定位。首个观测可以是盘前，事件不因此创建盘前交易。跨缺失 bar 时，已知事件
@@ -73,17 +81,26 @@ Provider 的 `snapshot(security_id, asof)` 返回 `CorporateActionCoverage` 和�
 
 事件键 `(security_id, event_id)`、已处理经济版本、应收/信用资格都保存在同一个
 AccountState checkpoint 中。重复 bar、处理器重建、恢复后重放不会重复加股/加钱。
-处理前可见修订选最新；入账后经济条款改变或取消则停止要求对账，纯来源/版本元数据
-更新不重复执行。持仓/挂单期间 ticker 对应证券 ID 改变会报错；并购、分拆、退市、
+处理前可见修订选最新。每个事件保存 `observed_only` 或 `economically_applied` 的历史作用域：
+当事件只被观察、没有改动持仓/挂单/保护单/待执行风险退出/活动调仓授权或非零股息资格时，
+同有效日期、同事件类型的可见修订只更新已观察版本及独立修订审计，不重放经济变换，
+也不影响事后买入的新仓。改变有效日期或类型不能沿用旧无敞口证明，须对账重放。
+曾产生经济影响的事件即使如今已经平仓，经济条款改变或取消仍停止要求对账；纯来源/版本
+元数据更新不重复执行。缺少作用域证明的旧 checkpoint 保守视为已产生经济影响。
+持仓/挂单期间 ticker 对应证券 ID 改变会报错；并购、分拆、退市、
 改名迁移、特殊股息/due bill、非 USD、未知自定义风控价格语义均显式阻断受影响敞口，
 不把资产归零或悄悄丢弃。未持有的复杂事件只记 `ignored_unexposed`。
 基座 Canonical pre-open intent 的股份目标和授权迁移暂不支持与本公司行为适配器混用，
 存在此类意图时明确停止；使用本约束层的目标/调仓计划接口。实际信用事件表示一笔资格的
 完整最终到账，分期/部分到账需独立条款实现，不能当作普通全额信用事件；实际净额不能
-超过已确认资格毛额，也不能给零股资格凭空加钱。
+超过已确认资格毛额，也不能给零股资格凭空加钱。到账资格只引用稳定证券 ID 和旧
+`parent_event_id` 锁定的除息股数/金额，与到账当天是否持仓、何时重买和重买数量无关。
+旧资格卖出后仍保留；新仓不扩大旧资格。同资格的第二笔信用确认被拒绝。
 
 `broker.corporate_action_evidence()` 和结果 `metrics['corporate_actions_v1']` 包含版本、
-逐事件来源/时点/股数/状态、应收、现金增量、收入与失败诊断，可随结果 Parquet 保存。
+逐事件来源/时点/锁定股数/状态/历史作用域、应收、现金增量、收入与失败诊断；
+`observation_revisions` 单独保存无敞口修订的前后条款和来源版本，不重复增加事件收入，
+可随结果 Parquet 保存。
 原有 cash/exposure 字段含义不变：`equity = cash + net_exposure + outstanding_receivables`。
 交易 P&L 与股息收入分开；统一终值不变量检查 `initial + trading P&L + funding + income`，
 不豁免公司行为回测的会计校验。
