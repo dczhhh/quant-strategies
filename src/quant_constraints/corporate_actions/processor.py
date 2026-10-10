@@ -70,6 +70,48 @@ class CorporateActionProcessor:
             )
         )
 
+    def legacy_entitlement_quantities(self) -> dict:
+        """Read historical proof only for checkpoints missing locked quantities."""
+        return {
+            (record["security_id"], record["event_id"]): record["eligible_quantity"]
+            for record in self.state["records"]
+            if record["kind"] == "CASH_DIVIDEND"
+        }
+
+    def prepare_entitlements(self):
+        """Prove legacy zero-share cleanup without changing the checkpoint."""
+        legacy = None
+        quantities, empty = {}, set()
+        for key, item in self.state["entitlements"].items():
+            if item["credited"]:
+                continue
+            if "quantity" in item:
+                quantity = item["quantity"]
+            else:
+                if legacy is None:
+                    legacy = self.legacy_entitlement_quantities()
+                if key not in legacy:
+                    raise ValueError(
+                        f"Legacy dividend entitlement lacks quantity proof; reconcile: {key}"
+                    )
+                quantity = legacy[key]
+                quantities[key] = quantity
+            if (
+                isinstance(quantity, bool)
+                or not isinstance(quantity, (int, float))
+                or not math.isfinite(quantity)
+                or quantity < 0
+            ):
+                raise ValueError(f"Invalid locked dividend quantity; reconcile: {key}")
+            if quantity == 0:
+                receivable = self.broker.account._receivables.get(entitlement_key(*key), 0)
+                if item["net"] != 0 or item["gross"] != 0 or receivable != 0:
+                    raise ValueError(
+                        f"Zero-share entitlement has nonzero amounts; reconcile: {key}"
+                    )
+                empty.add(key)
+        return quantities, empty
+
     def prepare(self, asof: datetime, observed: set[str]):
         """Read-only preflight. Source gaps/late economics reject before bar mutation."""
         aware(asof)
@@ -117,8 +159,11 @@ class CorporateActionProcessor:
             identities[asset] = context.security_id
         if len(set(identities.values())) != len(identities):
             raise ValueError("Duplicate tickers for one security require explicit migration")
+        quantities, empty = self.prepare_entitlements()
         securities = set(identities.values()) | {
-            key[0] for key, item in self.state["entitlements"].items() if not item["credited"]
+            key[0]
+            for key, item in self.state["entitlements"].items()
+            if not item["credited"] and key not in empty
         }
         by_security = {sid: asset for asset, sid in identities.items()}
         events = []
@@ -208,7 +253,7 @@ class CorporateActionProcessor:
                 events.append((effective, asset, event, False))
         rank = {"SPLIT": 0, "CASH_DIVIDEND": 1, "CASH_CREDIT": 2}
         events.sort(key=lambda item: (item[0], rank.get(item[2].kind, 3), item[2].key))
-        return identities, events
+        return identities, events, quantities, empty
 
     @staticmethod
     def validate_terms(event: CorporateAction):
@@ -224,11 +269,17 @@ class CorporateActionProcessor:
             raise ValueError(f"Dividend must declare post-split per-share basis: {event.key}")
 
     def apply(self, asof: datetime, observed: set[str], prepared):
-        identities, events = prepared
+        identities, events, quantities, empty = prepared
         # A legacy snapshot may be restored into an existing processor. Backfill
         # only on the transactional write path, keeping preflight read-only.
         self.state.setdefault("scopes", {})
         self.state.setdefault("revisions", [])
+        for key in empty:
+            del self.state["entitlements"][key]
+            self.broker.account._receivables.pop(entitlement_key(*key), None)
+        for key, quantity in quantities.items():
+            if key not in empty:
+                self.state["entitlements"][key]["quantity"] = quantity
         self.state["identities"].update(identities)
         for effective, asset, event, observation_revision in events:
             if observation_revision:
@@ -489,6 +540,9 @@ class CorporateActionProcessor:
 
     def dividend(self, event: CorporateAction, quantity: float, record: dict):
         assert event.dividend_per_share is not None
+        if quantity == 0:
+            record.update(status="observed_no_entitlement")
+            return
         rate = (
             event.withholding_rate
             if event.withholding_rate is not None
@@ -528,6 +582,18 @@ class CorporateActionProcessor:
         item = self.state["entitlements"].get(parent)
         if item is None or item["credited"]:
             raise ValueError(f"Unknown/already credited dividend entitlement: {parent}")
+        if "quantity" in item:
+            quantity = item["quantity"]
+        else:
+            # Direct legacy credit callers may not have run bar preflight.
+            legacy = self.legacy_entitlement_quantities()
+            if parent not in legacy:
+                raise ValueError(
+                    f"Legacy dividend entitlement lacks quantity proof; reconcile: {parent}"
+                )
+            quantity = legacy[parent]
+        if quantity <= 0:
+            raise ValueError(f"No qualifying shares for dividend credit: {parent}")
         estimate = item["net"]
         actual = estimate if event.credited_net is None else event.credited_net
         if actual > item["gross"] + 1e-8:
@@ -538,17 +604,7 @@ class CorporateActionProcessor:
         item["credited"] = True
         record.update(
             status="cash_credited",
-            eligible_quantity=item.get(
-                "quantity",
-                next(
-                    (
-                        r["eligible_quantity"]
-                        for r in self.state["records"]
-                        if (r["security_id"], r["event_id"]) == parent
-                    ),
-                    0.0,
-                ),
-            ),
+            eligible_quantity=quantity,
             cash_delta=actual,
             income_delta=actual - estimate,
             parent_event_id=event.parent_event_id,

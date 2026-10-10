@@ -778,13 +778,13 @@ def test_late_dividend_after_ex_date_sale_cannot_silently_lose_entitlement():
     assert broker.cash == cash
 
 
-def test_credit_cannot_create_income_for_zero_share_entitlement():
+def test_credit_cannot_create_income_without_share_entitlement():
     broker, _, _, _, _ = build(
         action("CASH_DIVIDEND"),
         action("CASH_CREDIT", "credit", "2026-10-13", parent_event_id="event", credited_net=20),
     )
     tick(broker, at("2026-10-12"), price=99)
-    with pytest.raises(ValueError, match="exceeds eligible"):
+    with pytest.raises(ValueError, match="Unknown/already credited"):
         tick(broker, at("2026-10-13"), price=99)
     assert broker.cash == 10000
 
