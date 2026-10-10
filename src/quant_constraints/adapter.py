@@ -270,7 +270,7 @@ class ConstrainedBroker(Broker):
             and entry_type is OrderType.MARKET
         ):
             self._order_book._fill_immediately(entry)
-            if entry in self._order_state.pending:
+            if entry.status is not OrderStatus.PENDING and entry in self._order_state.pending:
                 self._order_state.pending.remove(entry)
         self.refresh_brackets()
         return entry, tp, sl

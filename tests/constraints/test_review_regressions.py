@@ -130,6 +130,31 @@ def test_partial_bracket_exit_cancels_unfilled_parent_remainder():
     assert not broker.get_position("A")
 
 
+def test_immediate_partial_bracket_retains_parent_remainder_and_cash_reservation():
+    broker, _ = make(
+        execution_mode=ExecutionMode.SAME_BAR,
+        execution_price=ExecutionPrice.CLOSE,
+        immediate_fill=True,
+    )
+    broker.execution_limits = VolumeParticipationLimit(max_participation=0.0005)
+    tick(broker)
+    parent, tp, sl = broker.submit_bracket("A", 20, take_profit=110, stop_loss=95)
+    assert parent.status is OrderStatus.PENDING
+    assert parent.filled_quantity == tp.quantity == sl.quantity == 5
+    assert parent.quantity == 15 and broker.reserved_cash == 1500
+    assert {o.order_id for o in broker.get_pending_orders()} == {
+        parent.order_id,
+        tp.order_id,
+        sl.order_id,
+    }
+    tick(broker, at(clock="10:31"), price=94)
+    broker._process_orders(use_open=True)
+    assert parent.status is tp.status is OrderStatus.CANCELLED
+    assert sl.status is OrderStatus.FILLED
+    assert broker.reserved_cash == 0 and not broker.get_pending_orders()
+    assert not broker.get_position("A")
+
+
 def test_cancel_partial_parent_preserves_protection_and_forced_exit_supersedes_children():
     broker, _ = make()
     broker.execution_limits = VolumeParticipationLimit(max_participation=0.0005)
